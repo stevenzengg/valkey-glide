@@ -1,7 +1,23 @@
 definitions:
+  caches:
+    gradle-cache:
+      key:
+        files:
+          - build.gradle.kts
+          - gradle.properties
+      path: ~/.gradle/caches
+    gradle-wrapper:
+      key:
+        files:
+          - gradle/wrapper/gradle-wrapper.properties
+      path: ~/.gradle/wrapper
   steps:
     publishToArtifactory: &publishToArtifactory
+      image: "atlassian/default-image:5"
       size: 4x
+      caches:
+        - gradle-cache
+        - gradle-wrapper
       runtime:
         cloud:
           instance-type: "standard"
@@ -12,7 +28,11 @@ definitions:
         - cd java
         - ./gradlew publish
     build: &build
+      image: "atlassian/default-image:5"
       size: 4x
+      caches:
+        - gradle-cache
+        - gradle-wrapper
       runtime:
         cloud:
           instance-type: "standard"
