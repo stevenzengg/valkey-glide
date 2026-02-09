@@ -22,22 +22,13 @@ definitions:
         - ./gradlew build
 pipelines:
   default:
-    - step: *publishToArtifactory
+    - step: *build
   custom:
-    # =========================================================================
-    # Cluster Controller Only Pipeline
-    # Use this for changes that only affect cluster-controller/ directory
-    # This is significantly faster as it skips Rust compilation
-    # =========================================================================
-    deploy-cluster-controller-staging:
+    manual-publish-to-artifactory:
       - step: *publishToArtifactory
-
   pull-requests:
-    # PRs targeting main (release PRs) - run validation only
     main:
       - step: *build
-
   branches:
-    # Merges to main (production releases) - validate, build, deploy to staging/canary, then manual deploy to production
     main:
       - step: *publishToArtifactory
