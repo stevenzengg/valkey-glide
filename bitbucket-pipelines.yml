@@ -13,7 +13,7 @@ definitions:
         - cd java
         - apt update -y
         - apt install -y openjdk-11-jdk git gcc pkg-config openssl libssl-dev unzip cmake
-        - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+        - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
         - ./gradlew publish
     build: &build
       image: "atlassian/default-image:5"
@@ -28,7 +28,7 @@ definitions:
         - cd java
         - apt update -y
         - apt install -y openjdk-11-jdk git gcc pkg-config openssl libssl-dev unzip cmake
-        - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+        - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
         - ./gradlew build
 pipelines:
   default:
