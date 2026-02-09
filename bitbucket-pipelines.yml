@@ -11,6 +11,9 @@ definitions:
         - pipe: docker://atlassian/artifactory-sidekick:latest
         - source .artifactory/activate.sh
         - cd java
+        - sudo apt update -y
+        - sudo apt install -y openjdk-11-jdk git gcc pkg-config openssl libssl-dev unzip cmake
+        - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
         - ./gradlew publish
     build: &build
       image: "atlassian/default-image:5"
@@ -23,6 +26,9 @@ definitions:
         - pipe: docker://atlassian/artifactory-sidekick:latest
         - source .artifactory/activate.sh
         - cd java
+        - sudo apt update -y
+        - sudo apt install -y openjdk-11-jdk git gcc pkg-config openssl libssl-dev unzip cmake
+        - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
         - ./gradlew build
 pipelines:
   default:
