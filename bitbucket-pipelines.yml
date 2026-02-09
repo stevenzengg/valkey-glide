@@ -3,7 +3,7 @@ definitions:
     gradle-cache:
       key:
         files:
-          - build.gradle.kts
+          - build.gradle
           - gradle.properties
       path: ~/.gradle/caches
     gradle-wrapper:
