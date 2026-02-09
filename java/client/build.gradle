@@ -204,7 +204,7 @@ publishing {
             from components.shadow
             artifact tasks.named('javadocJar')
             artifact tasks.named('sourcesJar')
-            groupId = 'io.valkey'
+            groupId = 'io.atlassian.valkey'
             artifactId = 'valkey-glide'
             version = System.getenv("GLIDE_RELEASE_VERSION") ?: project.ext.defaultReleaseVersion
             pom {
