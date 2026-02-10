@@ -40,6 +40,9 @@ definitions:
         - source "$HOME/.cargo/env"
         - curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v29.1/protoc-29.1-linux-x86_64.zip
         - unzip protoc-29.1-linux-x86_64.zip -d /usr/local
+        - python3 -m venv .venv
+        - . .venv/bin/activate
+        - pip3 install --upgrade pip3
         - pip3 install ziglang
         - cargo install --locked cargo-zigbuild
         - ./gradlew build
