@@ -12,7 +12,7 @@ definitions:
         - source .artifactory/activate.sh
         - cd java
         - apt update -y
-        - apt install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake
+        - apt install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake protobuf-compiler
         - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
         - ./gradlew publish
     build: &build
@@ -27,7 +27,7 @@ definitions:
         - source .artifactory/activate.sh
         - cd java
         - apt update -y
-        - apt install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake
+        - apt install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake protobuf-compiler
         - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
         - ./gradlew build
 pipelines:
