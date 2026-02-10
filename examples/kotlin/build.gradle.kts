@@ -28,7 +28,7 @@ fun nettyTransport(): String {
 
 dependencies {
     testImplementation(kotlin("test"))
-    implementation("io.valkey:valkey-glide:1.+:$classifier")
+    implementation("io.atlassian.valkey:valkey-glide:1.+:$classifier")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.1")
 }
 

@@ -122,7 +122,7 @@ publishing {
             from components.java
             artifact tasks.named('javadocJar')
             artifact tasks.named('sourcesJar')
-            groupId = 'io.valkey'
+            groupId = 'io.atlassian.valkey'
             artifactId = 'valkey-glide-jedis-compatibility'
             version = System.getenv("GLIDE_RELEASE_VERSION") ?: project.ext.defaultReleaseVersion
             pom {
