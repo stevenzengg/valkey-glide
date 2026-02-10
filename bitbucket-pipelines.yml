@@ -12,8 +12,10 @@ definitions:
         - source .artifactory/activate.sh
         - cd java
         - apt update -y
-        - apt install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake protobuf-compiler
+        - apt install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake
         - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        - curl -O https://statlas.prod.atl-paas.net/flock-deps/protoc-30.0-linux-aarch_64.zip; \
+        - unzip protoc-30.0-linux-aarch_64.zip -d /usr/local;
         - ./gradlew publish
     build: &build
       image: "atlassian/default-image:5"
@@ -27,8 +29,10 @@ definitions:
         - source .artifactory/activate.sh
         - cd java
         - apt update -y
-        - apt install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake protobuf-compiler
+        - apt install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake
         - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        - curl -O https://statlas.prod.atl-paas.net/flock-deps/protoc-30.0-linux-aarch_64.zip; \
+        - unzip protoc-30.0-linux-aarch_64.zip -d /usr/local;
         - ./gradlew build
 pipelines:
   default:
