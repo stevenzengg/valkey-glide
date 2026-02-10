@@ -12,8 +12,9 @@ definitions:
         - source .artifactory/activate.sh
         - cd java
         - apt update -y
-        - apt install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake
+        - apt install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake valkey
         - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        - source "$HOME/.cargo/env"
         - curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v29.1/protoc-29.1-linux-x86_64.zip
         - unzip protoc-29.1-linux-x86_64.zip -d /usr/local
         - ./gradlew publish
@@ -29,8 +30,9 @@ definitions:
         - source .artifactory/activate.sh
         - cd java
         - apt update -y
-        - apt install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake
+        - apt install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake valkey
         - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        - source "$HOME/.cargo/env"
         - curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v29.1/protoc-29.1-linux-x86_64.zip
         - unzip protoc-29.1-linux-x86_64.zip -d /usr/local
         - ./gradlew build
