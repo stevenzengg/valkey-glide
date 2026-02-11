@@ -214,7 +214,7 @@ java/
 
 ## Quick Facts for Reasoners
 
-**Package:** `io.valkey:valkey-glide` on Maven Central
+**Package:** `io.atlassian.valkey:valkey-glide` on Maven Central
 **API Style:** Async with CompletableFuture, try-with-resources pattern
 **Client Types:** GlideClient (standalone), GlideClusterClient (cluster)
 **Key Features:** Jedis compatibility layer, comprehensive benchmarking, JNI-based Rust integration

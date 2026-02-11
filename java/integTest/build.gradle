@@ -32,10 +32,10 @@ dependencies {
         classifier = osdetector.classifier
     }
     // Use published GLIDE artifact
-    implementation group: 'io.valkey', name: 'valkey-glide', version: project.ext.defaultReleaseVersion, classifier: classifier
+    implementation group: 'io.atlassian.valkey', name: 'valkey-glide', version: project.ext.defaultReleaseVersion, classifier: classifier
     
     // Use published jedis-compatibility artifact
-    testImplementation group: 'io.valkey', name: 'valkey-glide-jedis-compatibility', version: project.ext.defaultReleaseVersion, classifier: osdetector.classifier
+    testImplementation group: 'io.atlassian.valkey', name: 'valkey-glide-jedis-compatibility', version: project.ext.defaultReleaseVersion, classifier: osdetector.classifier
 
     implementation group: 'org.apache.commons', name: 'commons-lang3', version: '3.20.0'
     implementation 'com.google.code.gson:gson:2.13.2'

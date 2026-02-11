@@ -24,7 +24,7 @@ dependencies {
     else {
         classifier = osdetector.classifier
     }
-    implementation "io.valkey:valkey-glide:${version}:${classifier}"
+    implementation "io.atlassian.valkey:valkey-glide:${version}:${classifier}"
         
 
     // This dependency is used internally, and not exposed to consumers on their own compile classpath.
