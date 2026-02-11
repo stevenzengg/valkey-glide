@@ -10,10 +10,6 @@ plugins {
     id 'com.gradleup.shadow' version '9.1.0'
 }
 
-repositories {
-    mavenCentral()
-}
-
 tasks.withType(JavaCompile) {
     options.encoding = 'UTF-8'
 }
@@ -199,6 +195,18 @@ tasks.register('sourcesJar', Jar) {
 }
 
 publishing {
+    repositories {
+        maven {
+            credentials {
+                username System.getenv('ARTIFACTORY_USERNAME')
+                password System.getenv('ARTIFACTORY_PASSWORD')
+            }
+            name = "maven-atlassian-com"
+            def releasesRepoUrl = "https://packages.atlassian.com/maven/private"
+            def snapshotsRepoUrl = "https://packages.atlassian.com/maven/private-snapshot"
+            url = version.endsWith('SNAPSHOT') ? snapshotsRepoUrl : releasesRepoUrl
+        }
+    }
     publications {
         mavenJava(MavenPublication) {
             from components.shadow
@@ -232,9 +240,6 @@ publishing {
                 }
             }
         }
-    }
-    repositories {
-        mavenLocal()
     }
 }
 

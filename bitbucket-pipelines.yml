@@ -22,6 +22,7 @@ definitions:
         - pip3 install --upgrade pip
         - pip3 install ziglang
         - cargo install --locked cargo-zigbuild
+        - export GLIDE_RELEASE_VERSION="1.$BITBUCKET_BUILD_NUMBER"
         - ./gradlew publish
     build: &build
       image: "atlassian/default-image:5"
