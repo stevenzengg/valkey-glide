@@ -9,6 +9,8 @@ definitions:
       name: Publish To Artifactory
       script:
         - pipe: docker://atlassian/artifactory-sidekick:latest
+          variables:
+            COMPLIANT: "true"
         - source .artifactory/activate.sh
         - cd java
         - apt update -y
