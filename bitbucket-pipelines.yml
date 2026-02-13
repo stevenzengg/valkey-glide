@@ -7,7 +7,7 @@ definitions:
         cloud:
           instance-type: "standard"
           arch: x86
-      name: Publish To Artifactory
+      name: Publish To Artifactory (x86)
       script:
         - pipe: docker://atlassian/artifactory-sidekick:latest
           variables:
@@ -34,7 +34,7 @@ definitions:
         cloud:
           instance-type: "standard"
           arch: arm
-      name: Publish To Artifactory
+      name: Publish To Artifactory (arm)
       script:
         - pipe: docker://atlassian/artifactory-sidekick:latest
           variables:
@@ -54,38 +54,14 @@ definitions:
         - cargo install --locked cargo-zigbuild
         - export GLIDE_RELEASE_VERSION="1.$BITBUCKET_BUILD_NUMBER"
         - ./gradlew publish
-    buildX86: &buildX86
-      image: "atlassian/default-image:5"
-      size: 4x
-      runtime:
-        cloud:
-          instance-type: "standard"
-          arch: x86
-      name: Build x86
-      script:
-        - pipe: docker://atlassian/artifactory-sidekick:latest
-        - source .artifactory/activate.sh
-        - cd java
-        - apt update -y
-        - apt install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake valkey python3-pip python3.12-venv
-        - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-        - source "$HOME/.cargo/env"
-        - curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v29.1/protoc-29.1-linux-x86_64.zip
-        - unzip protoc-29.1-linux-x86_64.zip -d /usr/local
-        - python3 -m venv .venv
-        - . .venv/bin/activate
-        - pip3 install --upgrade pip
-        - pip3 install ziglang
-        - cargo install --locked cargo-zigbuild
-        - ./gradlew build
-    buildARM: &buildARM
+    buildARM: &build
       image: "atlassian/default-image:5"
       size: 4x
       runtime:
         cloud:
           instance-type: "standard"
           arch: arm
-      name: Build ARM
+      name: Build
       script:
         - pipe: docker://atlassian/artifactory-sidekick:latest
         - source .artifactory/activate.sh
@@ -105,8 +81,7 @@ definitions:
 pipelines:
   default:
     - parallel:
-        - step: *buildX86
-        - step: *buildARM
+        - step: *build
   custom:
     manual-publish-to-artifactory:
       - parallel:
@@ -115,8 +90,7 @@ pipelines:
   pull-requests:
     main:
       - parallel:
-          - step: *buildX86
-          - step: *buildARM
+          - step: *build
   branches:
     main:
       - parallel:
