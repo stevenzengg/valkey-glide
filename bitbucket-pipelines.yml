@@ -113,7 +113,7 @@ definitions:
           arch: arm
       name: Build
       script:
-        - pipe: docker://atlassian/artifactory-sidekick:latest
+        - pipe: docker://atlassian/artifactory-sidekick:latest-arm64
         - source .artifactory/activate.sh
         - cd java
         - apt update -y
