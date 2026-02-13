@@ -78,17 +78,13 @@ definitions:
         - ./gradlew build
 pipelines:
   default:
-    - parallel:
-        - step: *build
+    - step: *build
   custom:
     manual-publish-to-artifactory:
-      - parallel:
-          - step: *publishToArtifactoryArmNonSox
+      - step: *publishToArtifactoryArmNonSox
   pull-requests:
     main:
-      - parallel:
-          - step: *build
+      - step: *build
   branches:
     main:
-      - parallel:
-          - step: *publishToArtifactoryArmSox
+      - step: *publishToArtifactoryArmSox
