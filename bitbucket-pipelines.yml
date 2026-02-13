@@ -52,7 +52,7 @@ definitions:
         - cargo install --locked cargo-zigbuild
         - export GLIDE_RELEASE_VERSION="1.$BITBUCKET_BUILD_NUMBER"
         - ./gradlew publish
-    buildARM: &build
+    build: &build
       image: "atlassian/default-image:5"
       size: 4x
       runtime:
