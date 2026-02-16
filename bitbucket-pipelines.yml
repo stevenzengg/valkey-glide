@@ -81,7 +81,7 @@ definitions:
                 - ./gradlew publish
         publishToArtifactoryArmOSXSox: &publishToArtifactoryArmOSXSox
             name: Publish To Artifactory - Arm OSX Sox
-            runs-runs-on:
+            runs-on:
                 - "atlassian-er-host-19-2"
             script:
                 - cd java
