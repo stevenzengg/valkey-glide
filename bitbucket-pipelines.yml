@@ -1,90 +1,138 @@
 definitions:
-  steps:
-    publishToArtifactoryArmNonSox: &publishToArtifactoryArmNonSox
-      image: "atlassian/default-image:5"
-      size: 4x
-      runtime:
-        cloud:
-          instance-type: "standard"
-          arch: arm
-      name: Publish To Artifactory (arm)
-      script:
-        - pipe: docker://atlassian/artifactory-sidekick:latest-arm64
-        - source .artifactory/activate.sh
-        - cd java
-        - apt update -y
-        - apt install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake valkey python3-pip python3.12-venv
-        - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-        - source "$HOME/.cargo/env"
-        - curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v29.1/protoc-29.1-linux-aarch_64.zip
-        - unzip protoc-29.1-linux-aarch_64.zip -d /usr/local
-        - python3 -m venv .venv
-        - . .venv/bin/activate
-        - pip3 install --upgrade pip
-        - pip3 install ziglang
-        - cargo install --locked cargo-zigbuild
-        - export GLIDE_RELEASE_VERSION="1.$BITBUCKET_BUILD_NUMBER"
-        - ./gradlew publish
-    publishToArtifactoryArmSox: &publishToArtifactoryArmSox
-      image: "atlassian/default-image:5"
-      size: 4x
-      runtime:
-        cloud:
-          instance-type: "standard"
-          arch: arm
-      name: Publish To Artifactory (arm)
-      script:
-        - pipe: docker://atlassian/artifactory-sidekick:latest-arm64
-          variables:
-            COMPLIANT: "true"
-        - source .artifactory/activate.sh
-        - cd java
-        - apt update -y
-        - apt install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake valkey python3-pip python3.12-venv
-        - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-        - source "$HOME/.cargo/env"
-        - curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v29.1/protoc-29.1-linux-aarch_64.zip
-        - unzip protoc-29.1-linux-aarch_64.zip -d /usr/local
-        - python3 -m venv .venv
-        - . .venv/bin/activate
-        - pip3 install --upgrade pip
-        - pip3 install ziglang
-        - cargo install --locked cargo-zigbuild
-        - export GLIDE_RELEASE_VERSION="1.$BITBUCKET_BUILD_NUMBER"
-        - ./gradlew publish
-    build: &build
-      image: "atlassian/default-image:5"
-      size: 4x
-      runtime:
-        cloud:
-          instance-type: "standard"
-          arch: arm
-      name: Build
-      script:
-        - pipe: docker://atlassian/artifactory-sidekick:latest-arm64
-        - source .artifactory/activate.sh
-        - cd java
-        - apt update -y
-        - apt install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake valkey python3-pip python3.12-venv
-        - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-        - source "$HOME/.cargo/env"
-        - curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v29.1/protoc-29.1-linux-aarch_64.zip
-        - unzip protoc-29.1-linux-aarch_64.zip -d /usr/local
-        - python3 -m venv .venv
-        - . .venv/bin/activate
-        - pip3 install --upgrade pip
-        - pip3 install ziglang
-        - cargo install --locked cargo-zigbuild
-        - ./gradlew build
+    steps:
+        publishToArtifactoryArmNonSox: &publishToArtifactoryArmNonSox
+            image: "atlassian/default-image:5"
+            size: 4x
+            runtime:
+                cloud:
+                    instance-type: "standard"
+                    arch: arm
+            name: Publish To Artifactory (arm)
+            script:
+                - pipe: docker://atlassian/artifactory-sidekick:latest-arm64
+                - source .artifactory/activate.sh
+                - cd java
+                - apt update -y
+                - apt install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake valkey python3-pip python3.12-venv
+                - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+                - source "$HOME/.cargo/env"
+                - curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v29.1/protoc-29.1-linux-aarch_64.zip
+                - unzip protoc-29.1-linux-aarch_64.zip -d /usr/local
+                - python3 -m venv .venv
+                - . .venv/bin/activate
+                - pip3 install --upgrade pip
+                - pip3 install ziglang
+                - cargo install --locked cargo-zigbuild
+                - export GLIDE_RELEASE_VERSION="1.$BITBUCKET_BUILD_NUMBER"
+                - ./gradlew publish
+        publishToArtifactoryArmSox: &publishToArtifactoryArmSox
+            image: "atlassian/default-image:5"
+            size: 4x
+            runtime:
+                cloud:
+                    instance-type: "standard"
+                    arch: arm
+            name: Publish To Artifactory - Arm Sox
+            script:
+                - pipe: docker://atlassian/artifactory-sidekick:latest-arm64
+                  variables:
+                      COMPLIANT: "true"
+                - source .artifactory/activate.sh
+                - cd java
+                - apt update -y
+                - apt install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake valkey python3-pip python3.12-venv
+                - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+                - source "$HOME/.cargo/env"
+                - curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v29.1/protoc-29.1-linux-aarch_64.zip
+                - unzip protoc-29.1-linux-aarch_64.zip -d /usr/local
+                - python3 -m venv .venv
+                - . .venv/bin/activate
+                - pip3 install --upgrade pip
+                - pip3 install ziglang
+                - cargo install --locked cargo-zigbuild
+                - export GLIDE_RELEASE_VERSION="1.$BITBUCKET_BUILD_NUMBER"
+                - ./gradlew publish
+        publishToArtifactoryX86_64Sox: &publishToArtifactoryX86_64Sox
+            image: "atlassian/default-image:5"
+            size: 4x
+            runtime:
+                cloud:
+                    instance-type: "standard"
+                    arch: x86
+            name: Publish To Artifactory - x86_64 Sox
+            script:
+                - pipe: docker://atlassian/artifactory-sidekick:latest
+                  variables:
+                      COMPLIANT: "true"
+                - source .artifactory/activate.sh
+                - cd java
+                - apt update -y
+                - apt install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake valkey python3-pip python3.12-venv
+                - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+                - source "$HOME/.cargo/env"
+                - curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v29.1/protoc-29.1-linux-x86_64.zip
+                - unzip protoc-29.1-linux-x86_64.zip -d /usr/local
+                - python3 -m venv .venv
+                - . .venv/bin/activate
+                - pip3 install --upgrade pip
+                - pip3 install ziglang
+                - cargo install --locked cargo-zigbuild
+                - export GLIDE_RELEASE_VERSION="1.$BITBUCKET_BUILD_NUMBER"
+                - ./gradlew publish
+        publishToArtifactoryArmOSXSox: &publishToArtifactoryArmOSXSox
+            name: Publish To Artifactory - Arm OSX Sox
+            runs-on:
+                - "atlassian-er-host-19-2"
+            script:
+                - cd java
+                - brew install openjdk@21 git pkg-config openssl cmake valkey python@3.12 protobuf || true
+                - export PATH="/opt/homebrew/opt/openjdk@21/bin:$PATH"
+                - export JAVA_HOME="/opt/homebrew/opt/openjdk@21"
+                - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+                - source "$HOME/.cargo/env"
+                - python3 -m venv .venv
+                - . .venv/bin/activate
+                - pip3 install --upgrade pip
+                - pip3 install ziglang
+                - cargo install --locked cargo-zigbuild
+                - export GLIDE_RELEASE_VERSION="1.$BITBUCKET_BUILD_NUMBER"
+                - ./gradlew publish
+        build: &build
+            image: "atlassian/default-image:5"
+            size: 4x
+            runtime:
+                cloud:
+                    instance-type: "standard"
+                    arch: arm
+            name: Build
+            script:
+                - pipe: docker://atlassian/artifactory-sidekick:latest-arm64
+                - source .artifactory/activate.sh
+                - cd java
+                - apt update -y
+                - apt install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake valkey python3-pip python3.12-venv
+                - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+                - source "$HOME/.cargo/env"
+                - curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v29.1/protoc-29.1-linux-aarch_64.zip
+                - unzip protoc-29.1-linux-aarch_64.zip -d /usr/local
+                - python3 -m venv .venv
+                - . .venv/bin/activate
+                - pip3 install --upgrade pip
+                - pip3 install ziglang
+                - cargo install --locked cargo-zigbuild
+                - ./gradlew build
+
 pipelines:
-  default:
-    - step: *build
-  custom:
-    manual-publish-to-artifactory:
-      - step: *publishToArtifactoryArmNonSox
-  pull-requests:
-    main:
-      - step: *build
-  branches:
-    main:
-      - step: *publishToArtifactoryArmSox
+    default:
+        - step: *build
+    custom:
+        manual-publish-to-artifactory:
+            - step: *publishToArtifactoryArmNonSox
+    pull-requests:
+        main:
+            - step: *build
+    branches:
+        main:
+            - step: *publishToArtifactoryArmSox
+            - step: *publishToArtifactoryX86_64Sox
+            - step: *publishToArtifactoryArmOSXSox
