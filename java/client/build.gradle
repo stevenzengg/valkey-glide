@@ -212,7 +212,7 @@ publishing {
             artifact tasks.named('javadocJar')
             artifact tasks.named('sourcesJar')
             groupId = 'io.atlassian.valkey'
-            artifactId = 'valkey-glide'
+            artifactId = "valkey-glide-${osdetector.classifier}"
             version = System.getenv("GLIDE_RELEASE_VERSION") ?: project.ext.defaultReleaseVersion
             pom {
                 name = 'valkey-glide'

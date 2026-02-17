@@ -81,8 +81,13 @@ definitions:
                 - ./gradlew publish
         publishToArtifactoryArmOSXSox: &publishToArtifactoryArmOSXSox
             name: Publish To Artifactory - Arm OSX Sox
+            image:
+                name: docker.atl-paas.net/sox/mobuild/er-xcode-26.0:v2680
+            size: 4x
             runs-on:
-                - "atlassian-er-host-19-2"
+                - self.hosted
+                - macos.tart
+                - m1
             script:
                 - cd java
                 - brew install openjdk@21 git pkg-config openssl cmake valkey python@3.12 protobuf || true
@@ -121,6 +126,28 @@ definitions:
                 - pip3 install ziglang
                 - cargo install --locked cargo-zigbuild
                 - ./gradlew build
+        buildOsx: &buildOSX
+            name: Build - OSX
+            image:
+                name: docker.atl-paas.net/sox/mobuild/er-xcode-26.0:v2680
+            size: 4x
+            runs-on:
+                - self.hosted
+                - macos.tart
+                - m1
+            script:
+                - cd java
+                - brew install openjdk@21 git pkg-config openssl cmake valkey python@3.12 protobuf || true
+                - export PATH="/opt/homebrew/opt/openjdk@21/bin:$PATH"
+                - export JAVA_HOME="/opt/homebrew/opt/openjdk@21"
+                - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+                - source "$HOME/.cargo/env"
+                - python3 -m venv .venv
+                - . .venv/bin/activate
+                - pip3 install --upgrade pip
+                - pip3 install ziglang
+                - cargo install --locked cargo-zigbuild
+                - ./gradlew build
 
 pipelines:
     default:
@@ -130,9 +157,12 @@ pipelines:
             - step: *publishToArtifactoryArmNonSox
     pull-requests:
         main:
-            - step: *build
+            - parallel:
+                  - step: *build
+                  - step: *buildOSX
     branches:
         main:
-            - step: *publishToArtifactoryArmSox
-            - step: *publishToArtifactoryX86_64Sox
-            - step: *publishToArtifactoryArmOSXSox
+            - parallel:
+                  - step: *publishToArtifactoryArmSox
+                  - step: *publishToArtifactoryX86_64Sox
+                  - step: *publishToArtifactoryArmOSXSox
