@@ -151,7 +151,9 @@ definitions:
 
 pipelines:
     default:
-        - step: *build
+        - parallel:
+              - step: *build
+              - step: *buildOSX
     custom:
         manual-publish-to-artifactory:
             - step: *publishToArtifactoryArmNonSox
