@@ -89,6 +89,7 @@ definitions:
                 - macos.tart
                 - m1
             script:
+                - export ARTIFACTORY_SIDEKICK_DIR="$PWD"
                 - export COMPLIANT="true"
                 - curl -fL https://statlas.prod.atl-paas.net/artifactory-sidekick/sidekick_darwin_arm64.tar.gz | tar -xzp sidekick
                 - ./sidekick
@@ -143,6 +144,7 @@ definitions:
                 - macos.tart
                 - m1
             script:
+                - export ARTIFACTORY_SIDEKICK_DIR="$PWD"
                 - curl -fL https://statlas.prod.atl-paas.net/artifactory-sidekick/sidekick_darwin_arm64.tar.gz | tar -xzp sidekick
                 - ./sidekick
                 - . .artifactory/activate.sh
