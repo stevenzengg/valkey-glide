@@ -89,9 +89,9 @@ definitions:
                 - macos.tart
                 - m1
             script:
-                - pipe: docker://atlassian/artifactory-sidekick:latest-arm64
-                  variables:
-                      COMPLIANT: "true"
+                - export COMPLIANT="true"
+                - curl -fL https://statlas.prod.atl-paas.net/artifactory-sidekick/sidekick_darwin_arm64.tar.gz | tar -xzp sidekick
+                - ./sidekick
                 - source .artifactory/activate.sh
                 - cd java
                 - brew install openjdk@21 git pkg-config openssl cmake valkey python@3.12 || true
@@ -143,7 +143,8 @@ definitions:
                 - macos.tart
                 - m1
             script:
-                - pipe: docker://atlassian/artifactory-sidekick:latest-arm64
+                - curl -fL https://statlas.prod.atl-paas.net/artifactory-sidekick/sidekick_darwin_arm64.tar.gz | tar -xzp sidekick
+                - ./sidekick
                 - source .artifactory/activate.sh
                 - cd java
                 - brew install openjdk@21 git pkg-config openssl cmake valkey python@3.12 || true
