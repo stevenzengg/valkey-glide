@@ -92,7 +92,7 @@ definitions:
                 - export COMPLIANT="true"
                 - curl -fL https://statlas.prod.atl-paas.net/artifactory-sidekick/sidekick_darwin_arm64.tar.gz | tar -xzp sidekick
                 - ./sidekick
-                - source .artifactory/activate.sh
+                - . .artifactory/activate.sh
                 - cd java
                 - brew install openjdk@21 git pkg-config openssl cmake valkey python@3.12 || true
                 - export PATH="/opt/homebrew/opt/openjdk@21/bin:$PATH"
@@ -145,7 +145,7 @@ definitions:
             script:
                 - curl -fL https://statlas.prod.atl-paas.net/artifactory-sidekick/sidekick_darwin_arm64.tar.gz | tar -xzp sidekick
                 - ./sidekick
-                - source .artifactory/activate.sh
+                - . .artifactory/activate.sh
                 - cd java
                 - brew install openjdk@21 git pkg-config openssl cmake valkey python@3.12 || true
                 - export PATH="/opt/homebrew/opt/openjdk@21/bin:$PATH"
