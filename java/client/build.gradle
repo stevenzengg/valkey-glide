@@ -215,7 +215,7 @@ publishing {
             artifactId = "valkey-glide-${osdetector.classifier}"
             version = System.getenv("GLIDE_RELEASE_VERSION") ?: project.ext.defaultReleaseVersion
             pom {
-                name = 'valkey-glide'
+                name = "valkey-glide-${osdetector.classifier}"
                 description = 'General Language Independent Driver for the Enterprise (GLIDE) for Valkey'
                 url = 'https://github.com/valkey-io/valkey-glide.git'
                 inceptionYear = '2024'
