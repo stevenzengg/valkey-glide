@@ -89,6 +89,10 @@ definitions:
                 - macos.tart
                 - m1
             script:
+                - pipe: docker://atlassian/artifactory-sidekick:latest-arm64
+                  variables:
+                      COMPLIANT: "true"
+                - source .artifactory/activate.sh
                 - cd java
                 - brew install openjdk@21 git pkg-config openssl cmake valkey python@3.12 || true
                 - export PATH="/opt/homebrew/opt/openjdk@21/bin:$PATH"
@@ -139,6 +143,8 @@ definitions:
                 - macos.tart
                 - m1
             script:
+                - pipe: docker://atlassian/artifactory-sidekick:latest-arm64
+                - source .artifactory/activate.sh
                 - cd java
                 - brew install openjdk@21 git pkg-config openssl cmake valkey python@3.12 || true
                 - export PATH="/opt/homebrew/opt/openjdk@21/bin:$PATH"
