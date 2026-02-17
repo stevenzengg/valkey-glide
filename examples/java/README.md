@@ -16,6 +16,6 @@ cd valkey-glide/examples/java
 These examples are running `valkey-glide` version `1.+`. In order to change the version, update the following section in the `build.gradle` file:
 ```groovy
 dependencies {
-    implementation "io.valkey:valkey-glide:1.+:${osdetector.classifier}"
+    implementation "io.valkey:valkey-glide-${osdetector.classifier}:1.+:${osdetector.classifier}"
 }
 ```
