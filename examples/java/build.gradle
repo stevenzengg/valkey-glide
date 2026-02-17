@@ -10,7 +10,7 @@ repositories {
 }
 
 dependencies {
-    implementation "io.atlassian.valkey:valkey-glide:1.+:${osdetector.classifier}"
+    implementation "io.atlassian.valkey:valkey-glide-${osdetector.classifier}:1.+:${osdetector.classifier}"
 }
 
 task runStandalone(type: JavaExec) {

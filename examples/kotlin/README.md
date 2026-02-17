@@ -17,6 +17,6 @@ cd valkey-glide/examples/kotlin
 These examples are running `valkey-glide` version `1.+`. In order to change the version, update the following section in the `build.gradle.kts` file:
 ```kotlin
 dependencies {
-    implementation("io.valkey:valkey-glide:1.+:$classifier")
+    implementation("io.valkey:valkey-glide-${osdetector.classifier}:1.+:$classifier")
 }
 ```
