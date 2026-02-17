@@ -90,11 +90,13 @@ definitions:
                 - m1
             script:
                 - cd java
-                - brew install openjdk@21 git pkg-config openssl cmake valkey python@3.12 protobuf || true
+                - brew install openjdk@21 git pkg-config openssl cmake valkey python@3.12 || true
                 - export PATH="/opt/homebrew/opt/openjdk@21/bin:$PATH"
                 - export JAVA_HOME="/opt/homebrew/opt/openjdk@21"
                 - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
                 - source "$HOME/.cargo/env"
+                - curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v29.1/protoc-29.1-osx-aarch_64.zip
+                - unzip protoc-29.1-osx-aarch_64.zip -d /usr/local
                 - python3 -m venv .venv
                 - . .venv/bin/activate
                 - pip3 install --upgrade pip
@@ -137,11 +139,13 @@ definitions:
                 - m1
             script:
                 - cd java
-                - brew install openjdk@21 git pkg-config openssl cmake valkey python@3.12 protobuf || true
+                - brew install openjdk@21 git pkg-config openssl cmake valkey python@3.12 || true
                 - export PATH="/opt/homebrew/opt/openjdk@21/bin:$PATH"
                 - export JAVA_HOME="/opt/homebrew/opt/openjdk@21"
                 - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
                 - source "$HOME/.cargo/env"
+                - curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v29.1/protoc-29.1-osx-aarch_64.zip
+                - unzip protoc-29.1-osx-aarch_64.zip -d /usr/local
                 - python3 -m venv .venv
                 - . .venv/bin/activate
                 - pip3 install --upgrade pip
