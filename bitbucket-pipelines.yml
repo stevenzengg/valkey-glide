@@ -96,7 +96,8 @@ definitions:
                 - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
                 - source "$HOME/.cargo/env"
                 - curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v29.1/protoc-29.1-osx-aarch_64.zip
-                - unzip protoc-29.1-osx-aarch_64.zip -d /usr/local
+                - unzip protoc-29.1-osx-aarch_64.zip -d $HOME/.local
+                - export PATH="$PATH:$HOME/.local/bin"
                 - python3 -m venv .venv
                 - . .venv/bin/activate
                 - pip3 install --upgrade pip
@@ -145,7 +146,8 @@ definitions:
                 - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
                 - source "$HOME/.cargo/env"
                 - curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v29.1/protoc-29.1-osx-aarch_64.zip
-                - unzip protoc-29.1-osx-aarch_64.zip -d /usr/local
+                - unzip protoc-29.1-osx-aarch_64.zip -d $HOME/.local
+                - export PATH="$PATH:$HOME/.local/bin"
                 - python3 -m venv .venv
                 - . .venv/bin/activate
                 - pip3 install --upgrade pip
