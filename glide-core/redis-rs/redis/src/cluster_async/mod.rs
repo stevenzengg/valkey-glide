@@ -449,7 +449,28 @@ where
     /// original address unchanged.
     pub(crate) fn resolve_address(&self, address: &str) -> String {
         let params = self.cluster_params.read().expect(MUTEX_READ_ERR);
-        cluster::resolve_address(address, params.address_resolver.as_deref())
+        let resolved = cluster::resolve_address(address, params.address_resolver.as_deref());
+
+        // If the resolved address has a connection, return it directly.
+        let conn_lock = self.conn_lock.read().expect(MUTEX_READ_ERR);
+        if conn_lock.connection_for_address(&resolved).is_some() {
+            return resolved;
+        }
+
+        // If the resolved address didn't match a connection, try reverse IP lookup.
+        // This handles the case where MOVED/ASK errors return raw IP addresses
+        // (e.g., "10.186.24.36:6379") that can't be translated by the address resolver
+        // but can be mapped back to a known node via the IP→address map built from
+        // CLUSTER SLOTS.
+        if let Some((host, _port_str)) = address.rsplit_once(':') {
+            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                if let Some(node_address) = conn_lock.slot_map.node_address_for_ip(ip) {
+                    return node_address.to_string();
+                }
+            }
+        }
+
+        resolved
     }
 
     fn get_cluster_param<T, F>(&self, f: F) -> Result<T, RedisError>
