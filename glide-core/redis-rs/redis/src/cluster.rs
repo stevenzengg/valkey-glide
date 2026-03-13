@@ -735,8 +735,14 @@ where
                 let mut connections = self.connections.borrow_mut();
                 let (addr, conn) = if let Some(redirected) = redirected.take() {
                     let (addr, is_asking) = match redirected {
-                        Redirect::Moved(addr) => (addr, false),
-                        Redirect::Ask(addr, should_exec_asking) => (addr, should_exec_asking),
+                        Redirect::Moved(addr) => (
+                            resolve_address(&addr, self.cluster_params.address_resolver.as_deref()),
+                            false,
+                        ),
+                        Redirect::Ask(addr, should_exec_asking) => (
+                            resolve_address(&addr, self.cluster_params.address_resolver.as_deref()),
+                            should_exec_asking,
+                        ),
                     };
                     let conn = self.get_connection_by_addr(&mut connections, &addr)?;
                     if is_asking {
@@ -1029,6 +1035,23 @@ pub(crate) fn get_connection_info(
             db: cluster_params.database_id,
         },
     })
+}
+
+/// Resolves a raw `"host:port"` address string through the given address resolver.
+/// If no resolver is provided, or the address cannot be parsed, returns the original
+/// address unchanged.
+pub(crate) fn resolve_address(address: &str, resolver: Option<&dyn AddressResolver>) -> String {
+    let resolver = match resolver {
+        Some(r) => r,
+        None => return address.to_string(),
+    };
+    if let Some((host, port_str)) = address.rsplit_once(':') {
+        if let Ok(port) = port_str.parse::<u16>() {
+            let (resolved_host, resolved_port) = resolver.resolve(host, port);
+            return format!("{resolved_host}:{resolved_port}");
+        }
+    }
+    address.to_string()
 }
 
 pub(crate) fn get_connection_addr(

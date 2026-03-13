@@ -1190,7 +1190,7 @@ mod tests {
 
         // Parse with resolver - addresses should be transformed
         let result_with_resolver =
-            parse_and_count_slots(&view, None, "fallback", Some(&resolver)).unwrap();
+            parse_and_count_slots(&view, None, "fallback", Some(resolver.as_ref())).unwrap();
         assert_eq!(result_with_resolver.slots.len(), 1);
         assert_eq!(
             result_with_resolver.slots[0].master(),

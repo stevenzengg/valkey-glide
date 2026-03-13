@@ -15,6 +15,25 @@ mod cluster {
         Value,
     };
 
+    use redis::AddressResolver;
+
+    /// An address resolver for testing that translates `"internal-node"` to a
+    /// specified target hostname, leaving all other addresses unchanged.
+    #[derive(Debug)]
+    struct InternalNodeResolver {
+        resolved_name: &'static str,
+    }
+
+    impl AddressResolver for InternalNodeResolver {
+        fn resolve(&self, host: &str, port: u16) -> (String, u16) {
+            if host == "internal-node" {
+                (self.resolved_name.to_string(), port)
+            } else {
+                (host.to_string(), port)
+            }
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_cluster_basics() {
@@ -533,6 +552,62 @@ mod cluster {
         let value = cmd("GET").arg("test").query::<Option<i32>>(&mut connection);
 
         assert_eq!(value, Ok(Some(123)));
+    }
+
+    /// Test that MOVED redirect errors have their addresses resolved through
+    /// the configured address resolver before connection lookup.
+    #[test]
+    #[serial_test::serial]
+    fn test_cluster_moved_error_with_address_resolver() {
+        let name = "test_sync_moved_resolver";
+        let requests = Arc::new(atomic::AtomicUsize::new(0));
+        let requests_clone = requests.clone();
+        let started = Arc::new(atomic::AtomicBool::new(false));
+        let started_clone = started.clone();
+
+        let MockEnv {
+            mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .address_resolver(Arc::new(InternalNodeResolver { resolved_name: name })),
+            name,
+            move |cmd: &[u8], port| {
+                if !started_clone.load(atomic::Ordering::SeqCst) {
+                    respond_startup(name, cmd)?;
+                }
+                started_clone.store(true, atomic::Ordering::SeqCst);
+
+                if contains_slice(cmd, b"PING") {
+                    return Err(Ok(Value::SimpleString("OK".into())));
+                }
+
+                let i = requests_clone.fetch_add(1, atomic::Ordering::SeqCst);
+
+                match i {
+                    // First request: MOVED with raw internal hostname.
+                    // Without address resolution, lookup of "internal-node" would fail.
+                    0 => Err(parse_redis_value(
+                        format!("-MOVED 123 internal-node:{port}\r\n").as_bytes(),
+                    )),
+                    // After refresh_slots, respond with topology
+                    1 => Err(Ok(Value::Array(vec![Value::Array(vec![
+                        Value::Int(0),
+                        Value::Int(16383),
+                        Value::Array(vec![
+                            Value::BulkString(name.as_bytes().to_vec()),
+                            Value::Int(port as i64),
+                        ]),
+                    ])]))),
+                    // Retry should succeed after resolver translated the address
+                    _ => Err(Ok(Value::BulkString(b"42".to_vec()))),
+                }
+            },
+        );
+
+        let value = cmd("GET").arg("test").query::<Option<i32>>(&mut connection);
+        assert_eq!(value, Ok(Some(42)));
     }
 
     #[test]
@@ -1168,5 +1243,99 @@ mod cluster {
                 }
             }
         }
+    }
+
+    /// Test that MOVED redirect errors in the async client have their addresses
+    /// resolved through the configured address resolver before connection lookup.
+    /// Without the fix, the client would try to connect to "internal-node" which
+    /// has no registered handler, causing a panic.
+    #[cfg(feature = "cluster-async")]
+    #[test]
+    #[serial_test::serial]
+    fn test_async_cluster_moved_error_with_address_resolver() {
+        let name = "test_async_moved_resolver";
+        let requests = Arc::new(atomic::AtomicUsize::new(0));
+        let requests_clone = requests.clone();
+
+        let MockEnv {
+            runtime,
+            async_connection: mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .address_resolver(Arc::new(InternalNodeResolver { resolved_name: name })),
+            name,
+            move |cmd: &[u8], port| {
+                respond_startup(name, cmd)?;
+
+                if contains_slice(cmd, b"PING") {
+                    return Err(Ok(Value::SimpleString("OK".into())));
+                }
+
+                let i = requests_clone.fetch_add(1, atomic::Ordering::SeqCst);
+
+                match i {
+                    // First request: MOVED with raw internal hostname.
+                    // Without address resolution, lookup of "internal-node" would fail.
+                    0 => Err(parse_redis_value(
+                        format!("-MOVED 123 internal-node:{port}\r\n").as_bytes(),
+                    )),
+                    // Retry should succeed after resolver translated the address.
+                    _ => Err(Ok(Value::BulkString(b"moved_result".to_vec()))),
+                }
+            },
+        );
+
+        let result: String = runtime
+            .block_on(cmd("GET").arg("test").query_async(&mut connection))
+            .unwrap();
+        assert_eq!(result, "moved_result");
+        assert_eq!(requests.load(atomic::Ordering::SeqCst), 2);
+    }
+
+    /// Test that ASK redirect errors in the async client have their addresses
+    /// resolved through the configured address resolver.
+    #[cfg(feature = "cluster-async")]
+    #[test]
+    #[serial_test::serial]
+    fn test_async_cluster_ask_error_with_address_resolver() {
+        let name = "test_async_ask_resolver";
+        let requests = Arc::new(atomic::AtomicUsize::new(0));
+        let requests_clone = requests.clone();
+
+        let MockEnv {
+            runtime,
+            async_connection: mut connection,
+            handler: _handler,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")])
+                .address_resolver(Arc::new(InternalNodeResolver { resolved_name: name })),
+            name,
+            move |cmd: &[u8], port| {
+                respond_startup(name, cmd)?;
+
+                if contains_slice(cmd, b"PING") || contains_slice(cmd, b"ASKING") {
+                    return Err(Ok(Value::SimpleString("OK".into())));
+                }
+
+                let i = requests_clone.fetch_add(1, atomic::Ordering::SeqCst);
+
+                match i {
+                    // First request: ASK with raw internal hostname.
+                    0 => Err(parse_redis_value(
+                        format!("-ASK 123 internal-node:{port}\r\n").as_bytes(),
+                    )),
+                    // Retry after ASK should succeed.
+                    _ => Err(Ok(Value::BulkString(b"ask_result".to_vec()))),
+                }
+            },
+        );
+
+        let result: String = runtime
+            .block_on(cmd("GET").arg("test").query_async(&mut connection))
+            .unwrap();
+        assert_eq!(result, "ask_result");
     }
 }

@@ -32,6 +32,7 @@ pub mod testing {
 }
 use crate::{
     client::GlideConnectionOptions,
+    cluster,
     cluster_routing::{Routable, RoutingInfo, ShardUpdateResult},
     cluster_slotmap::SlotMap,
     cluster_topology::{
@@ -443,6 +444,14 @@ impl<C> InnerCore<C>
 where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
+    /// Resolves a raw `"host:port"` address string through the configured address resolver.
+    /// If no address resolver is configured, or the address cannot be parsed, returns the
+    /// original address unchanged.
+    pub(crate) fn resolve_address(&self, address: &str) -> String {
+        let params = self.cluster_params.read().expect(MUTEX_READ_ERR);
+        cluster::resolve_address(address, params.address_resolver.as_deref())
+    }
+
     fn get_cluster_param<T, F>(&self, f: F) -> Result<T, RedisError>
     where
         F: FnOnce(&ClusterParams) -> T,
@@ -2786,26 +2795,33 @@ where
             InternalSingleNodeRouting::Redirect {
                 redirect: Redirect::Moved(moved_addr),
                 ..
-            } => core
-                .conn_lock
-                .read()
-                .expect(MUTEX_READ_ERR)
-                .connection_for_address(moved_addr.as_str())
-                .map_or(
-                    ConnectionCheck::OnlyAddress(moved_addr),
-                    ConnectionCheck::Found,
-                ),
+            } => {
+                // Resolve the address through the address resolver to translate internal
+                // cluster hostnames (e.g., "valkey-42:6379") to externally-reachable addresses.
+                let resolved_addr = core.resolve_address(&moved_addr);
+                core.conn_lock
+                    .read()
+                    .expect(MUTEX_READ_ERR)
+                    .connection_for_address(resolved_addr.as_str())
+                    .map_or(
+                        ConnectionCheck::OnlyAddress(resolved_addr),
+                        ConnectionCheck::Found,
+                    )
+            }
             InternalSingleNodeRouting::Redirect {
                 redirect: Redirect::Ask(ask_addr, should_exec_asking),
                 ..
             } => {
                 asking = should_exec_asking;
+                // Resolve the address through the address resolver to translate internal
+                // cluster hostnames (e.g., "valkey-42:6379") to externally-reachable addresses.
+                let resolved_addr = core.resolve_address(&ask_addr);
                 core.conn_lock
                     .read()
                     .expect(MUTEX_READ_ERR)
-                    .connection_for_address(ask_addr.as_str())
+                    .connection_for_address(resolved_addr.as_str())
                     .map_or(
-                        ConnectionCheck::OnlyAddress(ask_addr),
+                        ConnectionCheck::OnlyAddress(resolved_addr),
                         ConnectionCheck::Found,
                     )
             }
@@ -3200,11 +3216,15 @@ where
                     let future: Option<
                         RequestState<Pin<Box<dyn Future<Output = OperationResult> + Send>>>,
                     > = if let Some(moved_redirect) = moved_redirect {
+                        // Resolve the redirect address through the address resolver to translate
+                        // internal cluster hostnames to externally-reachable addresses.
+                        let resolved_address =
+                            self.inner.resolve_address(&moved_redirect.address);
                         Some(RequestState::UpdateMoved {
                             future: Box::pin(ClusterConnInner::update_upon_moved_error(
                                 self.inner.clone(),
                                 moved_redirect.slot,
-                                moved_redirect.address.into(),
+                                resolved_address.into(),
                             )),
                         })
                     } else if let Some(ref request) = request {
