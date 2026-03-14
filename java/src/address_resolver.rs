@@ -38,35 +38,46 @@ impl redis::AddressResolver for JavaAddressResolver {
     fn resolve(&self, host: &str, port: u16) -> (String, u16) {
         // Try to attach to JVM and call the Java resolver
         if let Ok(mut env) = self.jvm.attach_current_thread_as_daemon() {
-            // Call the resolver's resolve method: ResolvedAddress resolve(String host, int port)
-            if let Ok(host_jstring) = env.new_string(host)
-                && let Ok(result) = env.call_method(
-                    self.resolver_global.as_obj(),
-                    "resolve",
-                    "(Ljava/lang/String;I)Lglide/api/models/configuration/ResolvedAddress;",
-                    &[
-                        jni::objects::JValue::Object(&host_jstring),
-                        jni::objects::JValue::Int(port as i32),
-                    ],
-                )
-                && let Ok(resolved_address) = result.l()
-                && !resolved_address.is_null()
-            {
-                // Get the resolved host and port from the ResolvedAddress object
-                if let Ok(resolved_host_obj) =
-                    env.call_method(&resolved_address, "getHost", "()Ljava/lang/String;", &[])
-                    && let Ok(resolved_host_jobj) = resolved_host_obj.l()
-                    && !resolved_host_jobj.is_null()
-                    && let Ok(resolved_port_val) =
-                        env.call_method(&resolved_address, "getPort", "()I", &[])
-                    && let Ok(resolved_port) = resolved_port_val.i()
-                {
-                    let resolved_host_jstr: jni::objects::JString = resolved_host_jobj.into();
-                    if let Ok(resolved_host_str) = env.get_string(&resolved_host_jstr) {
-                        let resolved_host_string =
-                            resolved_host_str.to_str().unwrap_or(host).to_string();
-                        return (resolved_host_string, resolved_port as u16);
+            // Resolver callbacks run on long-lived attached threads. Bound JNI local refs
+            // to one resolve invocation so they are always released.
+            if env.push_local_frame(16).is_ok() {
+                let resolved = (|| -> Option<(String, u16)> {
+                    // Call the resolver's resolve method: ResolvedAddress resolve(String host, int port)
+                    if let Ok(host_jstring) = env.new_string(host)
+                        && let Ok(result) = env.call_method(
+                            self.resolver_global.as_obj(),
+                            "resolve",
+                            "(Ljava/lang/String;I)Lglide/api/models/configuration/ResolvedAddress;",
+                            &[
+                                jni::objects::JValue::Object(&host_jstring),
+                                jni::objects::JValue::Int(port as i32),
+                            ],
+                        )
+                        && let Ok(resolved_address) = result.l()
+                        && !resolved_address.is_null()
+                    {
+                        // Get the resolved host and port from the ResolvedAddress object
+                        if let Ok(resolved_host_obj) =
+                            env.call_method(&resolved_address, "getHost", "()Ljava/lang/String;", &[])
+                            && let Ok(resolved_host_jobj) = resolved_host_obj.l()
+                            && !resolved_host_jobj.is_null()
+                            && let Ok(resolved_port_val) =
+                                env.call_method(&resolved_address, "getPort", "()I", &[])
+                            && let Ok(resolved_port) = resolved_port_val.i()
+                        {
+                            let resolved_host_jstr: jni::objects::JString = resolved_host_jobj.into();
+                            if let Ok(resolved_host_str) = env.get_string(&resolved_host_jstr) {
+                                let resolved_host_string =
+                                    resolved_host_str.to_str().unwrap_or(host).to_string();
+                                return Some((resolved_host_string, resolved_port as u16));
+                            }
+                        }
                     }
+                    None
+                })();
+                let _ = unsafe { env.pop_local_frame(&JObject::null()) };
+                if let Some(resolved_addr) = resolved {
+                    return resolved_addr;
                 }
             }
         }
