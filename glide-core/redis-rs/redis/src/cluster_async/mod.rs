@@ -463,7 +463,7 @@ where
         // but can be mapped back to a known node via the IP→address map built from
         // CLUSTER SLOTS.
         if let Some((host, _port_str)) = address.rsplit_once(':') {
-            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            if let Ok(ip) = host.parse::<IpAddr>() {
                 if let Some(node_address) = conn_lock.slot_map.node_address_for_ip(ip) {
                     return node_address.to_string();
                 }
@@ -2314,16 +2314,27 @@ where
                 .await
                 .unwrap_or_else(|e| Err(e.into()));
 
-                (addr, result)
+                // Extract the IP from the successfully connected node for the
+                // slot map's IP→address reverse lookup.
+                let resolved_ip = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|node| node.user_connection.ip);
+
+                (addr, result, resolved_ip)
             }
         });
 
         // Await all connection futures, this is bounded by `connection_timeout`.
         let results = futures::future::join_all(connection_futures).await;
 
-        // Collect successful connections
+        // Collect successful connections and DNS-resolved IPs
         let new_connections = ConnectionsMap(DashMap::with_capacity(nodes_len));
-        for (addr, result) in results {
+        let mut resolved_ips: Vec<(String, IpAddr)> = Vec::new();
+        for (addr, result, resolved_ip) in results {
+            if let Some(ip) = resolved_ip {
+                resolved_ips.push((addr.clone(), ip));
+            }
             if let Ok(node) = result {
                 new_connections.0.insert(addr, node);
             }
@@ -2333,8 +2344,14 @@ where
         // Reset the current slot map and connection vector with the new ones
         let mut write_guard = inner.conn_lock.write().expect(MUTEX_WRITE_ERR);
         // Clear the refresh tasks of the prev instance
-        // TODO - Maybe we can take the running refresh tasks and use them instead of running new connection creation
         write_guard.refresh_conn_state.clear_refresh_state();
+
+        // Populate IP→address reverse lookup so MOVED/ASK errors with raw IPs
+        // can be resolved back to gateway addresses. Fresh DNS-resolved IPs take
+        // priority, then gaps are filled from the previous slot map's IP mappings.
+        new_slots.populate_ips(resolved_ips);
+        new_slots.carry_over_ips_from(&write_guard.slot_map);
+
         let read_from_replicas = inner
             .get_cluster_param(|params| params.read_from_replicas.clone())
             .expect(MUTEX_READ_ERR);

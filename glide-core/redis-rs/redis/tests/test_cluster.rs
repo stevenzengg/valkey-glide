@@ -15,6 +15,8 @@ mod cluster {
         Value,
     };
 
+    use std::net::{IpAddr, Ipv4Addr};
+
     use redis::AddressResolver;
 
     /// An address resolver for testing that translates `"internal-node"` to a
@@ -1294,48 +1296,71 @@ mod cluster {
         assert_eq!(requests.load(atomic::Ordering::SeqCst), 2);
     }
 
-    /// Test that ASK redirect errors in the async client have their addresses
-    /// resolved through the configured address resolver.
+    /// Test that MOVED errors returning raw IP addresses (instead of hostnames)
+    /// are resolved via the IP→address reverse lookup built from DNS resolution
+    /// during topology refresh. This simulates the scenario where Valkey nodes
+    /// use `cluster-announce-hostname` for CLUSTER SLOTS but return their raw
+    /// pod IP in MOVED errors.
     #[cfg(feature = "cluster-async")]
     #[test]
     #[serial_test::serial]
-    fn test_async_cluster_ask_error_with_address_resolver() {
-        let name = "test_async_ask_resolver";
+    fn test_async_cluster_moved_error_with_raw_ip_resolved_via_dns_lookup() {
+        let name = "test_async_moved_ip_resolver";
         let requests = Arc::new(atomic::AtomicUsize::new(0));
         let requests_clone = requests.clone();
+        let node_ip = IpAddr::V4(Ipv4Addr::new(10, 186, 22, 158));
 
-        let MockEnv {
-            runtime,
-            async_connection: mut connection,
-            handler: _handler,
-            ..
-        } = MockEnv::with_client_builder(
-            ClusterClient::builder(vec![&*format!("redis://{name}")])
-                .address_resolver(Arc::new(InternalNodeResolver { resolved_name: name })),
+        // Register the handler manually so we can set the IP type BEFORE
+        // the client connects and runs refresh_slots_inner.
+        let _handle = MockConnectionBehavior::register_new(
             name,
-            move |cmd: &[u8], port| {
+            Arc::new(move |cmd: &[u8], port| {
                 respond_startup(name, cmd)?;
 
-                if contains_slice(cmd, b"PING") || contains_slice(cmd, b"ASKING") {
+                if contains_slice(cmd, b"PING") {
                     return Err(Ok(Value::SimpleString("OK".into())));
                 }
 
                 let i = requests_clone.fetch_add(1, atomic::Ordering::SeqCst);
 
                 match i {
-                    // First request: ASK with raw internal hostname.
+                    // First request: MOVED with raw IP address (not a hostname).
+                    // The client must resolve this IP back to the handler's address
+                    // via the IP→address map populated during DNS resolution.
                     0 => Err(parse_redis_value(
-                        format!("-ASK 123 internal-node:{port}\r\n").as_bytes(),
+                        format!("-MOVED 123 10.186.22.158:{port}\r\n").as_bytes(),
                     )),
-                    // Retry after ASK should succeed.
-                    _ => Err(Ok(Value::BulkString(b"ask_result".to_vec()))),
+                    // Retry should succeed after IP was resolved to the correct address.
+                    _ => Err(Ok(Value::BulkString(b"ip_resolved".to_vec()))),
                 }
-            },
+            }),
         );
+
+        // Set the IP type BEFORE building the client so that refresh_slots_inner
+        // captures the IP during DNS resolution at startup.
+        modify_mock_connection_behavior(name, |behavior| {
+            behavior.returned_ip_type = ConnectionIPReturnType::Specified(node_ip);
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        let client = ClusterClient::builder(vec![&*format!("redis://{name}")])
+            .address_resolver(Arc::new(InternalNodeResolver { resolved_name: name }))
+            .build()
+            .unwrap();
+
+        let mut connection: redis::cluster_async::ClusterConnection<MockConnection> = runtime
+            .block_on(client.get_async_generic_connection())
+            .unwrap();
 
         let result: String = runtime
             .block_on(cmd("GET").arg("test").query_async(&mut connection))
             .unwrap();
-        assert_eq!(result, "ask_result");
+        assert_eq!(result, "ip_resolved");
+        assert_eq!(requests.load(atomic::Ordering::SeqCst), 2);
     }
 }
