@@ -213,7 +213,7 @@ impl SlotMap {
     /// connection establishment in `refresh_slots_inner`.
     pub(crate) fn populate_ips(&self, resolved_ips: Vec<(String, IpAddr)>) {
         for (addr, ip) in resolved_ips {
-            if let Some(mut entry) = self.nodes_map.get_mut(&Arc::from(addr)) {
+            if let Some(mut entry) = self.nodes_map.get_mut(&Arc::new(addr)) {
                 let (existing_ip, _) = entry.value_mut();
                 if existing_ip.is_none() {
                     *existing_ip = Some(ip);
