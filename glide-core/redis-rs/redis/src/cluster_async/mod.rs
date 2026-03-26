@@ -32,6 +32,7 @@ pub mod testing {
 }
 use crate::{
     client::GlideConnectionOptions,
+    cluster,
     cluster_routing::{Routable, RoutingInfo, ShardUpdateResult},
     cluster_slotmap::SlotMap,
     cluster_topology::{
@@ -443,6 +444,35 @@ impl<C> InnerCore<C>
 where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
+    /// Resolves a raw `"host:port"` address string through the configured address resolver.
+    /// If no address resolver is configured, or the address cannot be parsed, returns the
+    /// original address unchanged.
+    pub(crate) fn resolve_address(&self, address: &str) -> String {
+        let params = self.cluster_params.read().expect(MUTEX_READ_ERR);
+        let resolved = cluster::resolve_address(address, params.address_resolver.as_deref());
+
+        // If the resolved address has a connection, return it directly.
+        let conn_lock = self.conn_lock.read().expect(MUTEX_READ_ERR);
+        if conn_lock.connection_for_address(&resolved).is_some() {
+            return resolved;
+        }
+
+        // If the resolved address didn't match a connection, try reverse IP lookup.
+        // This handles the case where MOVED/ASK errors return raw IP addresses
+        // (e.g., "10.186.24.36:6379") that can't be translated by the address resolver
+        // but can be mapped back to a known node via the IP→address map built from
+        // CLUSTER SLOTS.
+        if let Some((host, _port_str)) = address.rsplit_once(':') {
+            if let Ok(ip) = host.parse::<IpAddr>() {
+                if let Some(node_address) = conn_lock.slot_map.node_address_for_ip(ip) {
+                    return node_address.to_string();
+                }
+            }
+        }
+
+        resolved
+    }
+
     fn get_cluster_param<T, F>(&self, f: F) -> Result<T, RedisError>
     where
         F: FnOnce(&ClusterParams) -> T,
@@ -2284,16 +2314,27 @@ where
                 .await
                 .unwrap_or_else(|e| Err(e.into()));
 
-                (addr, result)
+                // Extract the IP from the successfully connected node for the
+                // slot map's IP→address reverse lookup.
+                let resolved_ip = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|node| node.user_connection.ip);
+
+                (addr, result, resolved_ip)
             }
         });
 
         // Await all connection futures, this is bounded by `connection_timeout`.
         let results = futures::future::join_all(connection_futures).await;
 
-        // Collect successful connections
+        // Collect successful connections and DNS-resolved IPs
         let new_connections = ConnectionsMap(DashMap::with_capacity(nodes_len));
-        for (addr, result) in results {
+        let mut resolved_ips: Vec<(String, IpAddr)> = Vec::new();
+        for (addr, result, resolved_ip) in results {
+            if let Some(ip) = resolved_ip {
+                resolved_ips.push((addr.clone(), ip));
+            }
             if let Ok(node) = result {
                 new_connections.0.insert(addr, node);
             }
@@ -2303,8 +2344,14 @@ where
         // Reset the current slot map and connection vector with the new ones
         let mut write_guard = inner.conn_lock.write().expect(MUTEX_WRITE_ERR);
         // Clear the refresh tasks of the prev instance
-        // TODO - Maybe we can take the running refresh tasks and use them instead of running new connection creation
         write_guard.refresh_conn_state.clear_refresh_state();
+
+        // Populate IP→address reverse lookup so MOVED/ASK errors with raw IPs
+        // can be resolved back to gateway addresses. Fresh DNS-resolved IPs take
+        // priority, then gaps are filled from the previous slot map's IP mappings.
+        new_slots.populate_ips(resolved_ips);
+        new_slots.carry_over_ips_from(&write_guard.slot_map);
+
         let read_from_replicas = inner
             .get_cluster_param(|params| params.read_from_replicas.clone())
             .expect(MUTEX_READ_ERR);
@@ -2786,26 +2833,33 @@ where
             InternalSingleNodeRouting::Redirect {
                 redirect: Redirect::Moved(moved_addr),
                 ..
-            } => core
-                .conn_lock
-                .read()
-                .expect(MUTEX_READ_ERR)
-                .connection_for_address(moved_addr.as_str())
-                .map_or(
-                    ConnectionCheck::OnlyAddress(moved_addr),
-                    ConnectionCheck::Found,
-                ),
+            } => {
+                // Resolve the address through the address resolver to translate internal
+                // cluster hostnames (e.g., "valkey-42:6379") to externally-reachable addresses.
+                let resolved_addr = core.resolve_address(&moved_addr);
+                core.conn_lock
+                    .read()
+                    .expect(MUTEX_READ_ERR)
+                    .connection_for_address(resolved_addr.as_str())
+                    .map_or(
+                        ConnectionCheck::OnlyAddress(resolved_addr),
+                        ConnectionCheck::Found,
+                    )
+            }
             InternalSingleNodeRouting::Redirect {
                 redirect: Redirect::Ask(ask_addr, should_exec_asking),
                 ..
             } => {
                 asking = should_exec_asking;
+                // Resolve the address through the address resolver to translate internal
+                // cluster hostnames (e.g., "valkey-42:6379") to externally-reachable addresses.
+                let resolved_addr = core.resolve_address(&ask_addr);
                 core.conn_lock
                     .read()
                     .expect(MUTEX_READ_ERR)
-                    .connection_for_address(ask_addr.as_str())
+                    .connection_for_address(resolved_addr.as_str())
                     .map_or(
-                        ConnectionCheck::OnlyAddress(ask_addr),
+                        ConnectionCheck::OnlyAddress(resolved_addr),
                         ConnectionCheck::Found,
                     )
             }
@@ -3200,11 +3254,15 @@ where
                     let future: Option<
                         RequestState<Pin<Box<dyn Future<Output = OperationResult> + Send>>>,
                     > = if let Some(moved_redirect) = moved_redirect {
+                        // Resolve the redirect address through the address resolver to translate
+                        // internal cluster hostnames to externally-reachable addresses.
+                        let resolved_address =
+                            self.inner.resolve_address(&moved_redirect.address);
                         Some(RequestState::UpdateMoved {
                             future: Box::pin(ClusterConnInner::update_upon_moved_error(
                                 self.inner.clone(),
                                 moved_redirect.slot,
-                                moved_redirect.address.into(),
+                                resolved_address.into(),
                             )),
                         })
                     } else if let Some(ref request) = request {

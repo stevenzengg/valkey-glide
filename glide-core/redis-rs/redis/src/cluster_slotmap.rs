@@ -191,6 +191,37 @@ impl SlotMap {
         })
     }
 
+    /// Carries over IP mappings from an old slot map into this one.
+    /// This is needed because CLUSTER SLOTS may not include IP metadata
+    /// (e.g., when `cluster-announce-hostname` is set but `cluster-announce-ip` is not),
+    /// so IPs discovered via DNS resolution during previous refreshes must be preserved.
+    pub(crate) fn carry_over_ips_from(&self, old: &SlotMap) {
+        for entry in old.nodes_map.iter() {
+            let (old_ip, _) = entry.value();
+            if let Some(old_ip) = old_ip {
+                if let Some(mut new_entry) = self.nodes_map.get_mut(entry.key()) {
+                    let (new_ip, _) = new_entry.value_mut();
+                    if new_ip.is_none() {
+                        *new_ip = Some(*old_ip);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Populates IP mappings from DNS-resolved addresses discovered during
+    /// connection establishment in `refresh_slots_inner`.
+    pub(crate) fn populate_ips(&self, resolved_ips: Vec<(String, IpAddr)>) {
+        for (addr, ip) in resolved_ips {
+            if let Some(mut entry) = self.nodes_map.get_mut(&Arc::new(addr)) {
+                let (existing_ip, _) = entry.value_mut();
+                if existing_ip.is_none() {
+                    *existing_ip = Some(ip);
+                }
+            }
+        }
+    }
+
     /// Returns a set of all primary node addresses in the cluster.
     pub fn addresses_for_all_primaries(&self) -> HashSet<Arc<String>> {
         self.nodes_map
@@ -1499,4 +1530,5 @@ mod tests_cluster_slotmap {
         let found_addr = slot_map.node_address_for_ip(ip);
         assert_eq!(found_addr, Some(Arc::new("new-node:6379".to_string())));
     }
+
 }
