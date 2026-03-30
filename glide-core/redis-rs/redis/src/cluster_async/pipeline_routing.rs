@@ -364,9 +364,9 @@ where
 /// * `pipeline_map` - A map of node pipelines where the commands are grouped by their corresponding nodes.
 /// * `core` - The core object that provides access to connection locks and other resources.
 /// * `retry` - The retry counter.
-/// - `pipeline_retry_strategy`: Configures retry behavior for pipeline commands.  
-///   - `retry_server_error`: If `true`, retries commands on server errors (may cause reordering).  
-///   - `retry_connection_error`: If `true`, retries on connection errors (may lead to duplicate executions).  
+/// - `pipeline_retry_strategy`: Configures retry behavior for pipeline commands.
+///   - `retry_server_error`: If `true`, retries commands on server errors (may cause reordering).
+///   - `retry_connection_error`: If `true`, retries on connection errors (may lead to duplicate executions).
 ///
 /// # Returns
 ///
@@ -565,9 +565,9 @@ type RetryMap = HashMap<RetryMethod, Vec<RetryEntry>>;
 ///   `RedisResult<Response>` or a `RecvError`.
 /// - `addresses_and_indices`: A collection of pairs where each pair associates a node address with the indices
 ///   of commands in the pipeline that were sent to that node.
-/// - `pipeline_retry_strategy`: Configures retry behavior for pipeline commands.  
-///   - `retry_server_error`: If `true`, retries commands on server errors (may cause reordering).  
-///   - `retry_connection_error`: If `true`, retries on connection errors (may lead to duplicate executions).  
+/// - `pipeline_retry_strategy`: Configures retry behavior for pipeline commands.
+///   - `retry_server_error`: If `true`, retries commands on server errors (may cause reordering).
+///   - `retry_connection_error`: If `true`, retries on connection errors (may lead to duplicate executions).
 ///
 /// # Returns
 ///
@@ -753,9 +753,9 @@ fn update_retry_map(
 /// * `pipeline` - A reference to the original pipeline containing the commands.
 /// * `core` - The core object that provides access to connection locks and other resources.
 /// * `response_policies` - A HashMap of routing info and response policies to the pipeline commands.
-/// - `pipeline_retry_strategy`: Configures retry behavior for pipeline commands.  
-///   - `retry_server_error`: If `true`, retries commands on server errors (may cause reordering).  
-///   - `retry_connection_error`: If `true`, retries on connection errors (may lead to duplicate executions).  
+/// - `pipeline_retry_strategy`: Configures retry behavior for pipeline commands.
+///   - `retry_server_error`: If `true`, retries commands on server errors (may cause reordering).
+///   - `retry_connection_error`: If `true`, retries on connection errors (may lead to duplicate executions).
 pub(crate) async fn process_and_retry_pipeline_responses<C>(
     mut responses: Vec<Result<RedisResult<Response>, RecvError>>,
     mut addresses_and_indices: AddressAndIndices,
@@ -837,9 +837,9 @@ where
 /// * `retry` - The retry counter.
 /// * `pipeline_responses` - A mutable reference to the collection of pipeline responses.
 /// * `response_policies` - A HashMap of routing info and response policies to the pipeline commands.
-/// - `pipeline_retry_strategy`: Configures retry behavior for pipeline commands.  
-///   - `retry_server_error`: If `true`, retries commands on server errors (may cause reordering).  
-///   - `retry_connection_error`: If `true`, retries on connection errors (may lead to duplicate executions).  
+/// - `pipeline_retry_strategy`: Configures retry behavior for pipeline commands.
+///   - `retry_server_error`: If `true`, retries commands on server errors (may cause reordering).
+///   - `retry_connection_error`: If `true`, retries on connection errors (may lead to duplicate executions).
 ///
 /// # Returns
 ///
@@ -1153,7 +1153,7 @@ where
     ClusterConnInner::update_upon_moved_error(
         core.clone(),
         redirect_node.slot,
-        redirect_node.address.into(),
+        core.resolve_address(&redirect_node.address).into(),
     )
     .await
     .map_err(Into::into)
