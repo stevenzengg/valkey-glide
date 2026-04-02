@@ -1085,8 +1085,7 @@ where
         if matches!(retry_method, RetryMethod::MovedRedirect) {
             // Append rich redirect debug info to the error so it surfaces in the JVM exception message.
             // Each hop is tagged with a request ID and hop number to allow full redirect trace correlation.
-            if let Some(redirect) = redis_error.redirect(false) {
-                let raw_addr = redirect.addr.to_string();
+            if let Some((raw_addr, slot)) = redis_error.redirect_node().map(|(addr, slot)| (addr.to_string(), slot)) {
                 let (resolved, resolution_path) = core.resolve_address_with_path(&raw_addr);
                 let conn_lock = core.conn_lock.read().expect(MUTEX_READ_ERR);
                 let node_map_str: String = conn_lock
@@ -1110,7 +1109,7 @@ where
                     .join(" | ");
                 let slot_owner = conn_lock
                     .slot_map
-                    .node_address_for_slot(redirect.slot, SlotAddr::Master)
+                    .node_address_for_slot(slot, SlotAddr::Master)
                     .map(|a| a.to_string())
                     .unwrap_or_else(|| "unknown".to_string());
                 drop(conn_lock);
@@ -1120,7 +1119,7 @@ where
                         "[req={} hop={}] slot={} raw={} resolved={} resolution={} slot_owner={} nodes=[{}]",
                         request_id,
                         retry,
-                        redirect.slot,
+                        slot,
                         raw_addr,
                         resolved,
                         resolution_path,
