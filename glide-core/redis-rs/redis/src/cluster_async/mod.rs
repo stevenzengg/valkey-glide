@@ -448,16 +448,30 @@ where
     /// If no address resolver is configured, or the address cannot be parsed, returns the
     /// original address unchanged.
     pub(crate) fn resolve_address(&self, address: &str) -> String {
+        self.resolve_address_with_path(address).0
+    }
+
+    /// Resolves an address and returns both the resolved address and a human-readable
+    /// description of which resolution step succeeded. Useful for embedding in error
+    /// messages to diagnose MOVED/ASK redirect failures.
+    ///
+    /// Resolution steps (in order):
+    /// 1. DNS/address-resolver → direct connection lookup
+    /// 2. Reverse IP lookup via slot map (for raw IPs returned by MOVED/ASK)
+    /// 3. Raw fallback (no connection found)
+    ///
+    /// Returns `(resolved_address, resolution_path)`.
+    pub(crate) fn resolve_address_with_path(&self, address: &str) -> (String, &'static str) {
         let params = self.cluster_params.read().expect(MUTEX_READ_ERR);
         let resolved = cluster::resolve_address(address, params.address_resolver.as_deref());
 
-        // If the resolved address has a connection, return it directly.
+        // Step 1: If the resolved address has a connection, return it directly.
         let conn_lock = self.conn_lock.read().expect(MUTEX_READ_ERR);
         if conn_lock.connection_for_address(&resolved).is_some() {
-            return resolved;
+            return (resolved, "dns_resolved");
         }
 
-        // If the resolved address didn't match a connection, try reverse IP lookup.
+        // Step 2: If the resolved address didn't match a connection, try reverse IP lookup.
         // This handles the case where MOVED/ASK errors return raw IP addresses
         // (e.g., "10.186.24.36:6379") that can't be translated by the address resolver
         // but can be mapped back to a known node via the IP→address map built from
@@ -465,12 +479,13 @@ where
         if let Some((host, _port_str)) = address.rsplit_once(':') {
             if let Ok(ip) = host.parse::<IpAddr>() {
                 if let Some(node_address) = conn_lock.slot_map.node_address_for_ip(ip) {
-                    return node_address.to_string();
+                    return (node_address.to_string(), "reverse_ip_lookup");
                 }
             }
         }
 
-        resolved
+        // Step 3: No connection found — return raw resolved address as fallback.
+        (resolved, "raw_fallback")
     }
 
     fn get_cluster_param<T, F>(&self, f: F) -> Result<T, RedisError>
