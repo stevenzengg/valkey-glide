@@ -28,6 +28,7 @@ use super::CmdArg;
 use super::PendingRequest;
 use super::PipelineRetryStrategy;
 use super::RedirectNode;
+use crate::cluster_routing::Redirect;
 use super::RequestInfo;
 use super::{Core, InternalSingleNodeRouting, OperationTarget, Response};
 
@@ -785,6 +786,7 @@ where
     };
 
     let mut retry = 0;
+    let mut debug_log = String::new();
 
     // Initialize `PipelineResponses` to store responses for each pipeline command.
     // This will be used to store the responses from the different sub-pipelines to the pipeline commands.
@@ -800,12 +802,57 @@ where
             pipeline_retry_strategy,
         ) {
             Ok(retry_map) => {
+                // Accumulate debug info for each retry attempt
+                for (retry_method, entries) in &retry_map {
+                    for ((idx, _), addr, err) in entries {
+                        if matches!(retry_method, RetryMethod::MovedRedirect) {
+                            if let Some(Redirect::Moved(raw)) = err.redirect(false) {
+                                let resolved = core.resolve_address(&raw);
+                                use std::fmt::Write;
+                                let _ = write!(
+                                    debug_log,
+                                    "retry#{} cmd={} from={} raw={} resolved={};",
+                                    retry, idx, addr, raw, resolved
+                                );
+                            }
+                        }
+                    }
+                }
+
                 // If there are no retirable errors, or we have reached the maximum number of retries, we're done
                 if retry_map.is_empty() || retry >= retry_params.number_of_retries {
+                    // Append accumulated debug log to any remaining ServerError responses
+                    if !debug_log.is_empty() {
+                        let conn_lock = core.conn_lock.read().expect(MUTEX_READ_ERR);
+                        let node_map_str: String = conn_lock
+                            .slot_map_nodes()
+                            .map(|(addr, (ip, _))| format!("{}->ip:{:?}", addr, ip))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        drop(conn_lock);
+                        use std::fmt::Write;
+                        let _ = write!(debug_log, " nodes=[{}]", node_map_str);
+
+                        let debug = ServerError::ExtensionError {
+                            code: "PipelineRetryDebug".to_string(),
+                            detail: Some(debug_log.clone()),
+                        };
+                        for responses in pipeline_responses.iter_mut() {
+                            for (_addr, value) in responses.iter_mut() {
+                                if let Value::ServerError(err) = value {
+                                    err.append_detail(&debug);
+                                }
+                            }
+                        }
+                    }
                     return Ok(pipeline_responses);
                 }
 
                 retry = retry.saturating_add(1);
+                // Backoff before retrying, matching the single-command retry behavior.
+                // Without this, pipeline retries fire instantly and exhaust all attempts
+                // before a slot migration completes.
+                tokio::time::sleep(retry_params.wait_time_for_retry(retry)).await;
                 // TODO: consider moving this logic into sub-pipelines
                 match handle_retry_map(
                     retry_map,
@@ -1116,7 +1163,7 @@ where
                 let debug = ServerError::ExtensionError {
                     code: "RedirectHop".to_string(),
                     detail: Some(format!(
-                        "[req={} hop={}] slot={} raw={} resolved={} resolution={} slot_owner={} nodes=[{}]",
+                        "glide-redirect-trace [req={} hop={}] slot={} raw={} resolved={} resolution={} slot_owner={} nodes=[{}]",
                         request_id,
                         retry,
                         slot,
