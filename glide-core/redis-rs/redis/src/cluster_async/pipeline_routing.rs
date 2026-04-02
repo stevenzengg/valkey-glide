@@ -786,6 +786,7 @@ where
 
     let mut retry = 0;
     let mut debug_log = String::new();
+    let retry_start = tokio::time::Instant::now();
 
     // Initialize `PipelineResponses` to store responses for each pipeline command.
     // This will be used to store the responses from the different sub-pipelines to the pipeline commands.
@@ -810,10 +811,11 @@ where
                                 let raw = detail.split_whitespace().nth(1).unwrap_or(detail).to_string();
                                 let resolved = core.resolve_address(&raw);
                                 use std::fmt::Write;
+                                let elapsed_ms = retry_start.elapsed().as_millis();
                                 let _ = write!(
                                     debug_log,
-                                    "retry#{} cmd={} from={} raw={} resolved={};",
-                                    retry, idx, addr, raw, resolved
+                                    "retry#{} t={}ms cmd={} from={} raw={} resolved={};",
+                                    retry, elapsed_ms, idx, addr, raw, resolved
                                 );
                             }
                         }
@@ -834,14 +836,17 @@ where
                         use std::fmt::Write;
                         let _ = write!(debug_log, " nodes=[{}]", node_map_str);
 
-                        let debug = ServerError::ExtensionError {
-                            code: "PipelineRetryDebug".to_string(),
-                            detail: Some(debug_log.clone()),
-                        };
                         for responses in pipeline_responses.iter_mut() {
                             for (_addr, value) in responses.iter_mut() {
-                                if let Value::ServerError(err) = value {
-                                    err.append_detail(&debug);
+                                if let Value::ServerError(
+                                    ServerError::KnownError { detail, .. }
+                                    | ServerError::ExtensionError { detail, .. }
+                                ) = value {
+                                    if let Some(existing) = detail {
+                                        existing.push_str(&format!("; PipelineRetryDebug: {}", debug_log));
+                                    } else {
+                                        *detail = Some(format!("PipelineRetryDebug: {}", debug_log));
+                                    }
                                 }
                             }
                         }
