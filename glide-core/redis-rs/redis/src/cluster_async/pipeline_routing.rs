@@ -28,7 +28,6 @@ use super::CmdArg;
 use super::PendingRequest;
 use super::PipelineRetryStrategy;
 use super::RedirectNode;
-use crate::cluster_routing::Redirect;
 use super::RequestInfo;
 use super::{Core, InternalSingleNodeRouting, OperationTarget, Response};
 
@@ -806,7 +805,9 @@ where
                 for (retry_method, entries) in &retry_map {
                     for ((idx, _), addr, err) in entries {
                         if matches!(retry_method, RetryMethod::MovedRedirect) {
-                            if let Some(Redirect::Moved(raw)) = err.redirect(false) {
+                            if let Some(detail) = err.details() {
+                                // detail is "5108 10.186.23.5:6379" — extract the address after the space
+                                let raw = detail.split_whitespace().nth(1).unwrap_or(detail).to_string();
                                 let resolved = core.resolve_address(&raw);
                                 use std::fmt::Write;
                                 let _ = write!(
