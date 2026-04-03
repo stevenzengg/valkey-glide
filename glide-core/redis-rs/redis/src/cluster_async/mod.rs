@@ -462,26 +462,26 @@ where
     ///
     /// Returns `(resolved_address, resolution_path)`.
     pub(crate) fn resolve_address_with_path(&self, address: &str) -> (String, &'static str) {
-        let params = self.cluster_params.read().expect(MUTEX_READ_ERR);
-        let resolved = cluster::resolve_address(address, params.address_resolver.as_deref());
-
-        // Step 1: If the resolved address has a connection, return it directly.
         let conn_lock = self.conn_lock.read().expect(MUTEX_READ_ERR);
-        if conn_lock.connection_for_address(&resolved).is_some() {
-            return (resolved, "dns_resolved");
-        }
 
-        // Step 2: If the resolved address didn't match a connection, try reverse IP lookup.
-        // This handles the case where MOVED/ASK errors return raw IP addresses
-        // (e.g., "10.186.24.36:6379") that can't be translated by the address resolver
-        // but can be mapped back to a known node via the IP→address map built from
-        // CLUSTER SLOTS.
+        // Step 1: Reverse IP lookup via slot map. This returns the exact hostname:port
+        // from nodes_map, which is correct even when all nodes share one hostname
+        // and are distinguished only by port (e.g., NLB setups).
         if let Some((host, _port_str)) = address.rsplit_once(':') {
             if let Ok(ip) = host.parse::<IpAddr>() {
                 if let Some(node_address) = conn_lock.slot_map.node_address_for_ip(ip) {
                     return (node_address.to_string(), "reverse_ip_lookup");
                 }
             }
+        }
+
+        // Step 2: DNS/address-resolver. Resolves the hostname but preserves the port
+        // from the input address. This works for setups where each node has a unique
+        // hostname and the port in MOVED responses is correct.
+        let params = self.cluster_params.read().expect(MUTEX_READ_ERR);
+        let resolved = cluster::resolve_address(address, params.address_resolver.as_deref());
+        if conn_lock.connection_for_address(&resolved).is_some() {
+            return (resolved, "dns_resolved");
         }
 
         // Step 3: No connection found — return raw resolved address as fallback.
