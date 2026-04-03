@@ -14,6 +14,7 @@ use crate::{cluster_routing, RedisResult, Value};
 use crate::{cluster_routing::Route, Cmd, ErrorKind, RedisError};
 use cluster_routing::RoutingInfo::{MultiNode, SingleNode};
 use futures::FutureExt;
+use logger_core::log_error;
 use rand::prelude::IteratorRandom;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -1072,7 +1073,7 @@ where
                     index,
                     inner_index,
                     Value::ServerError(error),
-                    address.clone(),
+                    address,
                 )?;
                 continue;
             }
