@@ -1064,38 +1064,8 @@ where
         let (index, inner_index) = indices;
 
         if matches!(retry_method, RetryMethod::MovedRedirect) {
-            if let Some(redirect_node) =
-                RedirectNode::from_option_tuple(redis_error.redirect_node())
-            {
-                if let Err(update_err) = ClusterConnInner::update_upon_moved_error(
-                    core.clone(),
-                    redirect_node.slot,
-                    core.resolve_address(&redirect_node.address).into(),
-                )
-                .await
-                {
-                    // Failed to update the cluster state. Append this error and continue.
-                    error.append_detail(&update_err.into());
-                    add_pipeline_result(
-                        pipeline_responses,
-                        index,
-                        inner_index,
-                        Value::ServerError(error),
-                        address.clone(),
-                    )?;
-                    continue;
-                }
-                // Trigger a background topology refresh, matching single-command MOVED behavior.
-                let _ = ClusterConnInner::spawn_refresh_slots_task(
-                    core.clone(),
-                    &RefreshPolicy::Throttable,
-                );
-            } else {
-                // Failed to parse MOVED error. Append this error and continue.
-                let server_error = ServerError::KnownError {
-                    kind: ServerErrorKind::Moved,
-                    detail: Some("Failed to parse MOVED error".to_string()),
-                };
+            if let Err(server_error) = pipeline_handle_moved_redirect(core.clone(), &redis_error).await {
+                // A failure occurred, so we will append the error and continue to the next entry
                 error.append_detail(&server_error);
                 add_pipeline_result(
                     pipeline_responses,
@@ -1106,6 +1076,11 @@ where
                 )?;
                 continue;
             }
+            // Trigger a background topology refresh, matching single-command MOVED behavior.
+            let _ = ClusterConnInner::spawn_refresh_slots_task(
+                core.clone(),
+                &RefreshPolicy::Throttable,
+            );
         }
 
         if let Some(redirect_info) = redis_error.redirect(false) {
@@ -1158,6 +1133,32 @@ where
         )?;
     }
     Ok(())
+}
+
+/// Handles a MOVED redirection error by updating the cluster topology.
+/// If updating the topology fails, the error is returned.
+async fn pipeline_handle_moved_redirect<C>(
+    core: Core<C>,
+    redis_error: &RedisError,
+) -> Result<(), ServerError>
+where
+    C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
+{
+    let redirect_node =
+        RedirectNode::from_option_tuple(redis_error.redirect_node()).ok_or_else(|| {
+            ServerError::ExtensionError {
+                code: "ParsingError".to_string(),
+                detail: Some("Failed to parse MOVED error".to_string()),
+            }
+        })?;
+
+    ClusterConnInner::update_upon_moved_error(
+        core.clone(),
+        redirect_node.slot,
+        core.resolve_address(&redirect_node.address).into(),
+    )
+    .await
+    .map_err(Into::into)
 }
 
 /// Append the commands that encountered errors during pipeline execution for later retry.
