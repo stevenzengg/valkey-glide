@@ -1,6 +1,7 @@
 use crate::aio::ConnectionLike;
 use crate::cluster_async::ClusterConnInner;
 use crate::cluster_async::Connect;
+use crate::cluster_async::RefreshPolicy;
 use crate::cluster_async::MUTEX_READ_ERR;
 use crate::cluster_routing::RoutingInfo;
 use crate::cluster_routing::SlotAddr;
@@ -13,7 +14,6 @@ use crate::{cluster_routing, RedisResult, Value};
 use crate::{cluster_routing::Route, Cmd, ErrorKind, RedisError};
 use cluster_routing::RoutingInfo::{MultiNode, SingleNode};
 use futures::FutureExt;
-use logger_core::log_error;
 use rand::prelude::IteratorRandom;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -774,10 +774,6 @@ where
 
     let mut retry = 0;
 
-    // Initialize `PendingMovedUpdates` to store the pending MOVED updates for the slots.
-    // Many commands can be redirected to the same slot, so we key by the slot number and store the resolved address.
-    // If a command succeeds, we will update the slot map with the confirmed address.
-    let mut pending_moved_updates: HashMap<u16, String> = HashMap::new();
     // Initialize `PipelineResponses` to store responses for each pipeline command.
     // This will be used to store the responses from the different sub-pipelines to the pipeline commands.
     // A command can have one or more responses (e.g MultiNode commands).
@@ -792,21 +788,7 @@ where
             pipeline_retry_strategy,
         ) {
             Ok(retry_map) => {
-                // If there are no retirable errors, or we have reached the maximum number of retries, we're done
-                // Apply pending MOVED updates only for slots where at least one command succeeded, confirming the redirected node owns the slot.
                 if retry_map.is_empty() || retry >= retry_params.number_of_retries {
-                    for (slot, resolved_addr) in &pending_moved_updates {
-                        let any_succeeded = pipeline_responses.iter().any(|responses| {
-                            responses.iter().any(|(_, v)| !matches!(v, Value::ServerError(_)))
-                        });
-                        if any_succeeded {
-                            let _ = ClusterConnInner::update_upon_moved_error(
-                                core.clone(),
-                                *slot,
-                                resolved_addr.clone().into(),
-                            ).await;
-                        }
-                    }
                     return Ok(pipeline_responses);
                 }
 
@@ -821,7 +803,6 @@ where
                     &mut pipeline_responses,
                     response_policies,
                     pipeline_retry_strategy,
-                    &mut pending_moved_updates,
                 )
                 .await
                 {
@@ -873,7 +854,6 @@ async fn handle_retry_map<C>(
     pipeline_responses: &mut PipelineResponses,
     response_policies: &mut ResponsePoliciesMap,
     pipeline_retry_strategy: PipelineRetryStrategy,
-    pending_moved_updates: &mut HashMap<u16, String>,
 ) -> Result<
     (
         Vec<Result<RedisResult<Response>, RecvError>>,
@@ -931,7 +911,6 @@ where
                     pipeline_responses,
                     &mut pipeline_map,
                     response_policies,
-                    pending_moved_updates,
                 )
                 .await?;
             }
@@ -1075,7 +1054,6 @@ async fn handle_redirect_logic<C>(
     pipeline_responses: &mut PipelineResponses,
     pipeline_map: &mut NodePipelineMap<C>,
     response_policies: &mut ResponsePoliciesMap,
-    pending_moved_updates: &mut HashMap<u16, String>,
 ) -> Result<(), (OperationTarget, RedisError)>
 where
     C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
@@ -1086,8 +1064,47 @@ where
         let (index, inner_index) = indices;
 
         if matches!(retry_method, RetryMethod::MovedRedirect) {
-            if let Some(redirect_node) = RedirectNode::from_option_tuple(redis_error.redirect_node()) {
-                pending_moved_updates.insert(redirect_node.slot, core.resolve_address(&redirect_node.address));
+            if let Some(redirect_node) =
+                RedirectNode::from_option_tuple(redis_error.redirect_node())
+            {
+                if let Err(update_err) = ClusterConnInner::update_upon_moved_error(
+                    core.clone(),
+                    redirect_node.slot,
+                    core.resolve_address(&redirect_node.address).into(),
+                )
+                .await
+                {
+                    // Failed to update the cluster state. Append this error and continue.
+                    error.append_detail(&update_err.into());
+                    add_pipeline_result(
+                        pipeline_responses,
+                        index,
+                        inner_index,
+                        Value::ServerError(error),
+                        address.clone(),
+                    )?;
+                    continue;
+                }
+                // Trigger a background topology refresh, matching single-command MOVED behavior.
+                let _ = ClusterConnInner::spawn_refresh_slots_task(
+                    core.clone(),
+                    &RefreshPolicy::Throttable,
+                );
+            } else {
+                // Failed to parse MOVED error. Append this error and continue.
+                let server_error = ServerError::KnownError {
+                    kind: ServerErrorKind::Moved,
+                    detail: Some("Failed to parse MOVED error".to_string()),
+                };
+                error.append_detail(&server_error);
+                add_pipeline_result(
+                    pipeline_responses,
+                    index,
+                    inner_index,
+                    Value::ServerError(error),
+                    address.clone(),
+                )?;
+                continue;
             }
         }
 

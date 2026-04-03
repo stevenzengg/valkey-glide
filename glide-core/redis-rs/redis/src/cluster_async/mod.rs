@@ -1657,7 +1657,7 @@ where
         notifiers
     }
 
-    fn spawn_refresh_slots_task(
+    pub(crate) fn spawn_refresh_slots_task(
         inner: Arc<InnerCore<C>>,
         policy: &RefreshPolicy,
     ) -> JoinHandle<RedisResult<()>> {
