@@ -448,10 +448,6 @@ where
     /// If no address resolver is configured, or the address cannot be parsed, returns the
     /// original address unchanged.
     pub(crate) fn resolve_address(&self, address: &str) -> String {
-        self.resolve_address_with_path(address).0
-    }
-
-    pub(crate) fn resolve_address_with_path(&self, address: &str) -> (String, &'static str) {
         let conn_lock = self.conn_lock.read().expect(MUTEX_READ_ERR);
 
         // Step 1: Reverse IP lookup via slot map. This returns the exact hostname:port
@@ -460,7 +456,7 @@ where
         if let Some((host, _port_str)) = address.rsplit_once(':') {
             if let Ok(ip) = host.parse::<IpAddr>() {
                 if let Some(node_address) = conn_lock.slot_map.node_address_for_ip(ip) {
-                    return (node_address.to_string(), "reverse_ip_lookup");
+                    return node_address.to_string();
                 }
             }
         }
@@ -471,11 +467,11 @@ where
         let params = self.cluster_params.read().expect(MUTEX_READ_ERR);
         let resolved = cluster::resolve_address(address, params.address_resolver.as_deref());
         if conn_lock.connection_for_address(&resolved).is_some() {
-            return (resolved, "dns_resolved");
+            return resolved;
         }
 
         // Step 3: No connection found — return raw resolved address as fallback.
-        (resolved, "raw_fallback")
+        resolved
     }
 
     fn get_cluster_param<T, F>(&self, f: F) -> Result<T, RedisError>

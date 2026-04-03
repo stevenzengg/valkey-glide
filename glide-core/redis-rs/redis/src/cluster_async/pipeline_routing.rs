@@ -773,7 +773,16 @@ where
         .expect(MUTEX_READ_ERR);
 
     let mut retry = 0;
+
+    // Initialize `PendingMovedUpdates` to store the pending MOVED updates for the slots.
+    // Many commands can be redirected to the same slot, so we key by the slot number and store the resolved address.
+    // If a command succeeds, we will update the slot map with the confirmed address.
     let mut pending_moved_updates: HashMap<u16, String> = HashMap::new();
+    // Initialize `PipelineResponses` to store responses for each pipeline command.
+    // This will be used to store the responses from the different sub-pipelines to the pipeline commands.
+    // A command can have one or more responses (e.g MultiNode commands).
+    // Each entry in `PipelineResponses` corresponds to a command in the original pipeline and contains
+    // a vector of tuples where each tuple holds a response to the command and the address of the node that provided it.
     let mut pipeline_responses: PipelineResponses = vec![Vec::new(); pipeline.len()];
     loop {
         match process_pipeline_responses(
@@ -783,6 +792,7 @@ where
             pipeline_retry_strategy,
         ) {
             Ok(retry_map) => {
+                // If there are no retirable errors, or we have reached the maximum number of retries, we're done
                 // Apply pending MOVED updates only for slots where at least one command succeeded, confirming the redirected node owns the slot.
                 if retry_map.is_empty() || retry >= retry_params.number_of_retries {
                     for (slot, resolved_addr) in &pending_moved_updates {
@@ -801,9 +811,6 @@ where
                 }
 
                 retry = retry.saturating_add(1);
-                // Backoff before retrying, matching the single-command retry behavior.
-                // Without this, pipeline retries fire instantly and exhaust all attempts
-                // before a slot migration completes.
                 tokio::time::sleep(retry_params.wait_time_for_retry(retry)).await;
                 // TODO: consider moving this logic into sub-pipelines
                 match handle_retry_map(
