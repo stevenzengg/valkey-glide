@@ -451,16 +451,6 @@ where
         self.resolve_address_with_path(address).0
     }
 
-    /// Resolves an address and returns both the resolved address and a human-readable
-    /// description of which resolution step succeeded. Useful for embedding in error
-    /// messages to diagnose MOVED/ASK redirect failures.
-    ///
-    /// Resolution steps (in order):
-    /// 1. DNS/address-resolver → direct connection lookup
-    /// 2. Reverse IP lookup via slot map (for raw IPs returned by MOVED/ASK)
-    /// 3. Raw fallback (no connection found)
-    ///
-    /// Returns `(resolved_address, resolution_path)`.
     pub(crate) fn resolve_address_with_path(&self, address: &str) -> (String, &'static str) {
         let conn_lock = self.conn_lock.read().expect(MUTEX_READ_ERR);
 

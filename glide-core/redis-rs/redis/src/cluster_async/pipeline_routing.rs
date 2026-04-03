@@ -772,27 +772,8 @@ where
         .get_cluster_param(|params| params.retry_params.clone())
         .expect(MUTEX_READ_ERR);
 
-    // Generate a time-based request ID to correlate all redirect hops for this pipeline execution.
-    // Format: hex timestamp (ms) + random 16-bit suffix to avoid collisions within the same millisecond.
-    let request_id = {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let suffix: u16 = rand::random();
-        format!("{:x}{:04x}", ms, suffix)
-    };
-
     let mut retry = 0;
-    let mut debug_log = String::new();
-    let retry_start = tokio::time::Instant::now();
-
-    // Initialize `PipelineResponses` to store responses for each pipeline command.
-    // This will be used to store the responses from the different sub-pipelines to the pipeline commands.
-    // A command can have one or more responses (e.g MultiNode commands).
-    // Each entry in `PipelineResponses` corresponds to a command in the original pipeline and contains
-    // a vector of tuples where each tuple holds a response to the command and the address of the node that provided it.
+    let mut pending_moved_updates: HashMap<u16, String> = HashMap::new();
     let mut pipeline_responses: PipelineResponses = vec![Vec::new(); pipeline.len()];
     loop {
         match process_pipeline_responses(
@@ -802,53 +783,18 @@ where
             pipeline_retry_strategy,
         ) {
             Ok(retry_map) => {
-                // Accumulate debug info for each retry attempt
-                for (retry_method, entries) in &retry_map {
-                    for ((idx, _), addr, err) in entries {
-                        if matches!(retry_method, RetryMethod::MovedRedirect) {
-                            if let Some(detail) = err.details() {
-                                // detail is "5108 10.186.23.5:6379" — extract the address after the space
-                                let raw = detail.split_whitespace().nth(1).unwrap_or(detail).to_string();
-                                let resolved = core.resolve_address(&raw);
-                                use std::fmt::Write;
-                                let elapsed_ms = retry_start.elapsed().as_millis();
-                                let _ = write!(
-                                    debug_log,
-                                    "retry#{} t={}ms cmd={} from={} raw={} resolved={};",
-                                    retry, elapsed_ms, idx, addr, raw, resolved
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // If there are no retirable errors, or we have reached the maximum number of retries, we're done
+                // Apply pending MOVED updates only for slots where at least one command succeeded, confirming the redirected node owns the slot.
                 if retry_map.is_empty() || retry >= retry_params.number_of_retries {
-                    // Append accumulated debug log to any remaining ServerError responses
-                    if !debug_log.is_empty() {
-                        let conn_lock = core.conn_lock.read().expect(MUTEX_READ_ERR);
-                        let node_map_str: String = conn_lock
-                            .slot_map_nodes()
-                            .map(|(addr, (ip, _))| format!("{}->ip:{:?}", addr, ip))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        drop(conn_lock);
-                        use std::fmt::Write;
-                        let _ = write!(debug_log, " nodes=[{}]", node_map_str);
-
-                        for responses in pipeline_responses.iter_mut() {
-                            for (_addr, value) in responses.iter_mut() {
-                                if let Value::ServerError(
-                                    ServerError::KnownError { detail, .. }
-                                    | ServerError::ExtensionError { detail, .. }
-                                ) = value {
-                                    if let Some(existing) = detail {
-                                        existing.push_str(&format!("; PipelineRetryDebug: {}", debug_log));
-                                    } else {
-                                        *detail = Some(format!("PipelineRetryDebug: {}", debug_log));
-                                    }
-                                }
-                            }
+                    for (slot, resolved_addr) in &pending_moved_updates {
+                        let any_succeeded = pipeline_responses.iter().any(|responses| {
+                            responses.iter().any(|(_, v)| !matches!(v, Value::ServerError(_)))
+                        });
+                        if any_succeeded {
+                            let _ = ClusterConnInner::update_upon_moved_error(
+                                core.clone(),
+                                *slot,
+                                resolved_addr.clone().into(),
+                            ).await;
                         }
                     }
                     return Ok(pipeline_responses);
@@ -868,7 +814,7 @@ where
                     &mut pipeline_responses,
                     response_policies,
                     pipeline_retry_strategy,
-                    &request_id,
+                    &mut pending_moved_updates,
                 )
                 .await
                 {
@@ -920,7 +866,7 @@ async fn handle_retry_map<C>(
     pipeline_responses: &mut PipelineResponses,
     response_policies: &mut ResponsePoliciesMap,
     pipeline_retry_strategy: PipelineRetryStrategy,
-    request_id: &str,
+    pending_moved_updates: &mut HashMap<u16, String>,
 ) -> Result<
     (
         Vec<Result<RedisResult<Response>, RecvError>>,
@@ -978,8 +924,7 @@ where
                     pipeline_responses,
                     &mut pipeline_map,
                     response_policies,
-                    retry,
-                    request_id,
+                    pending_moved_updates,
                 )
                 .await?;
             }
@@ -1123,8 +1068,7 @@ async fn handle_redirect_logic<C>(
     pipeline_responses: &mut PipelineResponses,
     pipeline_map: &mut NodePipelineMap<C>,
     response_policies: &mut ResponsePoliciesMap,
-    retry: u32,
-    request_id: &str,
+    pending_moved_updates: &mut HashMap<u16, String>,
 ) -> Result<(), (OperationTarget, RedisError)>
 where
     C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
@@ -1134,68 +1078,9 @@ where
         let redis_error: RedisError = error.clone().into();
         let (index, inner_index) = indices;
 
-        // Handle MOVED redirect by updating the topology
         if matches!(retry_method, RetryMethod::MovedRedirect) {
-            // Append rich redirect debug info to the error so it surfaces in the JVM exception message.
-            // Each hop is tagged with a request ID and hop number to allow full redirect trace correlation.
-            if let Some((raw_addr, slot)) = redis_error.redirect_node().map(|(addr, slot)| (addr.to_string(), slot)) {
-                let (resolved, resolution_path) = core.resolve_address_with_path(&raw_addr);
-                let conn_lock = core.conn_lock.read().expect(MUTEX_READ_ERR);
-                let node_map_str: String = conn_lock
-                    .slot_map_nodes()
-                    .map(|(addr, (ip, shards))| {
-                        let replicas = shards
-                            .replicas()
-                            .iter()
-                            .map(|r| r.as_str())
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        format!(
-                            "{}(ip={},primary={},replicas=[{}])",
-                            addr,
-                            ip.map_or_else(|| "?".to_string(), |i| i.to_string()),
-                            shards.primary(),
-                            replicas,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                let slot_owner = conn_lock
-                    .slot_map
-                    .node_address_for_slot(slot, SlotAddr::Master)
-                    .map(|a| a.to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
-                drop(conn_lock);
-                let debug = ServerError::ExtensionError {
-                    code: "RedirectHop".to_string(),
-                    detail: Some(format!(
-                        "glide-redirect-trace [req={} hop={}] slot={} raw={} resolved={} resolution={} slot_owner={} nodes=[{}]",
-                        request_id,
-                        retry,
-                        slot,
-                        raw_addr,
-                        resolved,
-                        resolution_path,
-                        slot_owner,
-                        node_map_str,
-                    )),
-                };
-                error.append_detail(&debug);
-            }
-
-            if let Err(server_error) =
-                pipeline_handle_moved_redirect(core.clone(), &redis_error).await
-            {
-                // A failure occurred, so we will append the error and continue to the next entry
-                error.append_detail(&server_error);
-                add_pipeline_result(
-                    pipeline_responses,
-                    index,
-                    inner_index,
-                    Value::ServerError(error),
-                    address,
-                )?;
-                continue;
+            if let Some(redirect_node) = RedirectNode::from_option_tuple(redis_error.redirect_node()) {
+                pending_moved_updates.insert(redirect_node.slot, core.resolve_address(&redirect_node.address));
             }
         }
 
@@ -1249,52 +1134,6 @@ where
         )?;
     }
     Ok(())
-}
-
-/// Handles a MOVED redirection error by updating the cluster topology.
-/// If updating the topology fails, the error is returned.
-async fn pipeline_handle_moved_redirect<C>(
-    core: Core<C>,
-    redis_error: &RedisError,
-) -> Result<(), ServerError>
-where
-    C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
-{
-    let redirect_node =
-        RedirectNode::from_option_tuple(redis_error.redirect_node()).ok_or_else(|| {
-            ServerError::ExtensionError {
-                code: "ParsingError".to_string(),
-                detail: Some("Failed to parse MOVED error".to_string()),
-            }
-        })?;
-
-    let raw_addr = &redirect_node.address;
-    let resolved = core.resolve_address(raw_addr);
-
-    // Log raw IP, resolved address, and full node mapping for debugging MOVED errors
-    {
-        let conn_lock = core.conn_lock.read().expect(MUTEX_READ_ERR);
-        let node_map_str: String = conn_lock
-            .slot_map_nodes()
-            .map(|(addr, (ip, _))| format!("{}->ip:{:?}", addr, ip))
-            .collect::<Vec<_>>()
-            .join(", ");
-        log_error(
-            "pipeline_moved_redirect",
-            format!(
-                "MOVED slot={} raw={} resolved={} nodes=[{}]",
-                redirect_node.slot, raw_addr, resolved, node_map_str
-            ),
-        );
-    }
-
-    ClusterConnInner::update_upon_moved_error(
-        core.clone(),
-        redirect_node.slot,
-        resolved.into(),
-    )
-    .await
-    .map_err(Into::into)
 }
 
 /// Append the commands that encountered errors during pipeline execution for later retry.
