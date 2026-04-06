@@ -1,7 +1,6 @@
 use crate::aio::ConnectionLike;
 use crate::cluster_async::ClusterConnInner;
 use crate::cluster_async::Connect;
-use crate::cluster_async::RefreshPolicy;
 use crate::cluster_async::MUTEX_READ_ERR;
 use crate::cluster_routing::RoutingInfo;
 use crate::cluster_routing::SlotAddr;
@@ -789,12 +788,12 @@ where
             pipeline_retry_strategy,
         ) {
             Ok(retry_map) => {
+                // If there are no retirable errors, or we have reached the maximum number of retries, we're done
                 if retry_map.is_empty() || retry >= retry_params.number_of_retries {
                     return Ok(pipeline_responses);
                 }
 
                 retry = retry.saturating_add(1);
-                tokio::time::sleep(retry_params.wait_time_for_retry(retry)).await;
                 // TODO: consider moving this logic into sub-pipelines
                 match handle_retry_map(
                     retry_map,
@@ -1064,6 +1063,7 @@ where
         let redis_error: RedisError = error.clone().into();
         let (index, inner_index) = indices;
 
+        // Handle MOVED redirect by updating the topology
         if matches!(retry_method, RetryMethod::MovedRedirect) {
             if let Err(server_error) = pipeline_handle_moved_redirect(core.clone(), &redis_error).await {
                 // A failure occurred, so we will append the error and continue to the next entry
@@ -1077,11 +1077,6 @@ where
                 )?;
                 continue;
             }
-            // Trigger a background topology refresh, matching single-command MOVED behavior.
-            let _ = ClusterConnInner::spawn_refresh_slots_task(
-                core.clone(),
-                &RefreshPolicy::Throttable,
-            );
         }
 
         if let Some(redirect_info) = redis_error.redirect(false) {
