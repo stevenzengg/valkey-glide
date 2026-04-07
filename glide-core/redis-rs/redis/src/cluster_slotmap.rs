@@ -1525,4 +1525,96 @@ mod tests_cluster_slotmap {
         let found_addr = slot_map.node_address_for_ip(ip);
         assert_eq!(found_addr, Some(Arc::new("new-node:6379".to_string())));
     }
+
+    #[test]
+    fn test_populate_ips_empty_vec_is_noop() {
+        let slot_map = SlotMap::new(
+            vec![Slot::new(0, 16383, "node1:6379".to_owned(), vec![])],
+            HashMap::new(),
+            ReadFromReplicaStrategy::AlwaysFromPrimary,
+        );
+        // Populate with empty vec — should not panic or change anything
+        slot_map.populate_ips(vec![]);
+        let result = slot_map.node_address_for_ip("10.0.0.1".parse().unwrap());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_populate_ips_unknown_address_is_ignored() {
+        let slot_map = SlotMap::new(
+            vec![Slot::new(0, 16383, "node1:6379".to_owned(), vec![])],
+            HashMap::new(),
+            ReadFromReplicaStrategy::AlwaysFromPrimary,
+        );
+        // Address not in nodes_map — should be silently ignored
+        slot_map.populate_ips(vec![("unknown-node:9999".to_string(), "10.0.0.99".parse().unwrap())]);
+        let result = slot_map.node_address_for_ip("10.0.0.99".parse().unwrap());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_carry_over_ips_fresh_takes_priority_over_carryover() {
+        // node1 gets a fresh IP via populate_ips
+        let new_map = SlotMap::new(
+            vec![Slot::new(0, 16383, "node1:6379".to_owned(), vec![])],
+            HashMap::from([("node1:6379".to_string(), "10.0.0.2".parse().unwrap())]),
+            ReadFromReplicaStrategy::AlwaysFromPrimary,
+        );
+
+        // Old map had a different IP for node1
+        let old_map = SlotMap::new(
+            vec![Slot::new(0, 16383, "node1:6379".to_owned(), vec![])],
+            HashMap::from([("node1:6379".to_string(), "10.0.0.1".parse().unwrap())]),
+            ReadFromReplicaStrategy::AlwaysFromPrimary,
+        );
+
+        // carry_over should NOT overwrite the fresh IP with the old one
+        new_map.carry_over_ips_from(&old_map);
+
+        // Fresh IP (10.0.0.2) should win, not the old one (10.0.0.1)
+        let result = new_map.node_address_for_ip("10.0.0.2".parse().unwrap());
+        assert_eq!(result, Some(Arc::new("node1:6379".to_string())));
+
+        let old_result = new_map.node_address_for_ip("10.0.0.1".parse().unwrap());
+        assert!(old_result.is_none(), "Old IP should not be carried over when fresh IP exists");
+    }
+
+    #[test]
+    fn test_carry_over_ips_fills_gaps_from_old_map() {
+        // new_map has node1 with no IP, node2 with fresh IP
+        let new_map = SlotMap::new(
+            vec![
+                Slot::new(0, 8191, "node1:6379".to_owned(), vec![]),
+                Slot::new(8192, 16383, "node2:6380".to_owned(), vec![]),
+            ],
+            HashMap::from([("node2:6380".to_string(), "10.0.0.2".parse().unwrap())]),
+            ReadFromReplicaStrategy::AlwaysFromPrimary,
+        );
+
+        // old_map had IPs for both nodes
+        let old_map = SlotMap::new(
+            vec![
+                Slot::new(0, 8191, "node1:6379".to_owned(), vec![]),
+                Slot::new(8192, 16383, "node2:6380".to_owned(), vec![]),
+            ],
+            HashMap::from([
+                ("node1:6379".to_string(), "10.0.0.1".parse().unwrap()),
+                ("node2:6380".to_string(), "10.0.0.99".parse().unwrap()), // stale, should NOT override fresh
+            ]),
+            ReadFromReplicaStrategy::AlwaysFromPrimary,
+        );
+
+        new_map.carry_over_ips_from(&old_map);
+
+        // node1's IP should be carried over from old map (gap filled)
+        let node1_result = new_map.node_address_for_ip("10.0.0.1".parse().unwrap());
+        assert_eq!(node1_result, Some(Arc::new("node1:6379".to_string())));
+
+        // node2's fresh IP should be preserved, not overwritten by stale old IP
+        let node2_fresh = new_map.node_address_for_ip("10.0.0.2".parse().unwrap());
+        assert_eq!(node2_fresh, Some(Arc::new("node2:6380".to_string())));
+
+        let node2_stale = new_map.node_address_for_ip("10.0.0.99".parse().unwrap());
+        assert!(node2_stale.is_none(), "Stale IP should not override fresh IP");
+    }
 }

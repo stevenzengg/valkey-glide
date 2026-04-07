@@ -2388,8 +2388,9 @@ where
         // TODO - Maybe we can take the running refresh tasks and use them instead of running new connection creation
         write_guard.refresh_conn_state.clear_refresh_state();
         new_slots.carry_over_ips_from(&write_guard.slot_map);
-        let read_from_replicas =
-            inner.get_cluster_param(|params| params.read_from_replicas.clone());
+        let read_from_replicas = inner
+            .get_cluster_param(|params| params.read_from_replicas.clone())
+            .unwrap_or_default();
         *write_guard = ConnectionsContainer::new(
             new_slots,
             new_connections,
@@ -2415,7 +2416,7 @@ where
     ///    IP→address table (built from DNS resolution during CLUSTER SLOTS refresh).
     /// 2. Raw address fallback: return the original address unchanged.
     pub(crate) fn resolve_address(inner: &Arc<InnerCore<C>>, address: &str) -> String {
-        let conn_lock = inner.conn_lock.read();
+        let conn_lock = inner.conn_lock.read().unwrap();
 
         // Step 1: Reverse IP lookup via slot map.
         if let Some((host, _port)) = address.rsplit_once(':') {

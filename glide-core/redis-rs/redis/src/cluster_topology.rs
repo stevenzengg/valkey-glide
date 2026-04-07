@@ -971,7 +971,7 @@ mod tests {
                 slots_count,
                 slots,
                 address_to_ip_map,
-            } = parse_and_count_slots(&view, None, "fallback").unwrap();
+            } = parse_and_count_slots(&view, None, "fallback", None).unwrap();
 
             assert_eq!(slots_count, 16384);
             assert_eq!(slots.len(), 1);
