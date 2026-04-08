@@ -57,15 +57,19 @@ impl redis::AddressResolver for JavaAddressResolver {
                         && !resolved_address.is_null()
                     {
                         // Get the resolved host and port from the ResolvedAddress object
-                        if let Ok(resolved_host_obj) =
-                            env.call_method(&resolved_address, "getHost", "()Ljava/lang/String;", &[])
-                            && let Ok(resolved_host_jobj) = resolved_host_obj.l()
+                        if let Ok(resolved_host_obj) = env.call_method(
+                            &resolved_address,
+                            "getHost",
+                            "()Ljava/lang/String;",
+                            &[],
+                        ) && let Ok(resolved_host_jobj) = resolved_host_obj.l()
                             && !resolved_host_jobj.is_null()
                             && let Ok(resolved_port_val) =
                                 env.call_method(&resolved_address, "getPort", "()I", &[])
                             && let Ok(resolved_port) = resolved_port_val.i()
                         {
-                            let resolved_host_jstr: jni::objects::JString = resolved_host_jobj.into();
+                            let resolved_host_jstr: jni::objects::JString =
+                                resolved_host_jobj.into();
                             if let Ok(resolved_host_str) = env.get_string(&resolved_host_jstr) {
                                 let resolved_host_string =
                                     resolved_host_str.to_str().unwrap_or(host).to_string();
