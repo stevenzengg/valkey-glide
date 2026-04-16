@@ -9,7 +9,7 @@ use logger_core::log_debug;
 use logger_core::log_warn;
 use redis::aio::ConnectionLike;
 use redis::cluster_routing::{self, ResponsePolicy, Routable, RoutingInfo, is_readonly_cmd};
-use redis::{PushInfo, RedisError, RedisResult, RetryStrategy, Value};
+use redis::{AddressResolver, PushInfo, RedisError, RedisResult, RetryStrategy, Value};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -229,7 +229,7 @@ impl StandaloneClient {
 
         let iam_token_handle = iam_token_manager.map(|m| m.get_token_handle());
 
-        let mut stream = stream::iter(addresses.into_iter())
+        let mut stream = stream::iter(addresses)
             .map(move |address| {
                 let info = valkey_connection_info.clone();
                 let retry = retry_strategy;
@@ -240,6 +240,7 @@ impl StandaloneClient {
                 let params = tls_params.clone();
                 let nodelay = tcp_nodelay;
                 let sync = pubsub_synchronizer.clone();
+                let resolver = connection_request.address_resolver.clone();
                 let skip_replication = read_only;
                 let iam_handle = iam_token_handle.clone();
                 async move {
@@ -255,6 +256,7 @@ impl StandaloneClient {
                         nodelay,
                         &sync,
                         skip_replication,
+                        resolver.as_ref(),
                         iam_handle,
                     )
                     .await
@@ -870,6 +872,7 @@ async fn get_connection_and_replication_info(
     tcp_nodelay: bool,
     pubsub_synchronizer: &Option<Arc<dyn crate::pubsub::PubSubSynchronizer>>,
     skip_replication_check: bool,
+    address_resolver: Option<&Arc<dyn AddressResolver>>,
     iam_token_handle: Option<super::IAMTokenHandle>,
 ) -> Result<(ReconnectingConnection, Option<Value>), (ReconnectingConnection, RedisError)> {
     let reconnecting_connection = ReconnectingConnection::new(
@@ -883,6 +886,7 @@ async fn get_connection_and_replication_info(
         tls_params,
         tcp_nodelay,
         pubsub_synchronizer.clone(),
+        address_resolver,
         iam_token_handle,
     )
     .await?;
