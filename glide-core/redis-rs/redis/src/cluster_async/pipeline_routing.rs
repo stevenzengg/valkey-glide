@@ -13,7 +13,7 @@ use crate::{cluster_routing, RedisResult, Value};
 use crate::{cluster_routing::Route, Cmd, ErrorKind, RedisError};
 use cluster_routing::RoutingInfo::{MultiNode, SingleNode};
 use futures::FutureExt;
-use logger_core::log_error;
+use logger_core::{log_error, log_structured};
 use rand::prelude::IteratorRandom;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -695,6 +695,31 @@ fn update_retry_map(
     pipeline_retry_strategy: PipelineRetryStrategy,
 ) {
     let (index, inner_index) = indices;
+    let redis_error = RedisError::from(error.clone());
+    let redirect_node = redis_error.redirect_node();
+    let redirect_address = redirect_node
+        .map(|(node, _slot)| node.to_string())
+        .unwrap_or_default();
+    let redirect_slot = redirect_node
+        .map(|(_node, slot)| u64::from(slot))
+        .unwrap_or_default();
+    log_structured(
+        logger_core::Level::Warn,
+        "glide_cluster_pipeline_response_error",
+        logger_core::structured_fields!(
+            "node" => address.as_str(),
+            "command_index" => index,
+            "inner_index_present" => inner_index.is_some(),
+            "inner_index" => inner_index.unwrap_or_default(),
+            "retry_method" => format!("{retry_method:?}"),
+            "retry_connection_error" => pipeline_retry_strategy.retry_connection_error,
+            "error_kind" => format!("{:?}", redis_error.kind()),
+            "error_message" => redis_error.to_string(),
+            "redirect_present" => redirect_node.is_some(),
+            "redirect_address" => redirect_address,
+            "redirect_slot" => redirect_slot,
+        ),
+    );
     match retry_method {
         RetryMethod::NoRetry => {
             // Do nothing
@@ -1065,7 +1090,9 @@ where
 
         // Handle MOVED redirect by updating the topology
         if matches!(retry_method, RetryMethod::MovedRedirect) {
-            if let Err(server_error) = pipeline_handle_moved_redirect(core.clone(), &redis_error).await {
+            if let Err(server_error) =
+                pipeline_handle_moved_redirect(core.clone(), &redis_error).await
+            {
                 // A failure occurred, so we will append the error and continue to the next entry
                 error.append_detail(&server_error);
                 add_pipeline_result(

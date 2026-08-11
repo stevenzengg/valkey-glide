@@ -1,7 +1,8 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 use glide_core::client::FINISHED_SCAN_CURSOR;
-use glide_core::errors::error_message;
+use glide_core::errors::{error_message, error_type};
+use logger_core::log_structured;
 
 // Protocol constants for Java (defined directly since we don't use socket layer)
 const TYPE_HASH: &str = "hash";
@@ -24,8 +25,10 @@ use jni::objects::{
 use jni::sys::{jint, jlong};
 use parking_lot::Mutex;
 use redis::Value;
+use redis::cluster_routing::Routable;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 mod address_resolver;
 mod errors;
@@ -35,9 +38,207 @@ mod protobuf_bridge;
 
 use errors::{FFIError, handle_errors, handle_panics};
 use jni_client::*;
-use protobuf_bridge::*;
 
 use crate::address_resolver::JavaAddressResolver;
+
+fn elapsed_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn redis_command_name(cmd: &redis::Cmd) -> String {
+    cmd.command()
+        .map(|command| String::from_utf8_lossy(&command).into_owned())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn redis_value_type(value: &redis::Value) -> &'static str {
+    match value {
+        redis::Value::Nil => "nil",
+        redis::Value::Int(_) => "int",
+        redis::Value::BulkString(_) => "bulk_string",
+        redis::Value::Array(_) => "array",
+        redis::Value::SimpleString(_) => "simple_string",
+        redis::Value::Okay => "okay",
+        redis::Value::Map(_) => "map",
+        redis::Value::Attribute { .. } => "attribute",
+        redis::Value::Set(_) => "set",
+        redis::Value::Double(_) => "double",
+        redis::Value::Boolean(_) => "boolean",
+        redis::Value::VerbatimString { .. } => "verbatim_string",
+        redis::Value::BigNumber(_) => "big_number",
+        redis::Value::Push { .. } => "push",
+        redis::Value::ServerError(_) => "server_error",
+    }
+}
+
+fn routing_description(routing: &Option<redis::cluster_routing::RoutingInfo>) -> String {
+    routing
+        .as_ref()
+        .map(|routing| format!("{routing:?}"))
+        .unwrap_or_else(|| "default".to_string())
+}
+
+fn log_client_lookup_failed(callback_id: jlong, handle_id: u64, error: impl std::fmt::Display) {
+    log_structured(
+        logger_core::Level::Warn,
+        "glide_jni_client_lookup_failed",
+        logger_core::structured_fields!(
+            "callback_id" => callback_id,
+            "handle_id" => handle_id,
+            "error" => error.to_string(),
+        ),
+    );
+}
+
+struct SingleCommandLogContext<'a> {
+    callback_id: jlong,
+    handle_id: u64,
+    command_name: &'a str,
+    command_arg_count: usize,
+    routing: &'a str,
+}
+
+fn log_single_command_dispatched(
+    context: &SingleCommandLogContext<'_>,
+    expect_utf8: bool,
+    root_span_ptr_present: bool,
+) {
+    log_structured(
+        logger_core::Level::Debug,
+        "glide_jni_command_dispatched",
+        logger_core::structured_fields!(
+            "callback_id" => context.callback_id,
+            "handle_id" => context.handle_id,
+            "command_type" => "single",
+            "command_name" => context.command_name,
+            "command_arg_count" => context.command_arg_count,
+            "routing" => context.routing,
+            "expect_utf8" => expect_utf8,
+            "root_span_ptr_present" => root_span_ptr_present,
+        ),
+    );
+}
+
+fn log_single_command_completed(
+    context: &SingleCommandLogContext<'_>,
+    duration_ms: u64,
+    result: &Result<redis::Value, redis::RedisError>,
+) {
+    match result {
+        Ok(value) => log_structured(
+            logger_core::Level::Debug,
+            "glide_jni_command_completed",
+            logger_core::structured_fields!(
+                "callback_id" => context.callback_id,
+                "handle_id" => context.handle_id,
+                "command_type" => "single",
+                "command_name" => context.command_name,
+                "routing" => context.routing,
+                "duration_ms" => duration_ms,
+                "result" => "success",
+                "response_type" => redis_value_type(value),
+            ),
+        ),
+        Err(error) => log_structured(
+            logger_core::Level::Warn,
+            "glide_jni_command_completed",
+            logger_core::structured_fields!(
+                "callback_id" => context.callback_id,
+                "handle_id" => context.handle_id,
+                "command_type" => "single",
+                "command_name" => context.command_name,
+                "routing" => context.routing,
+                "duration_ms" => duration_ms,
+                "result" => "error",
+                "error_kind" => format!("{:?}", error.kind()),
+                "error_type" => format!("{:?}", error_type(error)),
+                "error_message" => error_message(error),
+            ),
+        ),
+    }
+}
+
+struct BatchCommandLogContext<'a> {
+    callback_id: jlong,
+    handle_id: u64,
+    command_count: usize,
+    command_names: &'a str,
+    is_atomic: bool,
+    routing: &'a str,
+}
+
+fn log_batch_command_dispatched(
+    context: &BatchCommandLogContext<'_>,
+    timeout: &str,
+    raise_on_error: bool,
+    retry_server_error: bool,
+    retry_connection_error: bool,
+    expect_utf8: bool,
+    root_span_ptr_present: bool,
+) {
+    log_structured(
+        logger_core::Level::Debug,
+        "glide_jni_command_dispatched",
+        logger_core::structured_fields!(
+            "callback_id" => context.callback_id,
+            "handle_id" => context.handle_id,
+            "command_type" => "batch",
+            "batch_command_count" => context.command_count,
+            "batch_command_names" => context.command_names,
+            "batch_is_atomic" => context.is_atomic,
+            "routing" => context.routing,
+            "timeout" => timeout,
+            "raise_on_error" => raise_on_error,
+            "retry_server_error" => retry_server_error,
+            "retry_connection_error" => retry_connection_error,
+            "expect_utf8" => expect_utf8,
+            "root_span_ptr_present" => root_span_ptr_present,
+        ),
+    );
+}
+
+fn log_batch_command_completed(
+    context: &BatchCommandLogContext<'_>,
+    duration_ms: u64,
+    result: &Result<redis::Value, redis::RedisError>,
+) {
+    match result {
+        Ok(value) => log_structured(
+            logger_core::Level::Debug,
+            "glide_jni_command_completed",
+            logger_core::structured_fields!(
+                "callback_id" => context.callback_id,
+                "handle_id" => context.handle_id,
+                "command_type" => "batch",
+                "batch_command_count" => context.command_count,
+                "batch_command_names" => context.command_names,
+                "batch_is_atomic" => context.is_atomic,
+                "routing" => context.routing,
+                "duration_ms" => duration_ms,
+                "result" => "success",
+                "response_type" => redis_value_type(value),
+            ),
+        ),
+        Err(error) => log_structured(
+            logger_core::Level::Warn,
+            "glide_jni_command_completed",
+            logger_core::structured_fields!(
+                "callback_id" => context.callback_id,
+                "handle_id" => context.handle_id,
+                "command_type" => "batch",
+                "batch_command_count" => context.command_count,
+                "batch_command_names" => context.command_names,
+                "batch_is_atomic" => context.is_atomic,
+                "routing" => context.routing,
+                "duration_ms" => duration_ms,
+                "result" => "error",
+                "error_kind" => format!("{:?}", error.kind()),
+                "error_type" => format!("{:?}", error_type(error)),
+                "error_message" => error_message(error),
+            ),
+        ),
+    }
+}
 
 #[derive(Clone)]
 pub struct RegistryMethodCache {
@@ -108,6 +309,7 @@ async fn execute_command_request_and_complete(
         let mut client = jni_client::ensure_client_for_handle(handle_id)
             .await
             .map_err(|e| {
+                log_client_lookup_failed(callback_id, handle_id, &e);
                 redis::RedisError::from((
                     redis::ErrorKind::ClientError,
                     "Client not found",
@@ -140,7 +342,25 @@ async fn execute_command_request_and_complete(
                     None
                 };
 
+                let command_name = redis_command_name(&cmd);
+                let command_arg_count = cmd.args_iter().len();
+                let routing_description = routing_description(&routing);
+                let log_context = SingleCommandLogContext {
+                    callback_id,
+                    handle_id,
+                    command_name: command_name.as_str(),
+                    command_arg_count,
+                    routing: routing_description.as_str(),
+                };
+                log_single_command_dispatched(
+                    &log_context,
+                    expect_utf8,
+                    root_span_ptr_opt.unwrap_or(0) != 0,
+                );
+                let command_started_at = Instant::now();
                 let exec = client.send_command(&mut cmd, routing).await;
+                let command_elapsed_ms = elapsed_ms(command_started_at.elapsed());
+                log_single_command_completed(&log_context, command_elapsed_ms, &exec);
 
                 if let Some(root_span_ptr) = root_span_ptr_opt
                     && root_span_ptr != 0
@@ -173,6 +393,7 @@ async fn execute_command_request_and_complete(
                 if batch.is_atomic {
                     pipeline.atomic();
                 }
+                let mut command_names = Vec::with_capacity(batch.commands.len());
                 for c in &batch.commands {
                     let valkey_cmd = protobuf_bridge::create_valkey_command(c).map_err(|e| {
                         redis::RedisError::from((
@@ -181,6 +402,7 @@ async fn execute_command_request_and_complete(
                             e.to_string(),
                         ))
                     })?;
+                    command_names.push(redis_command_name(&valkey_cmd));
                     pipeline.add_command(valkey_cmd);
                 }
 
@@ -197,6 +419,20 @@ async fn execute_command_request_and_complete(
                 } else {
                     None
                 };
+                let routing_description = routing_description(&routing);
+                let command_names = command_names.join(",");
+                let timeout_description = format!("{:?}", batch.timeout);
+                let raise_on_error = batch.raise_on_error.unwrap_or(true);
+                let retry_server_error = batch.retry_server_error.unwrap_or(false);
+                let retry_connection_error = batch.retry_connection_error.unwrap_or(false);
+                let log_context = BatchCommandLogContext {
+                    callback_id,
+                    handle_id,
+                    command_count: batch.commands.len(),
+                    command_names: command_names.as_str(),
+                    is_atomic: batch.is_atomic,
+                    routing: routing_description.as_str(),
+                };
 
                 // Child span as per previous behavior
                 let mut send_batch_span: Option<glide_core::GlideSpan> = None;
@@ -209,31 +445,36 @@ async fn execute_command_request_and_complete(
                     send_batch_span = Some(child);
                 }
 
+                log_batch_command_dispatched(
+                    &log_context,
+                    timeout_description.as_str(),
+                    raise_on_error,
+                    retry_server_error,
+                    retry_connection_error,
+                    expect_utf8,
+                    root_span_ptr_opt.unwrap_or(0) != 0,
+                );
+                let command_started_at = Instant::now();
                 let exec_res = if batch.is_atomic {
                     client
-                        .send_transaction(
-                            &pipeline,
-                            routing,
-                            batch.timeout,
-                            batch.raise_on_error.unwrap_or(true),
-                        )
+                        .send_transaction(&pipeline, routing, batch.timeout, raise_on_error)
                         .await
                 } else {
                     client
                         .send_pipeline(
                             &pipeline,
                             routing,
-                            batch.raise_on_error.unwrap_or(true),
+                            raise_on_error,
                             batch.timeout,
                             redis::PipelineRetryStrategy {
-                                retry_server_error: batch.retry_server_error.unwrap_or(false),
-                                retry_connection_error: batch
-                                    .retry_connection_error
-                                    .unwrap_or(false),
+                                retry_server_error,
+                                retry_connection_error,
                             },
                         )
                         .await
                 };
+                let command_elapsed_ms = elapsed_ms(command_started_at.elapsed());
+                log_batch_command_completed(&log_context, command_elapsed_ms, &exec_res);
 
                 if let Some(child) = send_batch_span.as_ref() {
                     child.end();
@@ -1573,6 +1814,11 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_markTimedOut(
     _class: JClass,
     callback_id: jlong,
 ) {
+    log_structured(
+        logger_core::Level::Warn,
+        "glide_jni_callback_marked_timed_out",
+        logger_core::structured_fields!("callback_id" => callback_id),
+    );
     jni_client::mark_callback_timed_out(callback_id);
 }
 
@@ -1610,19 +1856,6 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeBatchAsync(
                 }
             };
 
-            // Extract optional root span pointer from the request (if provided by Java)
-            let root_span_ptr_opt = command_request.root_span_ptr;
-            let route = command_request.route.0.map(|r| *r);
-
-            // Extract the batch from the command request (take ownership to avoid clone)
-            let batch = match command_request.command {
-                Some(command_request::Command::Batch(batch)) => batch,
-                _ => {
-                    log::error!("Expected batch command in request");
-                    return Some(());
-                }
-            };
-
             let handle_id = client_ptr as u64;
             let jvm = match env.get_java_vm() {
                 Ok(jvm) => Arc::new(jvm),
@@ -1632,129 +1865,13 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeBatchAsync(
                 }
             };
             let runtime = get_runtime();
-            runtime.spawn(async move {
-                let client_result = ensure_client_for_handle(handle_id).await;
-                match client_result {
-                    Ok(mut client) => {
-                        // Execute batch using existing FFI methodology
-                        let result: Result<redis::Value, redis::RedisError> = async {
-                            // If we have a root span, create a child span named "send_batch" to match expectations
-                            let mut send_batch_span: Option<glide_core::GlideSpan> = None;
-                            if let Some(root_span_ptr) = root_span_ptr_opt
-                                && root_span_ptr != 0
-                                && let Ok(root_span) = unsafe {
-                                    glide_core::GlideOpenTelemetry::span_from_pointer(root_span_ptr)
-                                }
-                                && let Ok(child) = root_span.add_span("send_batch")
-                            {
-                                send_batch_span = Some(child);
-                            }
-                            // Create pipeline using existing FFI approach
-                            let mut pipeline =
-                                redis::Pipeline::with_capacity(batch.commands.len());
-                            if batch.is_atomic {
-                                pipeline.atomic();
-                            }
-
-                            // Add commands to pipeline using existing bridge logic
-                            for cmd in &batch.commands {
-                                match protobuf_bridge::create_valkey_command(cmd) {
-                                    Ok(valkey_cmd) => pipeline.add_command(valkey_cmd),
-                                    Err(e) => {
-                                        return Err(redis::RedisError::from((
-                                            redis::ErrorKind::ClientError,
-                                            "Failed to create batch command",
-                                            e.to_string(),
-                                        )));
-                                    }
-                                };
-                            }
-
-                            // Get routing using FFI approach
-                            let route = route.unwrap_or_default();
-                            let routing = protobuf_bridge::get_route(route, None).map_err(|e| {
-                                    redis::RedisError::from((
-                                        redis::ErrorKind::ClientError,
-                                        "Routing error",
-                                        e.to_string(),
-                                    ))
-                                })?;
-
-                            // Execute using existing client methods
-                            let exec_res = if batch.is_atomic {
-                                client
-                                    .send_transaction(
-                                        &pipeline,
-                                        routing,
-                                        batch.timeout,
-                                        batch.raise_on_error.unwrap_or(true),
-                                    )
-                                    .await
-                            } else {
-                                client
-                                    .send_pipeline(
-                                        &pipeline,
-                                        routing,
-                                        batch.raise_on_error.unwrap_or(true),
-                                        batch.timeout,
-                                        redis::PipelineRetryStrategy {
-                                            retry_server_error: batch
-                                                .retry_server_error
-                                                .unwrap_or(false),
-                                            retry_connection_error: batch
-                                                .retry_connection_error
-                                                .unwrap_or(false),
-                                        },
-                                    )
-                                    .await
-                            };
-
-                            // End child span if created
-                            if let Some(child) = send_batch_span.as_ref() {
-                                child.end();
-                            }
-                            // End and drop the root span if provided
-                            if let Some(root_span_ptr) = root_span_ptr_opt
-                                && root_span_ptr != 0
-                            {
-                                match unsafe {
-                                    glide_core::GlideOpenTelemetry::span_from_pointer(root_span_ptr)
-                                } {
-                                    Ok(root_span) => {
-                                        root_span.end();
-                                        unsafe {
-                                            std::sync::Arc::from_raw(
-                                                root_span_ptr as *const glide_core::GlideSpan,
-                                            );
-                                        }
-                                    }
-                                    Err(err) => {
-                                        log::warn!(
-                                            "Failed to finalize OpenTelemetry span: pointer={}, error={}",
-                                            root_span_ptr,
-                                            err
-                                        );
-                                    }
-                                }
-                            }
-                            exec_res
-                        }
-                        .await;
-
-                        let binary_mode = expect_utf8 == 0;
-                        complete_callback(jvm, callback_id, result, binary_mode);
-                    }
-                    Err(err) => {
-                        let error = Err(redis::RedisError::from((
-                            redis::ErrorKind::ClientError,
-                            "Client not found",
-                            err.to_string(),
-                        )));
-                        let binary_mode = expect_utf8 == 0;
-                        complete_callback(jvm, callback_id, error, binary_mode);
-                    }
-                }
-            });
+            runtime.spawn(execute_command_request_and_complete(
+                handle_id,
+                command_request,
+                callback_id,
+                jvm,
+                expect_utf8 != 0,
+            ));
 
             Some(())
         },

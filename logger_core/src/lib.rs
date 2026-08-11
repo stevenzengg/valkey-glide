@@ -2,6 +2,8 @@
  * Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
  */
 use once_cell::sync::OnceCell;
+use serde::Serialize;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::{
     path::{Path, PathBuf},
     sync::RwLock,
@@ -105,6 +107,48 @@ pub enum Level {
     Trace = 4,
     Off = 5,
 }
+
+#[derive(Debug, Clone)]
+pub struct StructuredField {
+    key: &'static str,
+    value: JsonValue,
+}
+
+pub fn structured_field<Value: Serialize>(key: &'static str, value: Value) -> StructuredField {
+    StructuredField {
+        key,
+        value: serde_json::to_value(value).unwrap_or(JsonValue::Null),
+    }
+}
+
+#[macro_export]
+macro_rules! structured_fields {
+    ($($key:literal => $value:expr),* $(,)?) => {
+        &[$($crate::structured_field($key, $value)),*]
+    };
+}
+
+fn structured_payload(log_identifier: &str, fields: &[StructuredField]) -> String {
+    let mut payload = JsonMap::with_capacity(fields.len() + 2);
+    payload.insert("glide_structured".to_string(), JsonValue::Bool(true));
+    payload.insert(
+        "glide_event".to_string(),
+        JsonValue::String(log_identifier.to_string()),
+    );
+    for field in fields {
+        payload.insert(field.key.to_string(), field.value.clone());
+    }
+    serde_json::to_string(&payload).unwrap_or_else(|_| {
+        "{\"glide_structured\":true,\"glide_event\":\"serialization_failed\"}".to_string()
+    })
+}
+
+fn ensure_logger_exists() {
+    if INITIATE_ONCE.init_once.get().is_none() {
+        init(Some(Level::Warn), None);
+    };
+}
+
 impl Level {
     fn to_filter(&self) -> filter::LevelFilter {
         match self {
@@ -233,9 +277,7 @@ macro_rules! create_log {
             log_identifier: Identifier,
             message: Message,
         ) {
-            if INITIATE_ONCE.init_once.get().is_none() {
-                init(Some(Level::Warn), None);
-            };
+            ensure_logger_exists();
             let message_ref = message.as_ref();
             let identifier_ref = log_identifier.as_ref();
             event!(
@@ -251,6 +293,23 @@ create_log!(log_debug, DEBUG);
 create_log!(log_info, INFO);
 create_log!(log_warn, WARN);
 create_log!(log_error, ERROR);
+
+pub fn log_structured<Identifier: AsRef<str>>(
+    log_level: Level,
+    log_identifier: Identifier,
+    fields: &[StructuredField],
+) {
+    ensure_logger_exists();
+    let payload = structured_payload(log_identifier.as_ref(), fields);
+    match log_level {
+        Level::Debug => event!(tracing::Level::DEBUG, "{payload}"),
+        Level::Trace => event!(tracing::Level::TRACE, "{payload}"),
+        Level::Info => event!(tracing::Level::INFO, "{payload}"),
+        Level::Warn => event!(tracing::Level::WARN, "{payload}"),
+        Level::Error => event!(tracing::Level::ERROR, "{payload}"),
+        Level::Off => (),
+    }
+}
 
 // Logs the given log, with log_identifier and log level prefixed. If the given log level is below the threshold of given when the logger was initialized, the log will be ignored.
 // log_identifier should be used to add context to a log, and make it easier to connect it to other relevant logs. For example, it can be used to pass a task identifier.
@@ -304,5 +363,25 @@ mod tests {
         // Case 3: empty variable is not acceptable
         unsafe { std::env::set_var(ENV_GLIDE_LOG_DIR, "") };
         assert!(create_directory_from_env(ENV_GLIDE_LOG_DIR).is_none());
+    }
+
+    #[test]
+    fn test_structured_payload_escapes_values() {
+        let payload = structured_payload(
+            "command\"event",
+            &[
+                structured_field("callback_id", 42_i64),
+                structured_field("command", "GET\nkey"),
+                structured_field("success", false),
+            ],
+        );
+
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+        assert_eq!(payload["glide_structured"], true);
+        assert_eq!(payload["glide_event"], "command\"event");
+        assert_eq!(payload["callback_id"], 42);
+        assert_eq!(payload["command"], "GET\nkey");
+        assert_eq!(payload["success"], false);
     }
 }

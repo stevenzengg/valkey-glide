@@ -11,6 +11,7 @@ use jni::JavaVM;
 use jni::objects::{GlobalRef, JClass, JObject, JStaticMethodID, JValue};
 use jni::signature;
 use jni::sys::{JNI_VERSION_1_8, jint, jlong, jstring};
+use logger_core::log_structured;
 use parking_lot::Mutex;
 use redis::{RedisError as ServerError, Value as ServerValue};
 use std::ffi::c_void;
@@ -390,6 +391,15 @@ fn process_callback_job(
     binary_mode: bool,
 ) {
     if take_timed_out_callback(callback_id) {
+        log_structured(
+            logger_core::Level::Warn,
+            "glide_jni_callback_dropped_after_timeout",
+            logger_core::structured_fields!(
+                "callback_id" => callback_id,
+                "binary_mode" => binary_mode,
+                "stage" => "before_java_attach",
+            ),
+        );
         return;
     }
 
@@ -405,43 +415,155 @@ fn process_callback_job(
                 };
 
                 if take_timed_out_callback(callback_id) {
+                    log_structured(
+                        logger_core::Level::Warn,
+                        "glide_jni_callback_dropped_after_timeout",
+                        logger_core::structured_fields!(
+                            "callback_id" => callback_id,
+                            "binary_mode" => binary_mode,
+                            "stage" => "after_response_conversion",
+                        ),
+                    );
                     let _ = unsafe { env.pop_local_frame(&JObject::null()) };
                     return;
                 }
 
                 match java_result {
                     Ok(java_result) => {
-                        let _ = complete_java_callback(&mut env, callback_id, &java_result);
+                        match complete_java_callback(&mut env, callback_id, &java_result) {
+                            Ok(()) => log_structured(
+                                logger_core::Level::Debug,
+                                "glide_jni_callback_completed",
+                                logger_core::structured_fields!(
+                                    "callback_id" => callback_id,
+                                    "binary_mode" => binary_mode,
+                                    "result" => "success",
+                                ),
+                            ),
+                            Err(e) => log_structured(
+                                logger_core::Level::Warn,
+                                "glide_jni_callback_completion_failed",
+                                logger_core::structured_fields!(
+                                    "callback_id" => callback_id,
+                                    "binary_mode" => binary_mode,
+                                    "result" => "success",
+                                    "error" => e.to_string(),
+                                ),
+                            ),
+                        }
                     }
                     Err(e) => {
                         let error_code = 0;
                         let error_msg = format!("Response conversion failed: {e}");
-                        let _ = complete_java_callback_with_error_code(
+                        log_structured(
+                            logger_core::Level::Warn,
+                            "glide_jni_callback_response_conversion_failed",
+                            logger_core::structured_fields!(
+                                "callback_id" => callback_id,
+                                "binary_mode" => binary_mode,
+                                "error_code" => error_code,
+                                "error_message" => error_msg.as_str(),
+                            ),
+                        );
+                        match complete_java_callback_with_error_code(
                             &mut env,
                             callback_id,
                             error_code,
                             &error_msg,
-                        );
+                        ) {
+                            Ok(()) => log_structured(
+                                logger_core::Level::Debug,
+                                "glide_jni_callback_completed",
+                                logger_core::structured_fields!(
+                                    "callback_id" => callback_id,
+                                    "binary_mode" => binary_mode,
+                                    "result" => "conversion_error",
+                                ),
+                            ),
+                            Err(e) => log_structured(
+                                logger_core::Level::Warn,
+                                "glide_jni_callback_completion_failed",
+                                logger_core::structured_fields!(
+                                    "callback_id" => callback_id,
+                                    "binary_mode" => binary_mode,
+                                    "result" => "conversion_error",
+                                    "error" => e.to_string(),
+                                ),
+                            ),
+                        }
                     }
                 }
                 let _ = unsafe { env.pop_local_frame(&JObject::null()) };
             }
             Err(server_err) => {
                 if take_timed_out_callback(callback_id) {
+                    log_structured(
+                        logger_core::Level::Warn,
+                        "glide_jni_callback_dropped_after_timeout",
+                        logger_core::structured_fields!(
+                            "callback_id" => callback_id,
+                            "binary_mode" => binary_mode,
+                            "stage" => "before_error_completion",
+                            "server_error_kind" => format!("{:?}", server_err.kind()),
+                            "server_error_type" => format!("{:?}", error_type(&server_err)),
+                            "server_error_message" => error_message(&server_err),
+                        ),
+                    );
                     return;
                 }
 
                 let error_code = error_type(&server_err) as i32;
                 let error_msg = error_message(&server_err);
-                let _ = complete_java_callback_with_error_code(
+                log_structured(
+                    logger_core::Level::Warn,
+                    "glide_jni_callback_completing_error",
+                    logger_core::structured_fields!(
+                        "callback_id" => callback_id,
+                        "binary_mode" => binary_mode,
+                        "error_code" => error_code,
+                        "error_kind" => format!("{:?}", server_err.kind()),
+                        "error_type" => format!("{:?}", error_type(&server_err)),
+                        "error_message" => error_msg.as_str(),
+                    ),
+                );
+                match complete_java_callback_with_error_code(
                     &mut env,
                     callback_id,
                     error_code,
                     &error_msg,
-                );
+                ) {
+                    Ok(()) => log_structured(
+                        logger_core::Level::Debug,
+                        "glide_jni_callback_completed",
+                        logger_core::structured_fields!(
+                            "callback_id" => callback_id,
+                            "binary_mode" => binary_mode,
+                            "result" => "server_error",
+                        ),
+                    ),
+                    Err(e) => log_structured(
+                        logger_core::Level::Warn,
+                        "glide_jni_callback_completion_failed",
+                        logger_core::structured_fields!(
+                            "callback_id" => callback_id,
+                            "binary_mode" => binary_mode,
+                            "result" => "server_error",
+                            "error" => e.to_string(),
+                        ),
+                    ),
+                }
             }
         },
         Err(e) => {
+            log_structured(
+                logger_core::Level::Warn,
+                "glide_jni_callback_attach_failed",
+                logger_core::structured_fields!(
+                    "callback_id" => callback_id,
+                    "binary_mode" => binary_mode,
+                    "error" => e.to_string(),
+                ),
+            );
             log::error!("JNI environment attachment failed: {e}");
         }
     }
@@ -456,6 +578,15 @@ pub fn complete_callback(
 ) {
     let sender = init_callback_workers();
     if let Err(e) = sender.send((jvm, callback_id, result, binary_mode)) {
+        log_structured(
+            logger_core::Level::Warn,
+            "glide_jni_callback_enqueue_failed",
+            logger_core::structured_fields!(
+                "callback_id" => callback_id,
+                "binary_mode" => binary_mode,
+                "error" => e.to_string(),
+            ),
+        );
         log::error!("Callback queue send failed: {e}");
     }
 }

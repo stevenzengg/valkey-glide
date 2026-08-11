@@ -52,7 +52,7 @@ use pipeline_routing::{
     route_for_pipeline, PipelineResponses, ResponsePoliciesMap,
 };
 
-use logger_core::log_error;
+use logger_core::{log_error, log_structured};
 use rand::seq::IteratorRandom;
 
 use std::{
@@ -983,6 +983,28 @@ impl<C> Future for Request<C> {
                 // TODO - would be nice if we didn't need to repeat this code twice, with & without retries.
                 if request.retry >= this.retry_params.number_of_retries {
                     let retry_method = err.retry_method();
+                    let redirect_node = err.redirect_node();
+                    let redirect_address = redirect_node
+                        .map(|(node, _slot)| node.to_string())
+                        .unwrap_or_default();
+                    let redirect_slot = redirect_node
+                        .map(|(_node, slot)| u64::from(slot))
+                        .unwrap_or_default();
+                    log_structured(
+                        logger_core::Level::Warn,
+                        "glide_cluster_retry_exhausted",
+                        logger_core::structured_fields!(
+                            "target" => format!("{target:?}"),
+                            "retry_count" => request.retry,
+                            "retry_limit" => this.retry_params.number_of_retries,
+                            "retry_method" => format!("{retry_method:?}"),
+                            "error_kind" => format!("{:?}", err.kind()),
+                            "error_message" => err.to_string(),
+                            "redirect_present" => redirect_node.is_some(),
+                            "redirect_address" => redirect_address,
+                            "redirect_slot" => redirect_slot,
+                        ),
+                    );
                     let next = if err.kind() == ErrorKind::AllConnectionsUnavailable {
                         Next::ReconnectToInitialNodes { request: None }.into()
                     } else if matches!(
@@ -1060,8 +1082,31 @@ impl<C> Future for Request<C> {
                 };
 
                 warn!("Received request error {} on node {:?}.", err, address);
+                let retry_method = err.retry_method();
+                let redirect_node = err.redirect_node();
+                let redirect_address = redirect_node
+                    .map(|(node, _slot)| node.to_string())
+                    .unwrap_or_default();
+                let redirect_slot = redirect_node
+                    .map(|(_node, slot)| u64::from(slot))
+                    .unwrap_or_default();
+                log_structured(
+                    logger_core::Level::Warn,
+                    "glide_cluster_request_error",
+                    logger_core::structured_fields!(
+                        "node" => address.as_str(),
+                        "retry_count" => request.retry,
+                        "retry_method" => format!("{retry_method:?}"),
+                        "error_kind" => format!("{:?}", err.kind()),
+                        "error_message" => err.to_string(),
+                        "redirect_present" => redirect_node.is_some(),
+                        "redirect_address" => redirect_address,
+                        "redirect_slot" => redirect_slot,
+                        "retry_sleep_ms" => sleep_duration.as_millis() as u64,
+                    ),
+                );
 
-                match err.retry_method() {
+                match retry_method {
                     RetryMethod::AskRedirect => {
                         let mut request = this.request.take().unwrap();
                         request.info.set_redirect(
@@ -3257,8 +3302,7 @@ where
                     > = if let Some(moved_redirect) = moved_redirect {
                         // Resolve the redirect address through the address resolver to translate
                         // internal cluster hostnames to externally-reachable addresses.
-                        let resolved_address =
-                            self.inner.resolve_address(&moved_redirect.address);
+                        let resolved_address = self.inner.resolve_address(&moved_redirect.address);
                         Some(RequestState::UpdateMoved {
                             future: Box::pin(ClusterConnInner::update_upon_moved_error(
                                 self.inner.clone(),
