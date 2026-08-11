@@ -81,6 +81,11 @@ fn routing_description(routing: &Option<redis::cluster_routing::RoutingInfo>) ->
 
 #[derive(Clone)]
 enum InFlightCommandDetails {
+    Pending {
+        entrypoint: &'static str,
+        request_command_type: &'static str,
+        request_type: String,
+    },
     Single {
         command_name: String,
         command_arg_count: usize,
@@ -106,6 +111,47 @@ static IN_FLIGHT_COMMANDS: OnceLock<Mutex<HashMap<jlong, InFlightCommand>>> = On
 
 fn in_flight_commands() -> &'static Mutex<HashMap<jlong, InFlightCommand>> {
     IN_FLIGHT_COMMANDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn command_request_description(
+    command_request: &protobuf_bridge::CommandRequest,
+) -> (&'static str, String) {
+    match &command_request.command {
+        Some(protobuf_bridge::command_request::Command::SingleCommand(command)) => {
+            let request_type: glide_core::request_type::RequestType = command.request_type.into();
+            ("single", format!("{request_type:?}"))
+        }
+        Some(protobuf_bridge::command_request::Command::Batch(batch)) => {
+            ("batch", format!("{} commands", batch.commands.len()))
+        }
+        Some(_) => ("unsupported", "unsupported".to_string()),
+        None => ("missing", "missing".to_string()),
+    }
+}
+
+fn track_command_request_received(
+    callback_id: jlong,
+    handle_id: u64,
+    command_request: &protobuf_bridge::CommandRequest,
+    expect_utf8: bool,
+    entrypoint: &'static str,
+) {
+    let (request_command_type, request_type) = command_request_description(command_request);
+    in_flight_commands().lock().insert(
+        callback_id,
+        InFlightCommand {
+            handle_id,
+            routing: "not_computed".to_string(),
+            expect_utf8,
+            root_span_ptr_present: command_request.root_span_ptr.unwrap_or(0) != 0,
+            started_at: Instant::now(),
+            details: InFlightCommandDetails::Pending {
+                entrypoint,
+                request_command_type,
+                request_type,
+            },
+        },
+    );
 }
 
 fn track_single_command(
@@ -161,6 +207,27 @@ fn log_callback_marked_timed_out(callback_id: jlong) {
     let command = in_flight_commands().lock().remove(&callback_id);
     match command {
         Some(command) => match command.details {
+            InFlightCommandDetails::Pending {
+                entrypoint,
+                request_command_type,
+                request_type,
+            } => log_structured(
+                logger_core::Level::Warn,
+                "glide_jni_callback_marked_timed_out",
+                logger_core::structured_fields!(
+                    "callback_id" => callback_id,
+                    "in_flight_context_found" => true,
+                    "in_flight_context_stage" => "native_request_received",
+                    "handle_id" => command.handle_id,
+                    "entrypoint" => entrypoint,
+                    "request_command_type" => request_command_type,
+                    "request_type" => request_type.as_str(),
+                    "routing" => command.routing.as_str(),
+                    "duration_ms" => elapsed_ms(command.started_at.elapsed()),
+                    "expect_utf8" => command.expect_utf8,
+                    "root_span_ptr_present" => command.root_span_ptr_present,
+                ),
+            ),
             InFlightCommandDetails::Single {
                 command_name,
                 command_arg_count,
@@ -170,6 +237,7 @@ fn log_callback_marked_timed_out(callback_id: jlong) {
                 logger_core::structured_fields!(
                     "callback_id" => callback_id,
                     "in_flight_context_found" => true,
+                    "in_flight_context_stage" => "command_dispatched",
                     "handle_id" => command.handle_id,
                     "command_type" => "single",
                     "command_name" => command_name.as_str(),
@@ -190,6 +258,7 @@ fn log_callback_marked_timed_out(callback_id: jlong) {
                 logger_core::structured_fields!(
                     "callback_id" => callback_id,
                     "in_flight_context_found" => true,
+                    "in_flight_context_stage" => "command_dispatched",
                     "handle_id" => command.handle_id,
                     "command_type" => "batch",
                     "batch_command_count" => command_count,
@@ -602,18 +671,25 @@ async fn execute_command_request_and_complete(
                 );
                 let exec_res = if batch.is_atomic {
                     client
-                        .send_transaction(&pipeline, routing, batch.timeout, raise_on_error)
+                        .send_transaction(
+                            &pipeline,
+                            routing,
+                            batch.timeout,
+                            batch.raise_on_error.unwrap_or(true),
+                        )
                         .await
                 } else {
                     client
                         .send_pipeline(
                             &pipeline,
                             routing,
-                            raise_on_error,
+                            batch.raise_on_error.unwrap_or(true),
                             batch.timeout,
                             redis::PipelineRetryStrategy {
-                                retry_server_error,
-                                retry_connection_error,
+                                retry_server_error: batch.retry_server_error.unwrap_or(false),
+                                retry_connection_error: batch
+                                    .retry_connection_error
+                                    .unwrap_or(false),
                             },
                         )
                         .await
@@ -1812,18 +1888,26 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeCommandAsync
             };
 
             let handle_id = client_ptr as u64;
+            let expect_utf8 = true; // executeCommandAsync expects UTF-8 decoding
+            track_command_request_received(
+                callback_id,
+                handle_id,
+                &command_request,
+                expect_utf8,
+                "executeCommandAsync",
+            );
 
             // Get JVM for callback completion
             let jvm = match env.get_java_vm() {
                 Ok(jvm) => Arc::new(jvm),
                 Err(_) => {
+                    finish_in_flight_command(callback_id);
                     log::error!("JVM error in executeCommandAsync");
                     return Some(());
                 }
             };
             // Spawn unified async executor
             let runtime = get_runtime();
-            let expect_utf8 = true; // executeCommandAsync expects UTF-8 decoding
             runtime.spawn(execute_command_request_and_complete(
                 handle_id,
                 command_request,
@@ -1998,21 +2082,201 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeBatchAsync(
             };
 
             let handle_id = client_ptr as u64;
+            let expect_utf8_for_logging = expect_utf8 != 0;
+            track_command_request_received(
+                callback_id,
+                handle_id,
+                &command_request,
+                expect_utf8_for_logging,
+                "executeBatchAsync",
+            );
+
+            // Extract optional root span pointer from the request (if provided by Java)
+            let root_span_ptr_opt = command_request.root_span_ptr;
+            let route = command_request.route.0.map(|r| *r);
+
+            // Extract the batch from the command request (take ownership to avoid clone)
+            let batch = match command_request.command {
+                Some(protobuf_bridge::command_request::Command::Batch(batch)) => batch,
+                _ => {
+                    finish_in_flight_command(callback_id);
+                    log::error!("Expected batch command in request");
+                    return Some(());
+                }
+            };
+
             let jvm = match env.get_java_vm() {
                 Ok(jvm) => Arc::new(jvm),
                 Err(_) => {
+                    finish_in_flight_command(callback_id);
                     log::error!("JVM error in executeBatchAsync");
                     return Some(());
                 }
             };
             let runtime = get_runtime();
-            runtime.spawn(execute_command_request_and_complete(
-                handle_id,
-                command_request,
-                callback_id,
-                jvm,
-                expect_utf8 != 0,
-            ));
+            runtime.spawn(async move {
+                let client_result = ensure_client_for_handle(handle_id).await;
+                match client_result {
+                    Ok(mut client) => {
+                        // Execute batch using existing FFI methodology
+                        let result: Result<redis::Value, redis::RedisError> = async {
+                            // If we have a root span, create a child span named "send_batch" to match expectations
+                            let mut send_batch_span: Option<glide_core::GlideSpan> = None;
+                            if let Some(root_span_ptr) = root_span_ptr_opt
+                                && root_span_ptr != 0
+                                && let Ok(root_span) = unsafe {
+                                    glide_core::GlideOpenTelemetry::span_from_pointer(root_span_ptr)
+                                }
+                                && let Ok(child) = root_span.add_span("send_batch")
+                            {
+                                send_batch_span = Some(child);
+                            }
+                            // Create pipeline using existing FFI approach
+                            let mut pipeline =
+                                redis::Pipeline::with_capacity(batch.commands.len());
+                            if batch.is_atomic {
+                                pipeline.atomic();
+                            }
+                            let mut command_names = Vec::with_capacity(batch.commands.len());
+
+                            // Add commands to pipeline using existing bridge logic
+                            for cmd in &batch.commands {
+                                match protobuf_bridge::create_valkey_command(cmd) {
+                                    Ok(valkey_cmd) => {
+                                        command_names.push(redis_command_name(&valkey_cmd));
+                                        pipeline.add_command(valkey_cmd)
+                                    }
+                                    Err(e) => {
+                                        return Err(redis::RedisError::from((
+                                            redis::ErrorKind::ClientError,
+                                            "Failed to create batch command",
+                                            e.to_string(),
+                                        )));
+                                    }
+                                };
+                            }
+
+                            // Get routing using FFI approach
+                            let route = route.unwrap_or_default();
+                            let routing = protobuf_bridge::get_route(route, None).map_err(|e| {
+                                redis::RedisError::from((
+                                    redis::ErrorKind::ClientError,
+                                    "Routing error",
+                                    e.to_string(),
+                                ))
+                            })?;
+                            let routing_description = routing_description(&routing);
+                            let command_names = command_names.join(",");
+                            let timeout_description = format!("{:?}", batch.timeout);
+                            let raise_on_error = batch.raise_on_error.unwrap_or(true);
+                            let retry_server_error = batch.retry_server_error.unwrap_or(false);
+                            let retry_connection_error =
+                                batch.retry_connection_error.unwrap_or(false);
+                            let log_context = BatchCommandLogContext {
+                                callback_id,
+                                handle_id,
+                                command_count: batch.commands.len(),
+                                command_names: command_names.as_str(),
+                                is_atomic: batch.is_atomic,
+                                routing: routing_description.as_str(),
+                            };
+
+                            let command_started_at = Instant::now();
+                            let root_span_ptr_present = root_span_ptr_opt.unwrap_or(0) != 0;
+                            track_batch_command(
+                                &log_context,
+                                expect_utf8_for_logging,
+                                root_span_ptr_present,
+                                command_started_at,
+                            );
+                            log_batch_command_dispatched(
+                                &log_context,
+                                timeout_description.as_str(),
+                                raise_on_error,
+                                retry_server_error,
+                                retry_connection_error,
+                                expect_utf8_for_logging,
+                                root_span_ptr_present,
+                            );
+
+                            // Execute using existing client methods
+                            let exec_res = if batch.is_atomic {
+                                client
+                                    .send_transaction(
+                                        &pipeline,
+                                        routing,
+                                        batch.timeout,
+                                        batch.raise_on_error.unwrap_or(true),
+                                    )
+                                    .await
+                            } else {
+                                client
+                                    .send_pipeline(
+                                        &pipeline,
+                                        routing,
+                                        batch.raise_on_error.unwrap_or(true),
+                                        batch.timeout,
+                                        redis::PipelineRetryStrategy {
+                                            retry_server_error: batch
+                                                .retry_server_error
+                                                .unwrap_or(false),
+                                            retry_connection_error: batch
+                                                .retry_connection_error
+                                                .unwrap_or(false),
+                                        },
+                                    )
+                                    .await
+                            };
+                            let command_elapsed_ms = elapsed_ms(command_started_at.elapsed());
+                            log_batch_command_completed(&log_context, command_elapsed_ms, &exec_res);
+
+                            // End child span if created
+                            if let Some(child) = send_batch_span.as_ref() {
+                                child.end();
+                            }
+                            // End and drop the root span if provided
+                            if let Some(root_span_ptr) = root_span_ptr_opt
+                                && root_span_ptr != 0
+                            {
+                                match unsafe {
+                                    glide_core::GlideOpenTelemetry::span_from_pointer(root_span_ptr)
+                                } {
+                                    Ok(root_span) => {
+                                        root_span.end();
+                                        unsafe {
+                                            std::sync::Arc::from_raw(
+                                                root_span_ptr as *const glide_core::GlideSpan,
+                                            );
+                                        }
+                                    }
+                                    Err(err) => {
+                                        log::warn!(
+                                            "Failed to finalize OpenTelemetry span: pointer={}, error={}",
+                                            root_span_ptr,
+                                            err
+                                        );
+                                    }
+                                }
+                            }
+                            exec_res
+                        }
+                        .await;
+
+                        let binary_mode = expect_utf8 == 0;
+                        complete_callback(jvm, callback_id, result, binary_mode);
+                    }
+                    Err(err) => {
+                        log_client_lookup_failed(callback_id, handle_id, &err);
+                        let error = Err(redis::RedisError::from((
+                            redis::ErrorKind::ClientError,
+                            "Client not found",
+                            err.to_string(),
+                        )));
+                        let binary_mode = expect_utf8 == 0;
+                        complete_callback(jvm, callback_id, error, binary_mode);
+                    }
+                }
+            });
 
             Some(())
         },
@@ -2055,16 +2319,24 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeBinaryComman
             };
 
             let handle_id = client_ptr as u64;
+            let expect_utf8 = false; // binary entrypoint expects binary decoding
+            track_command_request_received(
+                callback_id,
+                handle_id,
+                &command_request,
+                expect_utf8,
+                "executeBinaryCommandAsync",
+            );
             let jvm = match env.get_java_vm() {
                 Ok(jvm) => Arc::new(jvm),
                 Err(_) => {
+                    finish_in_flight_command(callback_id);
                     log::error!("JVM error in executeBinaryCommandAsync");
                     return Some(());
                 }
             };
             // Spawn unified async executor
             let runtime = get_runtime();
-            let expect_utf8 = false; // binary entrypoint expects binary decoding
             runtime.spawn(execute_command_request_and_complete(
                 handle_id,
                 command_request,
