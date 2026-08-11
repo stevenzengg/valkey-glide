@@ -991,7 +991,7 @@ impl<C> Future for Request<C> {
                         .map(|(_node, slot)| u64::from(slot))
                         .unwrap_or_default();
                     log_structured(
-                        logger_core::Level::Warn,
+                        logger_core::Level::Error,
                         "glide_cluster_retry_exhausted",
                         logger_core::structured_fields!(
                             "target" => format!("{target:?}"),

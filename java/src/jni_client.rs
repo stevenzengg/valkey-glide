@@ -441,7 +441,7 @@ fn process_callback_job(
                                 ),
                             ),
                             Err(e) => log_structured(
-                                logger_core::Level::Warn,
+                                logger_core::Level::Error,
                                 "glide_jni_callback_completion_failed",
                                 logger_core::structured_fields!(
                                     "callback_id" => callback_id,
@@ -456,7 +456,7 @@ fn process_callback_job(
                         let error_code = 0;
                         let error_msg = format!("Response conversion failed: {e}");
                         log_structured(
-                            logger_core::Level::Warn,
+                            logger_core::Level::Error,
                             "glide_jni_callback_response_conversion_failed",
                             logger_core::structured_fields!(
                                 "callback_id" => callback_id,
@@ -481,7 +481,7 @@ fn process_callback_job(
                                 ),
                             ),
                             Err(e) => log_structured(
-                                logger_core::Level::Warn,
+                                logger_core::Level::Error,
                                 "glide_jni_callback_completion_failed",
                                 logger_core::structured_fields!(
                                     "callback_id" => callback_id,
@@ -542,7 +542,7 @@ fn process_callback_job(
                         ),
                     ),
                     Err(e) => log_structured(
-                        logger_core::Level::Warn,
+                        logger_core::Level::Error,
                         "glide_jni_callback_completion_failed",
                         logger_core::structured_fields!(
                             "callback_id" => callback_id,
@@ -556,7 +556,7 @@ fn process_callback_job(
         },
         Err(e) => {
             log_structured(
-                logger_core::Level::Warn,
+                logger_core::Level::Error,
                 "glide_jni_callback_attach_failed",
                 logger_core::structured_fields!(
                     "callback_id" => callback_id,
@@ -579,7 +579,7 @@ pub fn complete_callback(
     let sender = init_callback_workers();
     if let Err(e) = sender.send((jvm, callback_id, result, binary_mode)) {
         log_structured(
-            logger_core::Level::Warn,
+            logger_core::Level::Error,
             "glide_jni_callback_enqueue_failed",
             logger_core::structured_fields!(
                 "callback_id" => callback_id,

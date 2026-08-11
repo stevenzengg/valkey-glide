@@ -80,7 +80,7 @@ fn routing_description(routing: &Option<redis::cluster_routing::RoutingInfo>) ->
 
 fn log_client_lookup_failed(callback_id: jlong, handle_id: u64, error: impl std::fmt::Display) {
     log_structured(
-        logger_core::Level::Warn,
+        logger_core::Level::Error,
         "glide_jni_client_lookup_failed",
         logger_core::structured_fields!(
             "callback_id" => callback_id,
