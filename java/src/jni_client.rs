@@ -400,6 +400,7 @@ fn process_callback_job(
                 "stage" => "before_java_attach",
             ),
         );
+        crate::finish_in_flight_command(callback_id);
         return;
     }
 
@@ -424,6 +425,7 @@ fn process_callback_job(
                             "stage" => "after_response_conversion",
                         ),
                     );
+                    crate::finish_in_flight_command(callback_id);
                     let _ = unsafe { env.pop_local_frame(&JObject::null()) };
                     return;
                 }
@@ -493,6 +495,7 @@ fn process_callback_job(
                         }
                     }
                 }
+                crate::finish_in_flight_command(callback_id);
                 let _ = unsafe { env.pop_local_frame(&JObject::null()) };
             }
             Err(server_err) => {
@@ -509,6 +512,7 @@ fn process_callback_job(
                             "server_error_message" => error_message(&server_err),
                         ),
                     );
+                    crate::finish_in_flight_command(callback_id);
                     return;
                 }
 
@@ -552,6 +556,7 @@ fn process_callback_job(
                         ),
                     ),
                 }
+                crate::finish_in_flight_command(callback_id);
             }
         },
         Err(e) => {
@@ -564,6 +569,7 @@ fn process_callback_job(
                     "error" => e.to_string(),
                 ),
             );
+            crate::finish_in_flight_command(callback_id);
             log::error!("JNI environment attachment failed: {e}");
         }
     }
@@ -587,6 +593,7 @@ pub fn complete_callback(
                 "error" => e.to_string(),
             ),
         );
+        crate::finish_in_flight_command(callback_id);
         log::error!("Callback queue send failed: {e}");
     }
 }

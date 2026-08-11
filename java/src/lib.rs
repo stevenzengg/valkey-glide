@@ -26,6 +26,7 @@ use jni::sys::{jint, jlong};
 use parking_lot::Mutex;
 use redis::Value;
 use redis::cluster_routing::Routable;
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -76,6 +77,140 @@ fn routing_description(routing: &Option<redis::cluster_routing::RoutingInfo>) ->
         .as_ref()
         .map(|routing| format!("{routing:?}"))
         .unwrap_or_else(|| "default".to_string())
+}
+
+#[derive(Clone)]
+enum InFlightCommandDetails {
+    Single {
+        command_name: String,
+        command_arg_count: usize,
+    },
+    Batch {
+        command_count: usize,
+        command_names: String,
+        is_atomic: bool,
+    },
+}
+
+#[derive(Clone)]
+struct InFlightCommand {
+    handle_id: u64,
+    routing: String,
+    expect_utf8: bool,
+    root_span_ptr_present: bool,
+    started_at: Instant,
+    details: InFlightCommandDetails,
+}
+
+static IN_FLIGHT_COMMANDS: OnceLock<Mutex<HashMap<jlong, InFlightCommand>>> = OnceLock::new();
+
+fn in_flight_commands() -> &'static Mutex<HashMap<jlong, InFlightCommand>> {
+    IN_FLIGHT_COMMANDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn track_single_command(
+    context: &SingleCommandLogContext<'_>,
+    expect_utf8: bool,
+    root_span_ptr_present: bool,
+    started_at: Instant,
+) {
+    in_flight_commands().lock().insert(
+        context.callback_id,
+        InFlightCommand {
+            handle_id: context.handle_id,
+            routing: context.routing.to_string(),
+            expect_utf8,
+            root_span_ptr_present,
+            started_at,
+            details: InFlightCommandDetails::Single {
+                command_name: context.command_name.to_string(),
+                command_arg_count: context.command_arg_count,
+            },
+        },
+    );
+}
+
+fn track_batch_command(
+    context: &BatchCommandLogContext<'_>,
+    expect_utf8: bool,
+    root_span_ptr_present: bool,
+    started_at: Instant,
+) {
+    in_flight_commands().lock().insert(
+        context.callback_id,
+        InFlightCommand {
+            handle_id: context.handle_id,
+            routing: context.routing.to_string(),
+            expect_utf8,
+            root_span_ptr_present,
+            started_at,
+            details: InFlightCommandDetails::Batch {
+                command_count: context.command_count,
+                command_names: context.command_names.to_string(),
+                is_atomic: context.is_atomic,
+            },
+        },
+    );
+}
+
+fn finish_in_flight_command(callback_id: jlong) {
+    in_flight_commands().lock().remove(&callback_id);
+}
+
+fn log_callback_marked_timed_out(callback_id: jlong) {
+    let command = in_flight_commands().lock().remove(&callback_id);
+    match command {
+        Some(command) => match command.details {
+            InFlightCommandDetails::Single {
+                command_name,
+                command_arg_count,
+            } => log_structured(
+                logger_core::Level::Warn,
+                "glide_jni_callback_marked_timed_out",
+                logger_core::structured_fields!(
+                    "callback_id" => callback_id,
+                    "in_flight_context_found" => true,
+                    "handle_id" => command.handle_id,
+                    "command_type" => "single",
+                    "command_name" => command_name.as_str(),
+                    "command_arg_count" => command_arg_count,
+                    "routing" => command.routing.as_str(),
+                    "duration_ms" => elapsed_ms(command.started_at.elapsed()),
+                    "expect_utf8" => command.expect_utf8,
+                    "root_span_ptr_present" => command.root_span_ptr_present,
+                ),
+            ),
+            InFlightCommandDetails::Batch {
+                command_count,
+                command_names,
+                is_atomic,
+            } => log_structured(
+                logger_core::Level::Warn,
+                "glide_jni_callback_marked_timed_out",
+                logger_core::structured_fields!(
+                    "callback_id" => callback_id,
+                    "in_flight_context_found" => true,
+                    "handle_id" => command.handle_id,
+                    "command_type" => "batch",
+                    "batch_command_count" => command_count,
+                    "batch_command_names" => command_names.as_str(),
+                    "batch_is_atomic" => is_atomic,
+                    "routing" => command.routing.as_str(),
+                    "duration_ms" => elapsed_ms(command.started_at.elapsed()),
+                    "expect_utf8" => command.expect_utf8,
+                    "root_span_ptr_present" => command.root_span_ptr_present,
+                ),
+            ),
+        },
+        None => log_structured(
+            logger_core::Level::Warn,
+            "glide_jni_callback_marked_timed_out",
+            logger_core::structured_fields!(
+                "callback_id" => callback_id,
+                "in_flight_context_found" => false,
+            ),
+        ),
+    }
 }
 
 fn log_client_lookup_failed(callback_id: jlong, handle_id: u64, error: impl std::fmt::Display) {
@@ -352,12 +487,15 @@ async fn execute_command_request_and_complete(
                     command_arg_count,
                     routing: routing_description.as_str(),
                 };
-                log_single_command_dispatched(
+                let command_started_at = Instant::now();
+                let root_span_ptr_present = root_span_ptr_opt.unwrap_or(0) != 0;
+                track_single_command(
                     &log_context,
                     expect_utf8,
-                    root_span_ptr_opt.unwrap_or(0) != 0,
+                    root_span_ptr_present,
+                    command_started_at,
                 );
-                let command_started_at = Instant::now();
+                log_single_command_dispatched(&log_context, expect_utf8, root_span_ptr_present);
                 let exec = client.send_command(&mut cmd, routing).await;
                 let command_elapsed_ms = elapsed_ms(command_started_at.elapsed());
                 log_single_command_completed(&log_context, command_elapsed_ms, &exec);
@@ -445,6 +583,14 @@ async fn execute_command_request_and_complete(
                     send_batch_span = Some(child);
                 }
 
+                let command_started_at = Instant::now();
+                let root_span_ptr_present = root_span_ptr_opt.unwrap_or(0) != 0;
+                track_batch_command(
+                    &log_context,
+                    expect_utf8,
+                    root_span_ptr_present,
+                    command_started_at,
+                );
                 log_batch_command_dispatched(
                     &log_context,
                     timeout_description.as_str(),
@@ -452,9 +598,8 @@ async fn execute_command_request_and_complete(
                     retry_server_error,
                     retry_connection_error,
                     expect_utf8,
-                    root_span_ptr_opt.unwrap_or(0) != 0,
+                    root_span_ptr_present,
                 );
-                let command_started_at = Instant::now();
                 let exec_res = if batch.is_atomic {
                     client
                         .send_transaction(&pipeline, routing, batch.timeout, raise_on_error)
@@ -1814,11 +1959,7 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_markTimedOut(
     _class: JClass,
     callback_id: jlong,
 ) {
-    log_structured(
-        logger_core::Level::Warn,
-        "glide_jni_callback_marked_timed_out",
-        logger_core::structured_fields!("callback_id" => callback_id),
-    );
+    log_callback_marked_timed_out(callback_id);
     jni_client::mark_callback_timed_out(callback_id);
 }
 
