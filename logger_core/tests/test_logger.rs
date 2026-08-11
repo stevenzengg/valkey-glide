@@ -7,8 +7,9 @@ use test_env_helpers::*;
 #[after_all]
 #[before_all]
 mod tests {
-    use logger_core::{init, log_debug, log_trace};
+    use logger_core::{init, log_debug, log_structured, log_trace};
     use rand::{Rng, distributions::Alphanumeric};
+    use serde_json::Value;
     use std::{
         fs::{read_dir, read_to_string, remove_dir_all},
         path::Path,
@@ -81,6 +82,50 @@ mod tests {
             "Contents: {contents}"
         );
         assert!(contents.contains("foo"), "Contents: {contents}");
+    }
+
+    #[test]
+    fn structured_log_to_file_is_json_line() {
+        let identifier = generate_random_string(10);
+        let event_name = format!("test_structured_event_{identifier}");
+        init(Some(logger_core::Level::Debug), Some(identifier.as_str()));
+
+        log_structured(
+            logger_core::Level::Warn,
+            event_name.as_str(),
+            logger_core::structured_fields!(
+                "callback_id" => 42_i64,
+                "command_name" => "GET",
+                "duration_ms" => 123_u64,
+                "result" => "timeout",
+            ),
+        );
+
+        let contents = get_file_contents(identifier.as_str());
+        let line = contents
+            .lines()
+            .find(|line| line.contains(event_name.as_str()))
+            .unwrap_or_else(|| panic!("Missing structured log event. Contents: {contents}"));
+
+        assert!(
+            line.trim_start().starts_with('{'),
+            "Structured log line must be JSON without a tracing prefix. Line: {line}"
+        );
+        assert!(
+            !line.contains("WARN logger_core:"),
+            "Structured log line must not include the text formatter prefix. Line: {line}"
+        );
+
+        let payload: Value = serde_json::from_str(line).unwrap_or_else(|error| {
+            panic!("Structured log line is not valid JSON: {error}. Line: {line}")
+        });
+        assert_eq!(payload["glide_structured"], true);
+        assert_eq!(payload["glide_event"], event_name);
+        assert_eq!(payload["level"], "warn");
+        assert_eq!(payload["callback_id"], 42);
+        assert_eq!(payload["command_name"], "GET");
+        assert_eq!(payload["duration_ms"], 123);
+        assert_eq!(payload["result"], "timeout");
     }
 
     #[test]
