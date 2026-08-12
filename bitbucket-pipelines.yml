@@ -13,7 +13,13 @@ definitions:
                 - source .artifactory/activate.sh
                 - cd java
                 - apt-get update -y
-                - apt-get install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake redis-server python3-pip python3-venv
+                - apt-get install -y ca-certificates curl openjdk-21-jdk git build-essential tcl pkg-config openssl libssl-dev unzip cmake python3-pip python3-venv
+                - |
+                    VALKEY_VERSION=9.0.0
+                    curl -fL "https://github.com/valkey-io/valkey/archive/refs/tags/${VALKEY_VERSION}.tar.gz" -o /tmp/valkey.tar.gz
+                    tar xzf /tmp/valkey.tar.gz -C /tmp
+                    make -C "/tmp/valkey-${VALKEY_VERSION}" BUILD_TLS=yes -j4 install
+                    valkey-server --version
                 - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
                 - source "$HOME/.cargo/env"
                 - curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v29.1/protoc-29.1-linux-aarch_64.zip
@@ -40,7 +46,13 @@ definitions:
                 - source .artifactory/activate.sh
                 - cd java
                 - apt-get update -y
-                - apt-get install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake redis-server python3-pip python3-venv
+                - apt-get install -y ca-certificates curl openjdk-21-jdk git build-essential tcl pkg-config openssl libssl-dev unzip cmake python3-pip python3-venv
+                - |
+                    VALKEY_VERSION=9.0.0
+                    curl -fL "https://github.com/valkey-io/valkey/archive/refs/tags/${VALKEY_VERSION}.tar.gz" -o /tmp/valkey.tar.gz
+                    tar xzf /tmp/valkey.tar.gz -C /tmp
+                    make -C "/tmp/valkey-${VALKEY_VERSION}" BUILD_TLS=yes -j4 install
+                    valkey-server --version
                 - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
                 - source "$HOME/.cargo/env"
                 - curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v29.1/protoc-29.1-linux-aarch_64.zip
@@ -67,7 +79,13 @@ definitions:
                 - source .artifactory/activate.sh
                 - cd java
                 - apt-get update -y
-                - apt-get install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake redis-server python3-pip python3-venv
+                - apt-get install -y ca-certificates curl openjdk-21-jdk git build-essential tcl pkg-config openssl libssl-dev unzip cmake python3-pip python3-venv
+                - |
+                    VALKEY_VERSION=9.0.0
+                    curl -fL "https://github.com/valkey-io/valkey/archive/refs/tags/${VALKEY_VERSION}.tar.gz" -o /tmp/valkey.tar.gz
+                    tar xzf /tmp/valkey.tar.gz -C /tmp
+                    make -C "/tmp/valkey-${VALKEY_VERSION}" BUILD_TLS=yes -j4 install
+                    valkey-server --version
                 - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
                 - source "$HOME/.cargo/env"
                 - curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v29.1/protoc-29.1-linux-x86_64.zip
@@ -123,7 +141,13 @@ definitions:
                 - source .artifactory/activate.sh
                 - cd java
                 - apt-get update -y
-                - apt-get install -y openjdk-21-jdk git gcc pkg-config openssl libssl-dev unzip cmake redis-server python3-pip python3-venv
+                - apt-get install -y ca-certificates curl openjdk-21-jdk git build-essential tcl pkg-config openssl libssl-dev unzip cmake python3-pip python3-venv
+                - |
+                    VALKEY_VERSION=9.0.0
+                    curl -fL "https://github.com/valkey-io/valkey/archive/refs/tags/${VALKEY_VERSION}.tar.gz" -o /tmp/valkey.tar.gz
+                    tar xzf /tmp/valkey.tar.gz -C /tmp
+                    make -C "/tmp/valkey-${VALKEY_VERSION}" BUILD_TLS=yes -j4 install
+                    valkey-server --version
                 - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
                 - source "$HOME/.cargo/env"
                 - curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v29.1/protoc-29.1-linux-aarch_64.zip
