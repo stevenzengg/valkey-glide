@@ -100,7 +100,7 @@ definitions:
         publishToArtifactoryArmOSXSox: &publishToArtifactoryArmOSXSox
             name: Publish To Artifactory - Arm OSX Sox
             image:
-                name: docker.atl-paas.net/sox/mobuild/er-xcode-26.0:v2680
+                name: docker.atl-paas.net/sox/mobuild/er-xcode-26.6:latest
             size: 4x
             runs-on:
                 - self.hosted
@@ -161,7 +161,7 @@ definitions:
         buildOsx: &buildOSX
             name: Build - OSX
             image:
-                name: docker.atl-paas.net/sox/mobuild/er-xcode-26.0:v2680
+                name: docker.atl-paas.net/sox/mobuild/er-xcode-26.6:latest
             size: 4x
             runs-on:
                 - self.hosted
