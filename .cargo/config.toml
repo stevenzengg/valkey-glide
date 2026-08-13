@@ -2,3 +2,9 @@
 # Disable CPU jitter entropy in aws-lc-rs to avoid ~3x connection latency regression
 # See: https://github.com/aws/aws-lc-rs/issues/899
 AWS_LC_SYS_NO_JITTER_ENTROPY = "1"
+
+[source.crates-io]
+replace-with = "atlassian-crates"
+
+[source.atlassian-crates]
+registry = "sparse+https://packages.atlassian.com/artifactory/api/cargo/crates-io/index/"
