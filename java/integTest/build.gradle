@@ -34,8 +34,8 @@ dependencies {
     // Use published GLIDE artifact
     implementation group: 'io.atlassian.valkey', name: "valkey-glide-${osdetector.classifier}", version: project.ext.defaultReleaseVersion, classifier: classifier
 
-    // Use published jedis-compatibility artifact
-    testImplementation group: 'io.atlassian.valkey', name: 'valkey-glide-jedis-compatibility', version: project.ext.defaultReleaseVersion, classifier: osdetector.classifier
+    // Use project dependency for jedis-compatibility; the default release version is not published in CI.
+    testImplementation project(':jedis-compatibility')
 
     implementation group: 'org.apache.commons', name: 'commons-lang3', version: '3.20.0'
     implementation 'com.google.code.gson:gson:2.13.2'
