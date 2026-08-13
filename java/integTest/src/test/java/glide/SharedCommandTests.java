@@ -12041,11 +12041,7 @@ public class SharedCommandTests {
     @MethodSource("getClients")
     public void objectEncoding_returns_string_raw(BaseClient client) {
         String stringRawKey = UUID.randomUUID().toString();
-        assertEquals(
-                OK,
-                client
-                        .set(stringRawKey, "a really loooooooooooooooooooooooooooooooooooooooong value")
-                        .get());
+        assertEquals(OK, client.set(stringRawKey, Java8Utils.repeat("x", 1024)).get());
         assertEquals("raw", client.objectEncoding(stringRawKey).get());
     }
 
@@ -12054,11 +12050,7 @@ public class SharedCommandTests {
     @MethodSource("getClients")
     public void objectEncoding_binary_returns_string_raw(BaseClient client) {
         GlideString stringRawKey = gs(UUID.randomUUID().toString());
-        assertEquals(
-                OK,
-                client
-                        .set(stringRawKey, gs("a really loooooooooooooooooooooooooooooooooooooooong value"))
-                        .get());
+        assertEquals(OK, client.set(stringRawKey, gs(Java8Utils.repeat("x", 1024))).get());
         assertEquals("raw", client.objectEncoding(stringRawKey).get());
     }
 
