@@ -11,13 +11,71 @@ use jni::JavaVM;
 use jni::objects::{GlobalRef, JClass, JObject, JStaticMethodID, JValue};
 use jni::signature;
 use jni::sys::{JNI_VERSION_1_8, jint, jlong, jstring};
+use logger_core::log_structured;
 use parking_lot::Mutex;
 use redis::{RedisError as ServerError, Value as ServerValue};
 use std::ffi::c_void;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::thread;
 use tokio::runtime::Runtime;
+
+const MAX_EXCEPTION_DESCRIPTIONS: usize = 5;
+static EXCEPTION_DESCRIPTIONS_EMITTED: AtomicUsize = AtomicUsize::new(0);
+
+// ExceptionDescribe clears the pending exception. Only call this immediately before an existing
+// exception_clear recovery path so diagnostics do not change callback behavior.
+fn describe_pending_java_exception_before_clear(
+    env: &JNIEnv,
+    callback_id: Option<jlong>,
+    stage: &'static str,
+) {
+    let pending = match env.exception_check() {
+        Ok(pending) => pending,
+        Err(error) => {
+            log_structured(
+                logger_core::Level::Error,
+                "glide_jni_java_exception_check_failed",
+                logger_core::structured_fields!(
+                    "callback_id" => callback_id,
+                    "stage" => stage,
+                    "error" => error.to_string(),
+                ),
+            );
+            return;
+        }
+    };
+
+    let describe_ordinal =
+        pending.then(|| EXCEPTION_DESCRIPTIONS_EMITTED.fetch_add(1, Ordering::Relaxed));
+    let describe_emitted =
+        describe_ordinal.is_some_and(|ordinal| ordinal < MAX_EXCEPTION_DESCRIPTIONS);
+    let describe_error = describe_emitted
+        .then(|| {
+            env.exception_describe()
+                .err()
+                .map(|error| error.to_string())
+        })
+        .flatten();
+
+    log_structured(
+        if pending {
+            logger_core::Level::Error
+        } else {
+            logger_core::Level::Warn
+        },
+        "glide_jni_pending_java_exception",
+        logger_core::structured_fields!(
+            "callback_id" => callback_id,
+            "stage" => stage,
+            "pending" => pending,
+            "exception_describe_emitted" => describe_emitted,
+            "exception_describe_ordinal" => describe_ordinal,
+            "exception_describe_error" => describe_error,
+        ),
+    );
+}
 
 #[unsafe(no_mangle)]
 pub extern "system" fn JNI_OnLoad(vm: JavaVM, _reserved: *mut c_void) -> jint {
@@ -430,6 +488,16 @@ fn process_callback_job_with_env(
     binary_mode: bool,
 ) {
     if take_timed_out_callback(callback_id) {
+        log_structured(
+            logger_core::Level::Warn,
+            "glide_jni_callback_dropped_after_timeout",
+            logger_core::structured_fields!(
+                "callback_id" => callback_id,
+                "binary_mode" => binary_mode,
+                "stage" => "before_response_conversion",
+            ),
+        );
+        crate::finish_in_flight_command(callback_id);
         logger_core::log_debug_rate_limited!(
             "jni_callback",
             5,
@@ -443,22 +511,93 @@ fn process_callback_job_with_env(
 
     match result {
         Ok(server_value) => {
-            let _ = env.push_local_frame(16);
+            let response_type = crate::redis_value_type(&server_value);
+            let response_size_bytes = estimate_value_size(&server_value);
+            let use_direct_buffer = should_use_direct_buffer(&server_value);
+            let conversion_path = response_conversion_path(&server_value);
+            let callback_worker = thread::current().name().unwrap_or("unnamed").to_string();
 
-            let java_result = if should_use_direct_buffer(&server_value) {
+            log_structured(
+                logger_core::Level::Debug,
+                "glide_jni_response_conversion_started",
+                logger_core::structured_fields!(
+                    "callback_id" => callback_id,
+                    "binary_mode" => binary_mode,
+                    "callback_worker" => callback_worker.as_str(),
+                    "response_type" => response_type,
+                    "response_size_bytes" => response_size_bytes,
+                    "conversion_path" => conversion_path,
+                    "native_buffer_count" => get_native_buffer_registry().len(),
+                ),
+            );
+
+            if let Err(error) = env.push_local_frame(16) {
+                log_structured(
+                    logger_core::Level::Error,
+                    "glide_jni_response_conversion_stage_failed",
+                    logger_core::structured_fields!(
+                        "callback_id" => callback_id,
+                        "stage" => "push_local_frame",
+                        "response_type" => response_type,
+                        "response_size_bytes" => response_size_bytes,
+                        "conversion_path" => conversion_path,
+                        "java_exception_pending" => env.exception_check().unwrap_or(false),
+                        "error" => error.to_string(),
+                    ),
+                );
+            }
+
+            let java_result = if use_direct_buffer {
                 create_direct_byte_buffer(env, server_value, !binary_mode)
             } else {
                 crate::resp_value_to_java(env, server_value, !binary_mode)
             };
 
             if take_timed_out_callback(callback_id) {
+                log_structured(
+                    logger_core::Level::Warn,
+                    "glide_jni_callback_dropped_after_timeout",
+                    logger_core::structured_fields!(
+                        "callback_id" => callback_id,
+                        "binary_mode" => binary_mode,
+                        "stage" => "after_response_conversion",
+                    ),
+                );
+                crate::finish_in_flight_command(callback_id);
                 let _ = unsafe { env.pop_local_frame(&JObject::null()) };
                 return;
             }
 
             match java_result {
-                Ok(java_result) => {
-                    if let Err(e) = complete_java_callback(env, callback_id, &java_result) {
+                Ok(java_result) => match complete_java_callback(env, callback_id, &java_result) {
+                    Ok(()) => log_structured(
+                        logger_core::Level::Debug,
+                        "glide_jni_callback_completed",
+                        logger_core::structured_fields!(
+                            "callback_id" => callback_id,
+                            "binary_mode" => binary_mode,
+                            "result" => "success",
+                        ),
+                    ),
+                    Err(e) => {
+                        log_structured(
+                            logger_core::Level::Error,
+                            "glide_jni_callback_completion_failed",
+                            logger_core::structured_fields!(
+                                "callback_id" => callback_id,
+                                "binary_mode" => binary_mode,
+                                "result" => "success",
+                                "response_type" => response_type,
+                                "response_size_bytes" => response_size_bytes,
+                                "conversion_path" => conversion_path,
+                                "error" => e.to_string(),
+                            ),
+                        );
+                        describe_pending_java_exception_before_clear(
+                            env,
+                            Some(callback_id),
+                            "complete_success_callback",
+                        );
                         log::error!("JNI completion failed for callback {callback_id}: {e}");
                         let _ = env.exception_clear();
                         invalidate_jni_caches();
@@ -467,46 +606,144 @@ fn process_callback_job_with_env(
                             "JNI callback completion failed — cached method IDs may be stale",
                         );
                     }
-                }
+                },
                 Err(e) => {
                     let error_code = 0;
                     let error_msg = format!("Response conversion failed: {e}");
-                    if let Err(e2) = complete_java_callback_with_error_code(
+                    log_structured(
+                        logger_core::Level::Error,
+                        "glide_jni_callback_response_conversion_failed",
+                        logger_core::structured_fields!(
+                            "callback_id" => callback_id,
+                            "binary_mode" => binary_mode,
+                            "error_code" => error_code,
+                            "callback_worker" => callback_worker.as_str(),
+                            "response_type" => response_type,
+                            "response_size_bytes" => response_size_bytes,
+                            "conversion_path" => conversion_path,
+                            "native_buffer_count" => get_native_buffer_registry().len(),
+                            "java_exception_pending" => env.exception_check().unwrap_or(false),
+                            "error_message" => error_msg.as_str(),
+                        ),
+                    );
+                    match complete_java_callback_with_error_code(
                         env,
                         callback_id,
                         error_code,
                         &error_msg,
                     ) {
-                        log::error!("JNI error completion failed for callback {callback_id}: {e2}");
-                        let _ = env.exception_clear();
-                        invalidate_jni_caches();
-                        fail_all_pending_futures(
-                            env,
-                            "JNI error callback completion failed — cached method IDs may be stale",
-                        );
+                        Ok(()) => log_structured(
+                            logger_core::Level::Debug,
+                            "glide_jni_callback_completed",
+                            logger_core::structured_fields!(
+                                "callback_id" => callback_id,
+                                "binary_mode" => binary_mode,
+                                "result" => "conversion_error",
+                            ),
+                        ),
+                        Err(e2) => {
+                            log_structured(
+                                logger_core::Level::Error,
+                                "glide_jni_callback_completion_failed",
+                                logger_core::structured_fields!(
+                                    "callback_id" => callback_id,
+                                    "binary_mode" => binary_mode,
+                                    "result" => "conversion_error",
+                                    "response_type" => response_type,
+                                    "response_size_bytes" => response_size_bytes,
+                                    "conversion_path" => conversion_path,
+                                    "error" => e2.to_string(),
+                                ),
+                            );
+                            log::error!(
+                                "JNI error completion failed for callback {callback_id}: {e2}"
+                            );
+                            describe_pending_java_exception_before_clear(
+                                env,
+                                Some(callback_id),
+                                "complete_conversion_error_callback",
+                            );
+                            let _ = env.exception_clear();
+                            invalidate_jni_caches();
+                            fail_all_pending_futures(
+                                env,
+                                "JNI error callback completion failed — cached method IDs may be stale",
+                            );
+                        }
                     }
                 }
             }
+            crate::finish_in_flight_command(callback_id);
             let _ = unsafe { env.pop_local_frame(&JObject::null()) };
         }
         Err(server_err) => {
             if take_timed_out_callback(callback_id) {
+                log_structured(
+                    logger_core::Level::Warn,
+                    "glide_jni_callback_dropped_after_timeout",
+                    logger_core::structured_fields!(
+                        "callback_id" => callback_id,
+                        "binary_mode" => binary_mode,
+                        "stage" => "before_error_completion",
+                        "server_error_kind" => format!("{:?}", server_err.kind()),
+                        "server_error_type" => format!("{:?}", error_type(&server_err)),
+                        "server_error_message" => error_message(&server_err),
+                    ),
+                );
+                crate::finish_in_flight_command(callback_id);
                 return;
             }
 
             let error_code = error_type(&server_err) as i32;
             let error_msg = error_message(&server_err);
-            if let Err(e) =
-                complete_java_callback_with_error_code(env, callback_id, error_code, &error_msg)
-            {
-                log::error!("JNI error completion failed for callback {callback_id}: {e}");
-                let _ = env.exception_clear();
-                invalidate_jni_caches();
-                fail_all_pending_futures(
-                    env,
-                    "JNI error callback completion failed — cached method IDs may be stale",
-                );
+            log_structured(
+                logger_core::Level::Warn,
+                "glide_jni_callback_completing_error",
+                logger_core::structured_fields!(
+                    "callback_id" => callback_id,
+                    "binary_mode" => binary_mode,
+                    "error_code" => error_code,
+                    "error_kind" => format!("{:?}", server_err.kind()),
+                    "error_type" => format!("{:?}", error_type(&server_err)),
+                    "error_message" => error_msg.as_str(),
+                ),
+            );
+            match complete_java_callback_with_error_code(env, callback_id, error_code, &error_msg) {
+                Ok(()) => log_structured(
+                    logger_core::Level::Debug,
+                    "glide_jni_callback_completed",
+                    logger_core::structured_fields!(
+                        "callback_id" => callback_id,
+                        "binary_mode" => binary_mode,
+                        "result" => "server_error",
+                    ),
+                ),
+                Err(e) => {
+                    log_structured(
+                        logger_core::Level::Error,
+                        "glide_jni_callback_completion_failed",
+                        logger_core::structured_fields!(
+                            "callback_id" => callback_id,
+                            "binary_mode" => binary_mode,
+                            "result" => "server_error",
+                            "error" => e.to_string(),
+                        ),
+                    );
+                    describe_pending_java_exception_before_clear(
+                        env,
+                        Some(callback_id),
+                        "complete_server_error_callback",
+                    );
+                    log::error!("JNI error completion failed for callback {callback_id}: {e}");
+                    let _ = env.exception_clear();
+                    invalidate_jni_caches();
+                    fail_all_pending_futures(
+                        env,
+                        "JNI error callback completion failed — cached method IDs may be stale",
+                    );
+                }
             }
+            crate::finish_in_flight_command(callback_id);
         }
     }
 }
@@ -519,8 +756,43 @@ pub fn complete_callback(
     result: CallbackResult,
     binary_mode: bool,
 ) {
+    match &result {
+        Ok(server_value) => log_structured(
+            logger_core::Level::Debug,
+            "glide_jni_callback_enqueued",
+            logger_core::structured_fields!(
+                "callback_id" => callback_id,
+                "binary_mode" => binary_mode,
+                "result" => "success",
+                "response_type" => crate::redis_value_type(server_value),
+            ),
+        ),
+        Err(server_err) => log_structured(
+            logger_core::Level::Warn,
+            "glide_jni_callback_enqueued",
+            logger_core::structured_fields!(
+                "callback_id" => callback_id,
+                "binary_mode" => binary_mode,
+                "result" => "server_error",
+                "server_error_kind" => format!("{:?}", server_err.kind()),
+                "server_error_type" => format!("{:?}", error_type(server_err)),
+                "server_error_message" => error_message(server_err),
+            ),
+        ),
+    }
+
     let sender = init_callback_workers();
     if let Err(e) = sender.send((jvm.clone(), callback_id, result, binary_mode)) {
+        log_structured(
+            logger_core::Level::Error,
+            "glide_jni_callback_enqueue_failed",
+            logger_core::structured_fields!(
+                "callback_id" => callback_id,
+                "binary_mode" => binary_mode,
+                "error" => e.to_string(),
+            ),
+        );
+        crate::finish_in_flight_command(callback_id);
         log::error!("Callback channel dead, sweeping all pending futures: {e}");
         // Workers are dead — sweep the entire AsyncRegistry table
         if let Ok(mut env) = jvm.attach_current_thread_as_daemon() {
@@ -539,9 +811,25 @@ pub fn complete_callback(
 /// Fail all pending futures in AsyncRegistry by calling failAllWithError from Java.
 /// Used when fatal infrastructure failures are detected (channel dead, native panic).
 pub fn fail_all_pending_futures(env: &mut JNIEnv, error_msg: &str) {
+    log_structured(
+        logger_core::Level::Warn,
+        "glide_jni_fail_all_pending_futures_started",
+        logger_core::structured_fields!(
+            "reason" => error_msg,
+        ),
+    );
     let cache = match get_method_cache(env) {
         Ok(c) => c,
         Err(e) => {
+            log_structured(
+                logger_core::Level::Error,
+                "glide_jni_fail_all_pending_futures_failed",
+                logger_core::structured_fields!(
+                    "stage" => "get_method_cache",
+                    "reason" => error_msg,
+                    "error" => e.to_string(),
+                ),
+            );
             log::error!("Cannot sweep futures — failed to get method cache: {e}");
             return;
         }
@@ -550,6 +838,15 @@ pub fn fail_all_pending_futures(env: &mut JNIEnv, error_msg: &str) {
     let msg = match env.new_string(error_msg) {
         Ok(s) => s,
         Err(e) => {
+            log_structured(
+                logger_core::Level::Error,
+                "glide_jni_fail_all_pending_futures_failed",
+                logger_core::structured_fields!(
+                    "stage" => "new_error_string",
+                    "reason" => error_msg,
+                    "error" => e.to_string(),
+                ),
+            );
             log::error!("Cannot sweep futures — failed to create error string: {e}");
             let _ = unsafe { env.pop_local_frame(&JObject::null()) };
             return;
@@ -563,8 +860,26 @@ pub fn fail_all_pending_futures(env: &mut JNIEnv, error_msg: &str) {
             &[JValue::Object(&msg).as_jni()],
         )
     } {
+        log_structured(
+            logger_core::Level::Error,
+            "glide_jni_fail_all_pending_futures_failed",
+            logger_core::structured_fields!(
+                "stage" => "call_fail_all_with_error",
+                "reason" => error_msg,
+                "error" => e.to_string(),
+            ),
+        );
+        describe_pending_java_exception_before_clear(env, None, "fail_all_call_java");
         log::error!("Failed to sweep pending futures via failAllWithError: {e}");
         let _ = env.exception_clear();
+    } else {
+        log_structured(
+            logger_core::Level::Warn,
+            "glide_jni_fail_all_pending_futures_completed",
+            logger_core::structured_fields!(
+                "reason" => error_msg,
+            ),
+        );
     }
     let _ = unsafe { env.pop_local_frame(&JObject::null()) };
 }
@@ -616,6 +931,19 @@ pub fn complete_java_callback_with_error_code(
     }?;
     let _ = unsafe { env.pop_local_frame(&JObject::null()) };
     Ok(())
+}
+
+fn response_conversion_path(value: &ServerValue) -> &'static str {
+    if should_use_direct_buffer(value)
+        && matches!(
+            value,
+            ServerValue::BulkString(_) | ServerValue::Array(_) | ServerValue::Map(_)
+        )
+    {
+        "direct_byte_buffer"
+    } else {
+        "java_object"
+    }
 }
 
 /// Check if response should use DirectByteBuffer based on size threshold (16KB)
@@ -925,9 +1253,11 @@ pub extern "system" fn Java_glide_internal_GlideCoreClient_onNativeInit(
     if let Ok(jvm) = env.get_java_vm() {
         let _ = JVM.set(Arc::new(jvm));
     }
+    let jvm_cached = JVM.get().is_some();
 
     // Cache GlideCoreClient class and method IDs with correct classloader context.
     // The 'class' parameter is GlideCoreClient, already loaded by the application classloader.
+    let mut core_client_cache_initialized = false;
     if let Ok(global) = env.new_global_ref(&class)
         && let (Ok(on_native_push), Ok(register_cleaner)) = (
             env.get_static_method_id(&class, "onNativePush", "(J[B[B[B)V"),
@@ -945,7 +1275,27 @@ pub extern "system" fn Java_glide_internal_GlideCoreClient_onNativeInit(
         };
         let cache_mutex = GLIDE_CORE_CLIENT_CACHE.get_or_init(|| Mutex::new(None));
         *cache_mutex.lock() = Some(cache);
+        core_client_cache_initialized = true;
     }
+
+    log_structured(
+        if core_client_cache_initialized {
+            logger_core::Level::Debug
+        } else {
+            logger_core::Level::Error
+        },
+        if core_client_cache_initialized {
+            "glide_jni_core_client_cache_initialized"
+        } else {
+            "glide_jni_core_client_cache_initialization_failed"
+        },
+        logger_core::structured_fields!(
+            "source" => "application_classloader",
+            "jvm_cached" => jvm_cached,
+            "core_client_cache_initialized" => core_client_cache_initialized,
+            "java_exception_pending" => env.exception_check().unwrap_or(false),
+        ),
+    );
 }
 
 /// Native free for DirectByteBuffer-backed native memory (called by Java Cleaner)
@@ -985,6 +1335,13 @@ fn get_glide_core_client_cache_safe(env: &mut JNIEnv) -> Result<GlideCoreClientC
     }
 
     // Fallback: try to initialize dynamically using the provided env
+    log_structured(
+        logger_core::Level::Warn,
+        "glide_jni_core_client_cache_fallback_started",
+        logger_core::structured_fields!(
+            "source" => "callback_thread_find_class",
+        ),
+    );
     let class = env.find_class("glide/internal/GlideCoreClient")?;
     let global = env.new_global_ref(&class)?;
     let on_native_push = env.get_static_method_id(&class, "onNativePush", "(J[B[B[B)V")?;
@@ -1004,6 +1361,14 @@ fn get_glide_core_client_cache_safe(env: &mut JNIEnv) -> Result<GlideCoreClientC
     if guard.is_none() {
         *guard = Some(cache);
     }
+
+    log_structured(
+        logger_core::Level::Warn,
+        "glide_jni_core_client_cache_initialized",
+        logger_core::structured_fields!(
+            "source" => "callback_thread_find_class",
+        ),
+    );
 
     Ok(guard.as_ref().cloned().unwrap())
 }
@@ -1065,8 +1430,20 @@ pub fn complete_error_sync(
 
 #[cfg(test)]
 mod tests {
-    use super::serialize_array_to_bytes;
+    use super::{response_conversion_path, serialize_array_to_bytes};
     use redis::{Value, parse_redis_value};
+
+    #[test]
+    fn bulk_string_diagnostics_identify_direct_buffer_threshold() {
+        let threshold_sized = Value::BulkString(vec![0; 16 * 1024].into());
+        assert_eq!(response_conversion_path(&threshold_sized), "java_object");
+
+        let above_threshold = Value::BulkString(vec![0; 16 * 1024 + 1].into());
+        assert_eq!(
+            response_conversion_path(&above_threshold),
+            "direct_byte_buffer"
+        );
+    }
 
     #[test]
     fn serialize_array_to_bytes_encodes_bool_double_bignumber_and_nil() {

@@ -119,6 +119,109 @@ public final class AsyncRegistry {
         // Intentionally a no-op: keep the client usable for concurrent user shutdown hooks.
     }
 
+    private static void logLifecycle(Logger.Level level, long correlationId, String event) {
+        Long startedAtNanos = registrationTimestamps.get(correlationId);
+        Logger.log(
+                level,
+                "glide_java_async_registry",
+                () ->
+                        "{"
+                                + "\"glide_structured\":true,"
+                                + "\"glide_event\":\"glide_java_async_registry_"
+                                + event
+                                + "\","
+                                + "\"correlation_id\":"
+                                + correlationId
+                                + ","
+                                + "\"active_future_count\":"
+                                + activeFutures.size()
+                                + ","
+                                + "\"pending_timeout_count\":"
+                                + timeoutTasks.size()
+                                + ","
+                                + "\"duration_ms\":"
+                                + durationMillis(startedAtNanos)
+                                + "}");
+    }
+
+    private static void logLifecycle(
+            Logger.Level level, long correlationId, String event, String extraJsonFields) {
+        Long startedAtNanos = registrationTimestamps.get(correlationId);
+        Logger.log(
+                level,
+                "glide_java_async_registry",
+                () ->
+                        "{"
+                                + "\"glide_structured\":true,"
+                                + "\"glide_event\":\"glide_java_async_registry_"
+                                + event
+                                + "\","
+                                + "\"correlation_id\":"
+                                + correlationId
+                                + ","
+                                + "\"active_future_count\":"
+                                + activeFutures.size()
+                                + ","
+                                + "\"pending_timeout_count\":"
+                                + timeoutTasks.size()
+                                + ","
+                                + "\"duration_ms\":"
+                                + durationMillis(startedAtNanos)
+                                + (extraJsonFields == null || extraJsonFields.trim().isEmpty()
+                                        ? ""
+                                        : "," + extraJsonFields)
+                                + "}");
+    }
+
+    private static long durationMillis(Long startedAtNanos) {
+        if (startedAtNanos == null) {
+            return -1L;
+        }
+        return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAtNanos);
+    }
+
+    private static String jsonString(String value) {
+        if (value == null) {
+            return "null";
+        }
+        StringBuilder escaped = new StringBuilder(value.length() + 2);
+        escaped.append('"');
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            switch (c) {
+                case '"':
+                    escaped.append("\\\"");
+                    break;
+                case '\\':
+                    escaped.append("\\\\");
+                    break;
+                case '\b':
+                    escaped.append("\\b");
+                    break;
+                case '\f':
+                    escaped.append("\\f");
+                    break;
+                case '\n':
+                    escaped.append("\\n");
+                    break;
+                case '\r':
+                    escaped.append("\\r");
+                    break;
+                case '\t':
+                    escaped.append("\\t");
+                    break;
+                default:
+                    if (c < 0x20) {
+                        escaped.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        escaped.append(c);
+                    }
+            }
+        }
+        escaped.append('"');
+        return escaped.toString();
+    }
+
     /** Estimate initial capacity for the active futures map using inflight limit with margin. */
     private static int estimateInitialCapacity() {
         String env = System.getenv("GLIDE_MAX_INFLIGHT_REQUESTS");
@@ -185,6 +288,16 @@ public final class AsyncRegistry {
         // Store original future for completion by native code
         activeFutures.put(correlationId, originalFuture);
         registrationTimestamps.put(correlationId, System.nanoTime());
+        logLifecycle(
+                Logger.Level.DEBUG,
+                correlationId,
+                "registered",
+                "\"client_handle\":"
+                        + clientHandle
+                        + ",\"max_inflight_requests\":"
+                        + maxInflightRequests
+                        + ",\"timeout_ms\":"
+                        + timeoutMillis);
 
         // Double-check shutdown flag after insertion to handle race with shutdown()
         // If shutdown started between our first check and the put(), clean up and fail
@@ -236,7 +349,18 @@ public final class AsyncRegistry {
                         () -> {
                             timeoutTasks.remove(correlationId);
                             if (future.completeExceptionally(new TimeoutException("Request timed out"))) {
+                                logLifecycle(
+                                        Logger.Level.WARN,
+                                        correlationId,
+                                        "timed_out",
+                                        "\"timeout_ms\":" + timeoutMillis);
                                 GlideNativeBridge.markTimedOut(correlationId);
+                            } else {
+                                logLifecycle(
+                                        Logger.Level.DEBUG,
+                                        correlationId,
+                                        "timeout_skipped_already_completed",
+                                        "\"timeout_ms\":" + timeoutMillis);
                             }
                         },
                         timeoutMillis,
@@ -255,6 +379,17 @@ public final class AsyncRegistry {
             long clientHandle) {
         future.whenComplete(
                 (result, error) -> {
+                    logLifecycle(
+                            error == null ? Logger.Level.DEBUG : Logger.Level.WARN,
+                            correlationId,
+                            "cleanup",
+                            "\"completed_with_error\":"
+                                    + (error != null)
+                                    + ",\"error_type\":"
+                                    + jsonString(error == null ? null : error.getClass().getName())
+                                    + ",\"error_message\":"
+                                    + jsonString(error == null ? null : error.getMessage()));
+
                     // Atomic cleanup - no race conditions
                     activeFutures.remove(correlationId);
                     registrationTimestamps.remove(correlationId);
@@ -295,10 +430,25 @@ public final class AsyncRegistry {
      */
     public static boolean completeCallback(long correlationId, Object result) {
         CompletableFuture<Object> future = activeFutures.get(correlationId);
+        if (future == null) {
+            logLifecycle(Logger.Level.WARN, correlationId, "complete_success_missing_future");
+            return false;
+        }
         // complete() returns false if already completed
         // This prevents IllegalStateException from completing twice
         // Note: cleanup happens automatically in whenComplete()
-        return future != null && future.complete(result);
+        logLifecycle(
+                Logger.Level.DEBUG,
+                correlationId,
+                "complete_success_attempt",
+                "\"result_type\":" + jsonString(result == null ? null : result.getClass().getName()));
+        boolean completed = future.complete(result);
+        logLifecycle(
+                completed ? Logger.Level.DEBUG : Logger.Level.WARN,
+                correlationId,
+                completed ? "complete_success" : "complete_success_already_completed",
+                "\"result_type\":" + jsonString(result == null ? null : result.getClass().getName()));
+        return completed;
     }
 
     /**
@@ -314,6 +464,14 @@ public final class AsyncRegistry {
             long correlationId, int errorTypeCode, String errorMessage) {
         CompletableFuture<Object> future = activeFutures.get(correlationId);
         if (future == null) {
+            logLifecycle(
+                    Logger.Level.WARN,
+                    correlationId,
+                    "complete_error_missing_future",
+                    "\"error_type_code\":"
+                            + errorTypeCode
+                            + ",\"error_message\":"
+                            + jsonString(errorMessage));
             return false;
         }
 
@@ -366,7 +524,28 @@ public final class AsyncRegistry {
                 break;
         }
 
-        return future.completeExceptionally(ex);
+        logLifecycle(
+                Logger.Level.WARN,
+                correlationId,
+                "complete_error_attempt",
+                "\"error_type_code\":"
+                        + errorTypeCode
+                        + ",\"exception_type\":"
+                        + jsonString(ex.getClass().getName())
+                        + ",\"error_message\":"
+                        + jsonString(msg));
+        boolean completed = future.completeExceptionally(ex);
+        logLifecycle(
+                Logger.Level.WARN,
+                correlationId,
+                completed ? "complete_error" : "complete_error_already_completed",
+                "\"error_type_code\":"
+                        + errorTypeCode
+                        + ",\"exception_type\":"
+                        + jsonString(ex.getClass().getName())
+                        + ",\"error_message\":"
+                        + jsonString(msg));
+        return completed;
     }
 
     /** Get current pending operation count. */

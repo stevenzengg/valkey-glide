@@ -1,7 +1,8 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
 use glide_core::client::FINISHED_SCAN_CURSOR;
-use glide_core::errors::error_message;
+use glide_core::errors::{error_message, error_type};
+use logger_core::log_structured;
 // Protocol constants for Java (defined directly since we don't use socket layer)
 const TYPE_HASH: &str = "hash";
 const TYPE_LIST: &str = "list";
@@ -23,8 +24,11 @@ use jni::objects::{
 use jni::sys::{jint, jlong};
 use parking_lot::Mutex;
 use redis::Value;
+use redis::cluster_routing::Routable;
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 mod address_resolver;
 mod errors;
@@ -38,6 +42,433 @@ use errors::{FFIError, handle_errors, run_ffi};
 use jni_client::*;
 
 use crate::address_resolver::JavaAddressResolver;
+
+fn elapsed_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn redis_command_name(cmd: &redis::Cmd) -> String {
+    cmd.command()
+        .map(|command| String::from_utf8_lossy(&command).into_owned())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+pub(crate) fn redis_value_type(value: &redis::Value) -> &'static str {
+    match value {
+        redis::Value::Nil => "nil",
+        redis::Value::Int(_) => "int",
+        redis::Value::BulkString(_) => "bulk_string",
+        redis::Value::Array(_) => "array",
+        redis::Value::SimpleString(_) => "simple_string",
+        redis::Value::Okay => "okay",
+        redis::Value::Map(_) => "map",
+        redis::Value::Attribute { .. } => "attribute",
+        redis::Value::Set(_) => "set",
+        redis::Value::Double(_) => "double",
+        redis::Value::Boolean(_) => "boolean",
+        redis::Value::VerbatimString { .. } => "verbatim_string",
+        redis::Value::BigNumber(_) => "big_number",
+        redis::Value::Push { .. } => "push",
+        redis::Value::ServerError(_) => "server_error",
+    }
+}
+
+fn routing_description(routing: &Option<redis::cluster_routing::RoutingInfo>) -> String {
+    routing
+        .as_ref()
+        .map(|routing| format!("{routing:?}"))
+        .unwrap_or_else(|| "default".to_string())
+}
+
+#[derive(Clone)]
+enum InFlightCommandDetails {
+    PendingSingle {
+        request_type: i32,
+        command_arg_count: usize,
+    },
+    PendingBatch {
+        command_count: usize,
+        is_atomic: bool,
+    },
+    Single {
+        request_type: i32,
+        command_name: String,
+        command_arg_count: usize,
+    },
+    Batch {
+        command_count: usize,
+        command_names: String,
+        is_atomic: bool,
+    },
+}
+
+#[derive(Clone)]
+struct InFlightCommand {
+    handle_id: u64,
+    routing: String,
+    expect_utf8: bool,
+    root_span_ptr_present: bool,
+    started_at: Instant,
+    details: InFlightCommandDetails,
+}
+
+static IN_FLIGHT_COMMANDS: OnceLock<Mutex<HashMap<jlong, InFlightCommand>>> = OnceLock::new();
+
+fn in_flight_commands() -> &'static Mutex<HashMap<jlong, InFlightCommand>> {
+    IN_FLIGHT_COMMANDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn track_pending_single_command(
+    callback_id: jlong,
+    handle_id: u64,
+    request_type: i32,
+    command_arg_count: usize,
+    expect_utf8: bool,
+    root_span_ptr_present: bool,
+) {
+    in_flight_commands().lock().insert(
+        callback_id,
+        InFlightCommand {
+            handle_id,
+            routing: "not_computed".to_string(),
+            expect_utf8,
+            root_span_ptr_present,
+            started_at: Instant::now(),
+            details: InFlightCommandDetails::PendingSingle {
+                request_type,
+                command_arg_count,
+            },
+        },
+    );
+}
+
+fn track_pending_batch_command(
+    callback_id: jlong,
+    handle_id: u64,
+    command_count: usize,
+    is_atomic: bool,
+    expect_utf8: bool,
+    root_span_ptr_present: bool,
+) {
+    in_flight_commands().lock().insert(
+        callback_id,
+        InFlightCommand {
+            handle_id,
+            routing: "not_computed".to_string(),
+            expect_utf8,
+            root_span_ptr_present,
+            started_at: Instant::now(),
+            details: InFlightCommandDetails::PendingBatch {
+                command_count,
+                is_atomic,
+            },
+        },
+    );
+}
+
+struct SingleCommandLogContext<'a> {
+    callback_id: jlong,
+    handle_id: u64,
+    request_type: i32,
+    command_name: &'a str,
+    command_arg_count: usize,
+    routing: &'a str,
+}
+
+fn track_single_command(
+    context: &SingleCommandLogContext<'_>,
+    expect_utf8: bool,
+    root_span_ptr_present: bool,
+    started_at: Instant,
+) {
+    in_flight_commands().lock().insert(
+        context.callback_id,
+        InFlightCommand {
+            handle_id: context.handle_id,
+            routing: context.routing.to_string(),
+            expect_utf8,
+            root_span_ptr_present,
+            started_at,
+            details: InFlightCommandDetails::Single {
+                request_type: context.request_type,
+                command_name: context.command_name.to_string(),
+                command_arg_count: context.command_arg_count,
+            },
+        },
+    );
+}
+
+struct BatchCommandLogContext<'a> {
+    callback_id: jlong,
+    handle_id: u64,
+    command_count: usize,
+    command_names: &'a str,
+    is_atomic: bool,
+    routing: &'a str,
+}
+
+fn track_batch_command(
+    context: &BatchCommandLogContext<'_>,
+    expect_utf8: bool,
+    root_span_ptr_present: bool,
+    started_at: Instant,
+) {
+    in_flight_commands().lock().insert(
+        context.callback_id,
+        InFlightCommand {
+            handle_id: context.handle_id,
+            routing: context.routing.to_string(),
+            expect_utf8,
+            root_span_ptr_present,
+            started_at,
+            details: InFlightCommandDetails::Batch {
+                command_count: context.command_count,
+                command_names: context.command_names.to_string(),
+                is_atomic: context.is_atomic,
+            },
+        },
+    );
+}
+
+pub(crate) fn finish_in_flight_command(callback_id: jlong) {
+    in_flight_commands().lock().remove(&callback_id);
+}
+
+fn log_callback_marked_timed_out(callback_id: jlong) {
+    let command = in_flight_commands().lock().remove(&callback_id);
+    match command {
+        Some(command) => match command.details {
+            InFlightCommandDetails::PendingSingle {
+                request_type,
+                command_arg_count,
+            } => log_structured(
+                logger_core::Level::Warn,
+                "glide_jni_callback_marked_timed_out",
+                logger_core::structured_fields!(
+                    "callback_id" => callback_id,
+                    "in_flight_context_found" => true,
+                    "in_flight_context_stage" => "native_request_received",
+                    "handle_id" => command.handle_id,
+                    "command_type" => "single",
+                    "request_type" => request_type,
+                    "command_arg_count" => command_arg_count,
+                    "routing" => command.routing.as_str(),
+                    "duration_ms" => elapsed_ms(command.started_at.elapsed()),
+                    "expect_utf8" => command.expect_utf8,
+                    "root_span_ptr_present" => command.root_span_ptr_present,
+                ),
+            ),
+            InFlightCommandDetails::PendingBatch {
+                command_count,
+                is_atomic,
+            } => log_structured(
+                logger_core::Level::Warn,
+                "glide_jni_callback_marked_timed_out",
+                logger_core::structured_fields!(
+                    "callback_id" => callback_id,
+                    "in_flight_context_found" => true,
+                    "in_flight_context_stage" => "native_request_received",
+                    "handle_id" => command.handle_id,
+                    "command_type" => "batch",
+                    "batch_command_count" => command_count,
+                    "batch_is_atomic" => is_atomic,
+                    "routing" => command.routing.as_str(),
+                    "duration_ms" => elapsed_ms(command.started_at.elapsed()),
+                    "expect_utf8" => command.expect_utf8,
+                    "root_span_ptr_present" => command.root_span_ptr_present,
+                ),
+            ),
+            InFlightCommandDetails::Single {
+                request_type,
+                command_name,
+                command_arg_count,
+            } => log_structured(
+                logger_core::Level::Warn,
+                "glide_jni_callback_marked_timed_out",
+                logger_core::structured_fields!(
+                    "callback_id" => callback_id,
+                    "in_flight_context_found" => true,
+                    "in_flight_context_stage" => "command_dispatched",
+                    "handle_id" => command.handle_id,
+                    "command_type" => "single",
+                    "request_type" => request_type,
+                    "command_name" => command_name.as_str(),
+                    "command_arg_count" => command_arg_count,
+                    "routing" => command.routing.as_str(),
+                    "duration_ms" => elapsed_ms(command.started_at.elapsed()),
+                    "expect_utf8" => command.expect_utf8,
+                    "root_span_ptr_present" => command.root_span_ptr_present,
+                ),
+            ),
+            InFlightCommandDetails::Batch {
+                command_count,
+                command_names,
+                is_atomic,
+            } => log_structured(
+                logger_core::Level::Warn,
+                "glide_jni_callback_marked_timed_out",
+                logger_core::structured_fields!(
+                    "callback_id" => callback_id,
+                    "in_flight_context_found" => true,
+                    "in_flight_context_stage" => "command_dispatched",
+                    "handle_id" => command.handle_id,
+                    "command_type" => "batch",
+                    "batch_command_count" => command_count,
+                    "batch_command_names" => command_names.as_str(),
+                    "batch_is_atomic" => is_atomic,
+                    "routing" => command.routing.as_str(),
+                    "duration_ms" => elapsed_ms(command.started_at.elapsed()),
+                    "expect_utf8" => command.expect_utf8,
+                    "root_span_ptr_present" => command.root_span_ptr_present,
+                ),
+            ),
+        },
+        None => log_structured(
+            logger_core::Level::Warn,
+            "glide_jni_callback_marked_timed_out",
+            logger_core::structured_fields!(
+                "callback_id" => callback_id,
+                "in_flight_context_found" => false,
+            ),
+        ),
+    }
+}
+
+fn log_single_command_dispatched(
+    context: &SingleCommandLogContext<'_>,
+    expect_utf8: bool,
+    root_span_ptr_present: bool,
+) {
+    log_structured(
+        logger_core::Level::Debug,
+        "glide_jni_command_dispatched",
+        logger_core::structured_fields!(
+            "callback_id" => context.callback_id,
+            "handle_id" => context.handle_id,
+            "command_type" => "single",
+            "request_type" => context.request_type,
+            "command_name" => context.command_name,
+            "command_arg_count" => context.command_arg_count,
+            "routing" => context.routing,
+            "expect_utf8" => expect_utf8,
+            "root_span_ptr_present" => root_span_ptr_present,
+        ),
+    );
+}
+
+fn log_single_command_completed(
+    context: &SingleCommandLogContext<'_>,
+    duration_ms: u64,
+    result: &Result<redis::Value, redis::RedisError>,
+) {
+    match result {
+        Ok(value) => log_structured(
+            logger_core::Level::Debug,
+            "glide_jni_command_completed",
+            logger_core::structured_fields!(
+                "callback_id" => context.callback_id,
+                "handle_id" => context.handle_id,
+                "command_type" => "single",
+                "request_type" => context.request_type,
+                "command_name" => context.command_name,
+                "routing" => context.routing,
+                "duration_ms" => duration_ms,
+                "result" => "success",
+                "response_type" => redis_value_type(value),
+            ),
+        ),
+        Err(error) => log_structured(
+            logger_core::Level::Warn,
+            "glide_jni_command_completed",
+            logger_core::structured_fields!(
+                "callback_id" => context.callback_id,
+                "handle_id" => context.handle_id,
+                "command_type" => "single",
+                "request_type" => context.request_type,
+                "command_name" => context.command_name,
+                "routing" => context.routing,
+                "duration_ms" => duration_ms,
+                "result" => "error",
+                "error_kind" => format!("{:?}", error.kind()),
+                "error_type" => format!("{:?}", error_type(error)),
+                "error_message" => error_message(error),
+            ),
+        ),
+    }
+}
+
+fn log_batch_command_dispatched(
+    context: &BatchCommandLogContext<'_>,
+    timeout: &str,
+    raise_on_error: bool,
+    retry_server_error: bool,
+    retry_connection_error: bool,
+    expect_utf8: bool,
+    root_span_ptr_present: bool,
+) {
+    log_structured(
+        logger_core::Level::Debug,
+        "glide_jni_command_dispatched",
+        logger_core::structured_fields!(
+            "callback_id" => context.callback_id,
+            "handle_id" => context.handle_id,
+            "command_type" => "batch",
+            "batch_command_count" => context.command_count,
+            "batch_command_names" => context.command_names,
+            "batch_is_atomic" => context.is_atomic,
+            "routing" => context.routing,
+            "timeout" => timeout,
+            "raise_on_error" => raise_on_error,
+            "retry_server_error" => retry_server_error,
+            "retry_connection_error" => retry_connection_error,
+            "expect_utf8" => expect_utf8,
+            "root_span_ptr_present" => root_span_ptr_present,
+        ),
+    );
+}
+
+fn log_batch_command_completed(
+    context: &BatchCommandLogContext<'_>,
+    duration_ms: u64,
+    result: &Result<redis::Value, redis::RedisError>,
+) {
+    match result {
+        Ok(value) => log_structured(
+            logger_core::Level::Debug,
+            "glide_jni_command_completed",
+            logger_core::structured_fields!(
+                "callback_id" => context.callback_id,
+                "handle_id" => context.handle_id,
+                "command_type" => "batch",
+                "batch_command_count" => context.command_count,
+                "batch_command_names" => context.command_names,
+                "batch_is_atomic" => context.is_atomic,
+                "routing" => context.routing,
+                "duration_ms" => duration_ms,
+                "result" => "success",
+                "response_type" => redis_value_type(value),
+            ),
+        ),
+        Err(error) => log_structured(
+            logger_core::Level::Warn,
+            "glide_jni_command_completed",
+            logger_core::structured_fields!(
+                "callback_id" => context.callback_id,
+                "handle_id" => context.handle_id,
+                "command_type" => "batch",
+                "batch_command_count" => context.command_count,
+                "batch_command_names" => context.command_names,
+                "batch_is_atomic" => context.is_atomic,
+                "routing" => context.routing,
+                "duration_ms" => duration_ms,
+                "result" => "error",
+                "error_kind" => format!("{:?}", error.kind()),
+                "error_type" => format!("{:?}", error_type(error)),
+                "error_message" => error_message(error),
+            ),
+        ),
+    }
+}
 /// Process command arguments for compression, matching the socket_listener pattern.
 /// Extracts args from the command, applies compression if applicable, and rebuilds the command.
 fn process_command_for_compression(
@@ -1374,6 +1805,7 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_markTimedOut(
     _class: JClass,
     callback_id: jlong,
 ) {
+    log_callback_marked_timed_out(callback_id);
     jni_client::mark_callback_timed_out(callback_id);
 }
 
@@ -1481,6 +1913,14 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeBatchAsync(
         let retry_server = retry_server_error != 0;
         let retry_connection = retry_connection_error != 0;
         let expect_utf8_bool = expect_utf8 != 0;
+        track_pending_batch_command(
+            callback_id,
+            handle_id,
+            cmd_count,
+            is_atomic_bool,
+            expect_utf8_bool,
+            span_ptr != 0,
+        );
 
         // Extract route parameters
         let has_route_bool = has_route != 0;
@@ -1518,6 +1958,7 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeBatchAsync(
                         if let Some(ref child) = send_batch_span {
                             pipeline.set_pipeline_span(Some(child.clone()));
                         }
+                        let mut command_names = Vec::with_capacity(cmd_count);
 
                         for (i, rt) in req_types.iter().enumerate() {
                             let proto_rt = protobuf::EnumOrUnknown::<
@@ -1548,6 +1989,7 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeBatchAsync(
                                     }
                                 }
                             }
+                            command_names.push(redis_command_name(&cmd));
                             pipeline.add_command(cmd);
                         }
 
@@ -1570,6 +2012,34 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeBatchAsync(
                         if let Some(pid) = batch_pool_id {
                             glide_core::pool::mark_client_blocking(pid, handle_id, true);
                         }
+
+                        let routing_description = routing_description(&routing);
+                        let command_names = command_names.join(",");
+                        let timeout_description = format!("{timeout_val:?}");
+                        let log_context = BatchCommandLogContext {
+                            callback_id,
+                            handle_id,
+                            command_count: cmd_count,
+                            command_names: command_names.as_str(),
+                            is_atomic: is_atomic_bool,
+                            routing: routing_description.as_str(),
+                        };
+                        let command_started_at = Instant::now();
+                        track_batch_command(
+                            &log_context,
+                            expect_utf8_bool,
+                            span_ptr != 0,
+                            command_started_at,
+                        );
+                        log_batch_command_dispatched(
+                            &log_context,
+                            timeout_description.as_str(),
+                            raise_on_error_bool,
+                            retry_server,
+                            retry_connection,
+                            expect_utf8_bool,
+                            span_ptr != 0,
+                        );
 
                         // Execute
                         let exec_res = if is_atomic_bool {
@@ -1595,6 +2065,8 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeBatchAsync(
                                 )
                                 .await
                         };
+                        let command_elapsed_ms = elapsed_ms(command_started_at.elapsed());
+                        log_batch_command_completed(&log_context, command_elapsed_ms, &exec_res);
 
                         // Unmark blocking after batch completes
                         if let Some(pid) = batch_pool_id {
@@ -1764,6 +2236,14 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeCommandAsync
         };
 
         let expect_utf8_bool = expect_utf8 != 0;
+        track_pending_single_command(
+            callback_id,
+            handle_id,
+            request_type,
+            args_data.len(),
+            expect_utf8_bool,
+            span_ptr != 0,
+        );
 
         get_runtime().spawn(async move {
             let result: Result<redis::Value, redis::RedisError> = async {
@@ -1822,6 +2302,26 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeCommandAsync
                     ))
                 })?;
 
+                let command_name = redis_command_name(&cmd);
+                let command_arg_count = cmd.args_iter().len();
+                let routing_description = routing_description(&routing);
+                let log_context = SingleCommandLogContext {
+                    callback_id,
+                    handle_id,
+                    request_type,
+                    command_name: command_name.as_str(),
+                    command_arg_count,
+                    routing: routing_description.as_str(),
+                };
+                let command_started_at = Instant::now();
+                track_single_command(
+                    &log_context,
+                    expect_utf8_bool,
+                    span_ptr != 0,
+                    command_started_at,
+                );
+                log_single_command_dispatched(&log_context, expect_utf8_bool, span_ptr != 0);
+
                 // Abandon monitor integration: for pool-borrowed clients refresh the
                 // inactivity timer on every command, and mark blocking commands so the
                 // monitor skips them while they are in flight.
@@ -1840,6 +2340,8 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeCommandAsync
                     });
 
                 let result = client.send_command(&mut cmd, routing).await;
+                let command_elapsed_ms = elapsed_ms(command_started_at.elapsed());
+                log_single_command_completed(&log_context, command_elapsed_ms, &result);
 
                 // Unmark blocking after command completes
                 if let Some(pool_id) = blocking_flag {

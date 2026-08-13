@@ -390,6 +390,7 @@ delombok {
 javadoc {
     dependsOn delombok
     source = delombok.outputs
+    exclude '**/module-info.java.disabled'
     options.tags = [ "example:a:Example:" ]
     failOnError = false // TODO fix all javadoc errors and warnings and remove that
 }
