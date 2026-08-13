@@ -5,6 +5,7 @@ use once_cell::sync::OnceCell;
 use std::{
     path::{Path, PathBuf},
     sync::RwLock,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 use tracing::{self, event};
 use tracing_appender::rolling::{RollingFileAppender, RollingWriter, Rotation};
@@ -53,6 +54,27 @@ pub struct InitiateOnce {
 pub static INITIATE_ONCE: InitiateOnce = InitiateOnce {
     init_once: OnceCell::new(),
 };
+
+/// Cheap, cached effective max log verbosity (0=Off,1=Error,2=Warn,3=Info,4=Debug,5=Trace).
+/// Read on every lazy-log macro invocation to short-circuit the (expensive, RwLock-guarded)
+/// reload-subscriber `enabled` check when the level is disabled — the common hot-path case
+/// (e.g. per-command trace/debug logs while running at the default Warn level). Updated by
+/// `init` whenever the effective level changes; set as an UPPER BOUND on the true effective
+/// level so it can never suppress a log that should be emitted.
+pub static CURRENT_MAX_VERBOSITY: AtomicUsize = AtomicUsize::new(0);
+
+/// Maps `tracing::Level` to the verbosity ordering used by `CURRENT_MAX_VERBOSITY`.
+#[inline]
+pub fn level_may_be_enabled(level: tracing::Level) -> bool {
+    let needed = match level {
+        tracing::Level::ERROR => 1,
+        tracing::Level::WARN => 2,
+        tracing::Level::INFO => 3,
+        tracing::Level::DEBUG => 4,
+        tracing::Level::TRACE => 5,
+    };
+    CURRENT_MAX_VERBOSITY.load(Ordering::Relaxed) >= needed
+}
 
 const FILE_DIRECTORY: &str = "glide-logs";
 const ENV_GLIDE_LOG_DIR: &str = "GLIDE_LOG_DIR";
@@ -176,11 +198,15 @@ pub fn init(minimal_level: Option<Level>, file_name: Option<&str>) -> Level {
             .with_target("logger_core", log_level)
             .with_target(std::env!("CARGO_PKG_NAME"), log_level);
 
+        // Use try_init() instead of init() to gracefully handle the case where
+        // a tracing subscriber has already been set by the application.
+        // This allows applications to control their own logging configuration.
         tracing_subscriber::registry()
             .with(stdout_layer)
             .with(file_layer)
             .with(targets_filter)
-            .init();
+            .try_init()
+            .ok(); // Ignore the error if subscriber already set
 
         let reloads: Reloads = Reloads {
             console_reload: RwLock::new(stdout_reload),
@@ -224,6 +250,18 @@ pub fn init(minimal_level: Option<Level>, file_name: Option<&str>) -> Level {
                 .modify(|layer| *layer.filter_mut() = LevelFilter::OFF);
         }
     };
+    // Publish the effective max verbosity for the cheap lazy-macro gate.
+    CURRENT_MAX_VERBOSITY.store(
+        match level {
+            Level::Off => 0,
+            Level::Error => 1,
+            Level::Warn => 2,
+            Level::Info => 3,
+            Level::Debug => 4,
+            Level::Trace => 5,
+        },
+        Ordering::Relaxed,
+    );
     level
 }
 
@@ -251,6 +289,120 @@ create_log!(log_debug, DEBUG);
 create_log!(log_info, INFO);
 create_log!(log_warn, WARN);
 create_log!(log_error, ERROR);
+
+/// Lazy logging macros that only evaluate the message expression if the log level is enabled.
+/// This avoids the cost of `format!(...)` when the level is disabled.
+///
+/// Usage:
+/// ```ignore
+/// log_trace_lazy!("identifier", format!("expensive computation: {}", value));
+/// log_warn_lazy!("identifier", format!("something happened: {:?}", err));
+/// ```
+#[macro_export]
+macro_rules! log_trace_lazy {
+    ($identifier:expr, $message:expr) => {
+        if $crate::level_may_be_enabled(tracing::Level::TRACE)
+            && tracing::event_enabled!(tracing::Level::TRACE)
+        {
+            $crate::log_trace($identifier, $message);
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! log_debug_lazy {
+    ($identifier:expr, $message:expr) => {
+        if $crate::level_may_be_enabled(tracing::Level::DEBUG)
+            && tracing::event_enabled!(tracing::Level::DEBUG)
+        {
+            $crate::log_debug($identifier, $message);
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! log_info_lazy {
+    ($identifier:expr, $message:expr) => {
+        if $crate::level_may_be_enabled(tracing::Level::INFO)
+            && tracing::event_enabled!(tracing::Level::INFO)
+        {
+            $crate::log_info($identifier, $message);
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! log_warn_lazy {
+    ($identifier:expr, $message:expr) => {
+        if tracing::event_enabled!(tracing::Level::WARN) {
+            $crate::log_warn($identifier, $message);
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! log_error_lazy {
+    ($identifier:expr, $message:expr) => {
+        if tracing::event_enabled!(tracing::Level::ERROR) {
+            $crate::log_error($identifier, $message);
+        }
+    };
+}
+
+/// Rate-limited logging macro. Logs at most once per `interval_secs` seconds.
+/// Uses a static AtomicU64 per call site to track the last log time.
+///
+/// Usage:
+/// ```ignore
+/// log_warn_rate_limited!("identifier", 10, format!("something happened: {}", val));
+/// ```
+#[macro_export]
+macro_rules! log_warn_rate_limited {
+    ($identifier:expr, $interval_secs:expr, $message:expr) => {{
+        static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last = LAST_LOG.load(std::sync::atomic::Ordering::Relaxed);
+        if now >= last + $interval_secs {
+            LAST_LOG.store(now, std::sync::atomic::Ordering::Relaxed);
+            $crate::log_warn($identifier, $message);
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! log_info_rate_limited {
+    ($identifier:expr, $interval_secs:expr, $message:expr) => {{
+        static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last = LAST_LOG.load(std::sync::atomic::Ordering::Relaxed);
+        if now >= last + $interval_secs {
+            LAST_LOG.store(now, std::sync::atomic::Ordering::Relaxed);
+            $crate::log_info($identifier, $message);
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! log_debug_rate_limited {
+    ($identifier:expr, $interval_secs:expr, $message:expr) => {{
+        static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last = LAST_LOG.load(std::sync::atomic::Ordering::Relaxed);
+        if now >= last + $interval_secs {
+            LAST_LOG.store(now, std::sync::atomic::Ordering::Relaxed);
+            $crate::log_debug($identifier, $message);
+        }
+    }};
+}
 
 // Logs the given log, with log_identifier and log level prefixed. If the given log level is below the threshold of given when the logger was initialized, the log will be ignored.
 // log_identifier should be used to add context to a log, and make it easier to connect it to other relevant logs. For example, it can be used to pass a task identifier.

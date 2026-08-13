@@ -21,10 +21,15 @@ ext {
 }
 
 dependencies {
+    api project(':jedis-compat-shared')
+
     implementation project(':client')
 
     // Apache Commons Pool 2 for connection pooling - part of public API
     api group: 'org.apache.commons', name: 'commons-pool2', version: '2.12.1'
+
+    // Apache Commons Lang 3 for utility classes like Pair
+    implementation group: 'org.apache.commons', name: 'commons-lang3', version: '3.20.0'
 
     // Test dependencies
     testImplementation group: 'org.junit.jupiter', name: 'junit-jupiter', version: '5.10.2'
@@ -32,10 +37,10 @@ dependencies {
     testImplementation group: 'org.mockito', name: 'mockito-junit-jupiter', version: '5.2.0'
 
     // Lombok
-    compileOnly 'org.projectlombok:lombok:1.18.42'
-    annotationProcessor 'org.projectlombok:lombok:1.18.42'
-    testCompileOnly 'org.projectlombok:lombok:1.18.42'
-    testAnnotationProcessor 'org.projectlombok:lombok:1.18.42'
+    compileOnly 'org.projectlombok:lombok:1.18.44'
+    annotationProcessor 'org.projectlombok:lombok:1.18.44'
+    testCompileOnly 'org.projectlombok:lombok:1.18.44'
+    testAnnotationProcessor 'org.projectlombok:lombok:1.18.44'
 
     // SpotBugs annotations for static analysis (compile-only to avoid IDE errors)
     compileOnly 'com.github.spotbugs:spotbugs-annotations:4.8.0'
@@ -52,27 +57,7 @@ javadoc {
     failOnError = false // Disable javadoc errors for compatibility layer
 }
 
-tasks.register('copyNativeLib', Copy) {
-    def target
-    if (project.hasProperty('target')) {
-        target = project.target
-        from "${projectDir}/../target/${target}/release/"
-    } else if (osdetector.os == 'linux' && osdetector.release.id != 'alpine') {
-        from "${projectDir}/../target/${arch}-unknown-linux-gnu/release/"
-    } else if (osdetector.os == 'linux' && osdetector.release.id == 'alpine') {
-        from "${projectDir}/../target/${arch}-unknown-linux-musl/release/"
-    } else {
-        from "${projectDir}/../target/release/"
-    }
-    include "*.dylib", "*.so", "*.dll"
-    into sourceSets.main.output.resourcesDir
-}
-
-jar.dependsOn('copyNativeLib')
-javadoc.dependsOn('copyNativeLib')
-compileTestJava.dependsOn('copyNativeLib')
 delombok.dependsOn('compileJava')
-copyNativeLib.dependsOn(':client:buildRust')
 compileJava.dependsOn(':client:jar')
 
 tasks.withType(Test) {
@@ -91,7 +76,11 @@ tasks.withType(Test) {
 }
 
 jar {
-    if (project.hasProperty('target') && project.target.contains("musl")) {
+    def isNoClassifierBuild = System.getenv("JEDIS_NO_CLASSIFIER_BUILD") == "true"
+
+    if (isNoClassifierBuild) {
+        archiveClassifier = ''
+    } else if (project.hasProperty('target') && project.target.contains("musl")) {
         archiveClassifier = "linux_musl_${arch}"
     } else {
         archiveClassifier = osdetector.classifier
@@ -121,6 +110,7 @@ publishing {
             artifactId = 'valkey-glide-jedis-compatibility'
             version = System.getenv("GLIDE_RELEASE_VERSION") ?: project.ext.defaultReleaseVersion
             pom {
+                packaging = 'jar'
                 name = 'valkey-glide-jedis-compatibility'
                 description = 'Jedis compatibility layer for Valkey GLIDE'
                 url = 'https://github.com/valkey-io/valkey-glide.git'

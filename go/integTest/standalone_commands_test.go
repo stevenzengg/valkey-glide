@@ -842,6 +842,30 @@ func (suite *GlideTestSuite) TestLolwutWithOptions_Version9_FourParams() {
 	}
 }
 
+func (suite *GlideTestSuite) TestClientTrackingInfo_CacheOff() {
+	client := suite.defaultClient()
+	ctx := context.Background()
+
+	info, err := client.ClientTrackingInfo(ctx)
+	assert.NoError(suite.T(), err)
+	assertClientTrackingInfo(suite.T(), info, false)
+}
+
+func (suite *GlideTestSuite) TestClientTrackingInfo_CacheOn() {
+	cache, err := config.NewClientSideCache(defaultTestCacheKb, defaultTestTtlMs)
+	require.NoError(suite.T(), err)
+	cache.WithServerAssisted(true)
+
+	clientConfig := suite.defaultClientConfig().WithClientSideCache(cache)
+	client, err := suite.client(clientConfig)
+	require.NoError(suite.T(), err)
+
+	ctx := context.Background()
+	info, err := client.ClientTrackingInfo(ctx)
+	assert.NoError(suite.T(), err)
+	assertClientTrackingInfo(suite.T(), info, true)
+}
+
 func (suite *GlideTestSuite) TestClientId() {
 	client := suite.defaultClient()
 	result, err := client.ClientId(context.Background())
@@ -855,6 +879,56 @@ func (suite *GlideTestSuite) TestLastSave() {
 	result, err := client.LastSave(context.Background())
 	assert.Nil(t, err)
 	assert.Greater(t, result, int64(0))
+}
+
+func (suite *GlideTestSuite) TestSave() {
+	client := suite.defaultClient()
+	t := suite.T()
+	suite.waitForSaveNotInProgress(client)
+	result, err := client.Save(context.Background())
+	assert.Nil(t, err)
+	assert.Equal(t, "OK", result)
+}
+
+func (suite *GlideTestSuite) TestBgSave() {
+	client := suite.defaultClient()
+	t := suite.T()
+	suite.waitForSaveNotInProgress(client)
+	result, err := client.BgSave(context.Background())
+	assert.Nil(t, err)
+	assert.NotEmpty(t, result)
+	assert.Contains(t, bgsaveResponses, result)
+}
+
+func (suite *GlideTestSuite) TestBgSaveSchedule() {
+	client := suite.defaultClient()
+	t := suite.T()
+	suite.waitForSaveNotInProgress(client)
+	result, err := client.BgSaveSchedule(context.Background())
+	assert.Nil(t, err)
+	assert.NotEmpty(t, result)
+	assert.Contains(t, bgsaveResponses, result)
+}
+
+func (suite *GlideTestSuite) TestBgSaveCancel() {
+	suite.SkipIfServerVersionLowerThan("8.1.0", suite.T())
+	client := suite.defaultClient()
+	t := suite.T()
+	suite.waitForSaveNotInProgress(client)
+	// When no save is in progress, BGSAVE CANCEL should return an error
+	_, err := client.BgSaveCancel(context.Background())
+	assert.NotNil(t, err)
+	assert.Contains(t, err.Error(), bgsaveNotCancelledResponse)
+}
+
+func (suite *GlideTestSuite) TestBgRewriteAof() {
+	client := suite.defaultClient()
+	t := suite.T()
+	suite.waitForSaveNotInProgress(client)
+	result, err := client.BgRewriteAof(context.Background())
+	assert.Nil(t, err)
+	assert.NotEmpty(t, result)
+	assert.Contains(t, bgrewriteaofResponses, result)
 }
 
 func (suite *GlideTestSuite) TestConfigResetStat() {
@@ -1331,9 +1405,12 @@ func (suite *GlideTestSuite) TestScriptExists() {
 }
 
 func (suite *GlideTestSuite) TestScriptKill() {
-	invokeClient, err := suite.client(suite.defaultClientConfig())
-	require.NoError(suite.T(), err)
 	killClient := suite.defaultClient()
+
+	// Use a longer request timeout so InvokeScript blocks until killed
+	invokeConfig := suite.defaultClientConfig().WithRequestTimeout(12 * time.Second)
+	invokeClient, err := suite.client(invokeConfig)
+	require.NoError(suite.T(), err)
 
 	// Ensure no script is running at the beginning
 	_, err = killClient.ScriptKill(context.Background())
@@ -1341,46 +1418,202 @@ func (suite *GlideTestSuite) TestScriptKill() {
 	assert.True(suite.T(), strings.Contains(strings.ToLower(err.Error()), "notbusy"))
 
 	// Kill Running Code
-	code := CreateLongRunningLuaScript(5, true)
+	code := CreateLongRunningLuaScript(10, true)
 	script := options.NewScript(code)
 
-	go invokeClient.InvokeScript(context.Background(), *script)
+	// Start InvokeScript in a goroutine so it begins executing immediately
+	var invokeErr error
+	invokeDone := make(chan struct{})
+	go func() {
+		defer close(invokeDone)
+		_, invokeErr = invokeClient.InvokeScript(context.Background(), *script)
+	}()
 
-	timeout := time.After(4 * time.Second)
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
+	// Poll ScriptKill on the main goroutine until the script is running and killed
+	var killErr error
 	var result string
-	killed := false
+	require.Eventually(suite.T(), func() bool {
+		result, killErr = killClient.ScriptKill(context.Background())
+		return killErr == nil
+	}, 10*time.Second, 500*time.Millisecond, "Timed out waiting for script kill to succeed")
 
-	for !killed {
-		select {
-		case <-timeout:
-			suite.T().Fatal("Timeout: SCRIPT KILL failed to execute in 4 seconds")
-		case <-ticker.C:
-			result, err = killClient.ScriptKill(context.Background())
-			if err == nil {
-				killed = true
-				// No 'break' needed here; select already exits after one case
-				continue // Or simply let it fall through
-			}
+	// Wait for invoke to complete after kill
+	<-invokeDone
 
-			if !strings.Contains(strings.ToLower(err.Error()), "notbusy") {
-				assert.NoError(suite.T(), err) // Will fail the test if there's an unexpected error
-				killed = true                  // Stop polling on unexpected errors
-			}
-			// If it was "notbusy", loop continues naturally
-		}
-	}
-
-	assert.NoError(suite.T(), err) // This now checks the final error state after the loop
+	require.Error(suite.T(), invokeErr)
+	assert.Contains(suite.T(), strings.ToLower(invokeErr.Error()), "script killed")
+	assert.NoError(suite.T(), killErr)
 	assert.Equal(suite.T(), "OK", result)
 	script.Close()
-
-	time.Sleep(1 * time.Second)
 
 	// Ensure no script is running at the end
 	_, err = killClient.ScriptKill(context.Background())
 	assert.Error(suite.T(), err)
 	assert.True(suite.T(), strings.Contains(strings.ToLower(err.Error()), "notbusy"))
+}
+
+func (suite *GlideTestSuite) TestMigrateMultiKey() {
+	client := suite.defaultClient()
+	ctx := context.Background()
+	key1 := "{migrate}" + uuid.New().String()
+	key2 := "{migrate}" + uuid.New().String()
+	nonExistentKey1 := "{migrate}" + uuid.New().String()
+	nonExistentKey2 := "{migrate}" + uuid.New().String()
+
+	// Non-existent keys return "NOKEY" (not an error)
+	result, err := client.Migrate(ctx, "nonexistent.host", 6379, []string{nonExistentKey1, nonExistentKey2}, 0, 1000)
+	suite.NoError(err)
+	suite.Equal("NOKEY", result)
+
+	// Existing keys migrated to unreachable host returns an error
+	client.Set(ctx, key1, "value1")
+	client.Set(ctx, key2, "value2")
+	_, err = client.Migrate(ctx, "nonexistent.host", 6379, []string{key1, key2}, 0, 1000)
+	suite.Error(err)
+
+	// Empty keys returns error
+	_, err = client.Migrate(ctx, "nonexistent.host", 6379, []string{}, 0, 1000)
+	suite.Error(err)
+	suite.Contains(err.Error(), "keys must not be empty")
+
+	// Success: migrate keys to a second server
+	output, err := startDedicatedValkeyServer(suite, false)
+	suite.NoError(err)
+	clusterFolder := extractClusterFolder(suite, output)
+	defer stopDedicatedValkeyServer(suite, clusterFolder)
+	destAddresses := extractAddresses(suite, output)
+	destHost := destAddresses[0].Host
+	destPort := int64(destAddresses[0].Port)
+
+	srcKey1 := "{migrate}" + uuid.New().String()
+	srcKey2 := "{migrate}" + uuid.New().String()
+	client.Set(ctx, srcKey1, "val1")
+	client.Set(ctx, srcKey2, "val2")
+
+	result, err = client.Migrate(ctx, destHost, destPort, []string{srcKey1, srcKey2}, 0, 5000)
+	suite.NoError(err)
+	suite.Equal("OK", result)
+
+	// Keys should no longer exist on source
+	exists, err := client.Exists(ctx, []string{srcKey1, srcKey2})
+	suite.NoError(err)
+	suite.Equal(int64(0), exists)
+
+	// Keys should exist on destination
+	destClient, err := glide.NewClient(config.NewClientConfiguration().WithAddress(&destAddresses[0]))
+	suite.NoError(err)
+	defer destClient.Close()
+	exists, err = destClient.Exists(ctx, []string{srcKey1, srcKey2})
+	suite.NoError(err)
+	suite.Equal(int64(2), exists)
+}
+
+func (suite *GlideTestSuite) TestMigrateMultiKeyWithOptions() {
+	client := suite.defaultClient()
+	ctx := context.Background()
+	key1 := "{migrate}" + uuid.New().String()
+	key2 := "{migrate}" + uuid.New().String()
+	nonExistentKey1 := "{migrate}" + uuid.New().String()
+	nonExistentKey2 := "{migrate}" + uuid.New().String()
+	migrateOpts := options.NewMigrateOptions().SetCopy().SetReplace()
+
+	// Non-existent keys return "NOKEY" (not an error)
+	result, err := client.MigrateWithOptions(
+		ctx, "nonexistent.host", 6379, []string{nonExistentKey1, nonExistentKey2}, 0, 1000, *migrateOpts,
+	)
+	suite.NoError(err)
+	suite.Equal("NOKEY", result)
+
+	// Existing keys migrated to unreachable host returns an error
+	client.Set(ctx, key1, "value1")
+	client.Set(ctx, key2, "value2")
+	_, err = client.MigrateWithOptions(ctx, "nonexistent.host", 6379, []string{key1, key2}, 0, 1000, *migrateOpts)
+	suite.Error(err)
+
+	// Empty keys returns error
+	_, err = client.MigrateWithOptions(ctx, "nonexistent.host", 6379, []string{}, 0, 1000, *migrateOpts)
+	suite.Error(err)
+	suite.Contains(err.Error(), "keys must not be empty")
+
+	// Success with COPY option: keys remain on source after migration
+	output, err := startDedicatedValkeyServer(suite, false)
+	suite.NoError(err)
+	clusterFolder := extractClusterFolder(suite, output)
+	defer stopDedicatedValkeyServer(suite, clusterFolder)
+	destAddresses := extractAddresses(suite, output)
+	destHost := destAddresses[0].Host
+	destPort := int64(destAddresses[0].Port)
+
+	srcKey1 := "{migrate}" + uuid.New().String()
+	srcKey2 := "{migrate}" + uuid.New().String()
+	client.Set(ctx, srcKey1, "val1")
+	client.Set(ctx, srcKey2, "val2")
+
+	copyOpts := options.NewMigrateOptions().SetCopy()
+	result, err = client.MigrateWithOptions(ctx, destHost, destPort, []string{srcKey1, srcKey2}, 0, 5000, *copyOpts)
+	suite.NoError(err)
+	suite.Equal("OK", result)
+
+	// With COPY, keys should still exist on source
+	exists, err := client.Exists(ctx, []string{srcKey1, srcKey2})
+	suite.NoError(err)
+	suite.Equal(int64(2), exists)
+
+	// Keys should also exist on destination
+	destClient, err := glide.NewClient(config.NewClientConfiguration().WithAddress(&destAddresses[0]))
+	suite.NoError(err)
+	defer destClient.Close()
+	exists, err = destClient.Exists(ctx, []string{srcKey1, srcKey2})
+	suite.NoError(err)
+	suite.Equal(int64(2), exists)
+}
+
+func (suite *GlideTestSuite) TestFailover() {
+	// Spin up a dedicated standalone server with 1 replica so the failover
+	// doesn't destabilize the shared test server.
+	output, err := startDedicatedValkeyServerWithReplicas(suite, false, 1)
+	suite.Require().NoError(err)
+	clusterFolder := extractClusterFolder(suite, output)
+	addresses := extractAddresses(suite, output)
+	defer stopDedicatedValkeyServer(suite, clusterFolder)
+
+	cfg := defaultClientConfig()
+	cfg.WithAddress(&addresses[0])
+	client, err := glide.NewClient(cfg)
+	suite.Require().NoError(err)
+	defer client.Close()
+
+	ctx := context.Background()
+
+	// Verify initial role is master
+	suite.Require().Eventually(func() bool {
+		info, err := client.InfoWithOptions(ctx, options.InfoOptions{Sections: []constants.Section{constants.Replication}})
+		return err == nil && strings.Contains(info, "role:master")
+	}, 10*time.Second, 100*time.Millisecond, "Timed out waiting for initial master role")
+
+	// Execute failover — returns OK immediately
+	result, err := client.Failover(ctx)
+	suite.Require().NoError(err)
+	suite.Equal("OK", result)
+
+	// Wait for role to change to slave (failover completed)
+	suite.Require().Eventually(func() bool {
+		info, err := client.InfoWithOptions(ctx, options.InfoOptions{Sections: []constants.Section{constants.Replication}})
+		return err == nil && strings.Contains(info, "role:slave")
+	}, 30*time.Second, 500*time.Millisecond, "Timed out waiting for role change to slave")
+}
+
+func (suite *GlideTestSuite) TestFailoverWithOptions_Abort() {
+	client := suite.defaultClient()
+	// FAILOVER ABORT when no failover is in progress should error
+	_, err := client.FailoverWithOptions(context.Background(), options.NewFailoverOptionsWithAbort())
+	suite.Error(err)
+}
+
+func (suite *GlideTestSuite) TestReplicaOfNoOne() {
+	client := suite.defaultClient()
+	// REPLICAOF NO ONE on a primary should succeed (it's already a primary)
+	result, err := client.ReplicaOfNoOne(context.Background())
+	suite.Require().NoError(err)
+	suite.Equal("OK", result)
 }

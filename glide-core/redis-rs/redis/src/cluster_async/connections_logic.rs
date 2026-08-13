@@ -195,6 +195,8 @@ where
             connection_retry_strategy: None,
             tcp_nodelay: params.tcp_nodelay,
             pubsub_synchronizer: None,
+            iam_token_provider: None,
+            cert_params_provider: None,
         },
     )
     .await

@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Protocol, Set, Tuple, Union
 
+from glide_shared.cache import ClientSideCache
 from glide_shared.commands.core_options import PubSubMsg
 from glide_shared.exceptions import ConfigurationError
+from glide_shared.protobuf.connection_request_pb2 import (
+    ClientCertReloadConfig as ProtobufClientCertReloadConfig,
+)
 from glide_shared.protobuf.connection_request_pb2 import (
     CompressionBackend as ProtobufCompressionBackend,
 )
@@ -18,12 +23,23 @@ from glide_shared.protobuf.connection_request_pb2 import (
     ConnectionRequest,
 )
 from glide_shared.protobuf.connection_request_pb2 import (
+    NodeDiscoveryMode as ProtobufNodeDiscoveryMode,
+)
+from glide_shared.protobuf.connection_request_pb2 import (
     ProtocolVersion as SentProtocolVersion,
 )
 from glide_shared.protobuf.connection_request_pb2 import ReadFrom as ProtobufReadFrom
 from glide_shared.protobuf.connection_request_pb2 import (
     TlsMode,
 )
+
+# A filesystem path argument: a plain ``str`` or any ``os.PathLike[str]``
+# (for example ``pathlib.Path``).
+StrPath = Union[str, os.PathLike[str]]
+
+# Largest value that fits in an unsigned 32-bit protobuf field. Reused by
+# validators that need to bound a value to the uint32 wire range.
+MAX_UINT32 = 2**32 - 1
 
 
 class NodeAddress:
@@ -38,6 +54,52 @@ class NodeAddress:
     def __init__(self, host: str = "localhost", port: int = 6379):
         self.host = host
         self.port = port
+
+
+class AddressResolver(Protocol):
+    """
+    A callback protocol for resolving server addresses before connection.
+
+    When provided to a client configuration, this callback is invoked for each
+    configured address during connection establishment and during cluster topology
+    refreshes. The callback receives the configured host and port, and should return
+    the actual host and port to use for the connection.
+
+    Use cases:
+        - Custom DNS resolution for service discovery
+        - Address translation for proxy setups
+        - Dynamic endpoint resolution for cloud environments
+
+    Note:
+        The resolver must be thread-safe and should avoid blocking operations,
+        as it may be called from multiple threads during connection and topology refresh.
+        If the resolver raises an exception, the original address will be used as a fallback.
+
+    Example::
+
+        def my_resolver(host: str, port: int) -> Tuple[str, int]:
+            # Custom resolution logic
+            resolved_host = my_dns_resolver.resolve(host)
+            return (resolved_host, port)
+
+        config = GlideClientConfiguration(
+            addresses=[NodeAddress("my-service", 6379)],
+            address_resolver=my_resolver,
+        )
+    """
+
+    def __call__(self, host: str, port: int) -> Tuple[str, int]:
+        """
+        Resolve the given host and port to the actual connection address.
+
+        Args:
+            host (str): The configured host name or IP address.
+            port (int): The configured port number.
+
+        Returns:
+            Tuple[str, int]: A tuple of (resolved_host, resolved_port) to use for connection.
+        """
+        ...
 
 
 class ReadFrom(Enum):
@@ -63,6 +125,10 @@ class ReadFrom(Enum):
     """
     Spread the read requests among nodes within the client's Availability Zone (AZ) in a round robin manner,
     prioritizing local replicas, then the local primary, and falling back to any replica or the primary if needed.
+    """
+    ALL_NODES = ProtobufReadFrom.AllNodes
+    """
+    Spread the read requests between all nodes (primary and replicas) in a round robin manner.
     """
 
 
@@ -96,32 +162,35 @@ class CompressionBackend(Enum):
     """
 
 
+class NodeDiscoveryMode(Enum):
+    """
+    Controls how the client discovers node roles and topology in standalone mode.
+    """
+
+    STANDARD = ProtobufNodeDiscoveryMode.Standard
+    """
+    Default: verify node roles via INFO REPLICATION, use only provided addresses.
+    The client connects to all provided addresses and identifies which is the primary.
+    """
+    STATIC = ProtobufNodeDiscoveryMode.Static
+    """
+    Skip role detection entirely. Trust provided addresses as-is; first address is primary.
+    Use when connecting through a proxy (e.g., Envoy) or when the topology is known and static.
+
+    Note: Do not set ``client_name`` when using this mode with a proxy.
+    """
+    DISCOVER_ALL = ProtobufNodeDiscoveryMode.DiscoverAll
+    """
+    Discover full topology (primary + all replicas) from any starting node.
+    Provide any single node address and the client will find and connect to all other nodes.
+    """
+
+
 def _get_min_compressed_size() -> int:
-    """
-    Get the minimum compressed size from the Rust core.
-    This ensures Python validation stays in sync with Rust implementation.
-    """
-    try:
-        # Try async module first
-        from glide import get_min_compressed_size
+    """Get the minimum compressed size from the Rust core via FFI."""
+    from glide_shared._glide_ffi import GlideFFI
 
-        return get_min_compressed_size()
-    except ImportError:
-        pass
-
-    try:
-        # Try sync module
-        from glide_sync import get_min_compressed_size
-
-        return get_min_compressed_size()
-    except ImportError:
-        pass
-
-    # If neither module is available, fail fast
-    raise ImportError(
-        "Cannot import get_min_compressed_size from either 'glide' or 'glide_sync'. "
-        "Ensure the native module is built and available."
-    )
+    return GlideFFI.lib.get_min_compressed_size()
 
 
 # Lazy cache for minimum compression size to avoid circular import issues
@@ -144,6 +213,15 @@ class CompressionConfiguration:
     """
     Represents the compression configuration for automatic compression of values.
 
+    WARNING: This feature is experimental and not recommended for production use.
+
+    Compression is NOT compatible with commands that manipulate string data on the server side:
+    - APPEND, GETRANGE, SETRANGE, STRLEN, LCS
+    - INCR, INCRBY, INCRBYFLOAT, DECR, DECRBY
+    - GETBIT, SETBIT, BITCOUNT, BITPOS, BITFIELD, BITFIELD_RO, BITOP
+
+    Using these commands with compressed values will result in incorrect behavior or errors.
+
     Attributes:
         enabled (bool): Whether compression is enabled. Defaults to False.
         backend (CompressionBackend): The compression backend to use. Defaults to CompressionBackend.ZSTD.
@@ -152,12 +230,16 @@ class CompressionConfiguration:
             ZSTD default is 3
             LZ4 default is 0
         min_compression_size (int): The minimum size in bytes for values to be compressed. Values smaller than this will not be compressed. Defaults to 64 bytes.
+        max_decompressed_size (Optional[int]): Maximum allowed size in bytes for decompressed data.
+            This limit prevents decompression bombs (maliciously crafted compressed data that expands to huge sizes).
+            If not set, defaults to 512MB (matching Valkey's proto-max-bulk-len).
     """
 
     enabled: bool = False
     backend: CompressionBackend = CompressionBackend.ZSTD
     compression_level: Optional[int] = None
     min_compression_size: int = 64
+    max_decompressed_size: Optional[int] = None  # Use Rust default (512MB)
 
     def __post_init__(self) -> None:
         """Validate compression configuration parameters."""
@@ -175,6 +257,9 @@ class CompressionConfiguration:
             raise ConfigurationError(
                 f"min_compression_size should be at least {min_size} bytes"
             )
+
+        if self.max_decompressed_size is not None and self.max_decompressed_size <= 0:
+            raise ConfigurationError("max_decompressed_size must be positive if set")
 
         # Note: compression_level validation is performed by the Rust core,
         # which uses the actual compression library's valid ranges.
@@ -201,6 +286,12 @@ class CompressionConfiguration:
 
         if self.compression_level is not None:
             config.compression_level = self.compression_level
+
+        # Handle max_decompressed_size:
+        # - None = don't set field, let Rust use its default (512MB)
+        # - int > 0 = use that value
+        if self.max_decompressed_size is not None:
+            config.max_decompressed_size = self.max_decompressed_size
 
         return config
 
@@ -355,7 +446,12 @@ class PeriodicChecksStatus(Enum):
 
 class TlsAdvancedConfiguration:
     """
-    Represents advanced TLS configuration settings.
+    Advanced TLS configuration for standalone and cluster clients.
+
+    Mutual TLS (mTLS) is configured through the keyword-only constructor
+    parameters in one of two mutually-exclusive modes: static bytes
+    (``client_cert_pem`` + ``client_key_pem``) or path-based with automatic
+    reload (``client_cert_path`` + ``client_key_path``).
 
     Attributes:
         use_insecure_tls (Optional[bool]): Whether to bypass TLS certificate verification.
@@ -437,6 +533,49 @@ class TlsAdvancedConfiguration:
             - The key data should be in PEM format as a bytes object.
 
             - Must be used together with client_cert_pem.
+
+        client_cert_path (Optional[StrPath]): Path to the PEM-encoded client certificate for mutual TLS authentication.
+
+            - When provided along with ``client_key_path``, enables path-based mutual TLS (mTLS)
+              with automatic reload: the GLIDE core re-reads both files on a cadence, so a rotated
+              certificate is adopted on the next reconnect while existing open connections keep
+              their current material. A read failure keeps the last-known-good material with no
+              application-level exception.
+
+            - Must be used together with ``client_key_path``, and cannot be combined with
+              byte-based mTLS (``client_cert_pem`` / ``client_key_pem``). Invalid combinations
+              raise ``ConfigurationError`` when the connection request is built.
+
+            - Accepts a ``str`` or any ``os.PathLike`` (including ``pathlib.Path``). The file is
+              read and validated by the GLIDE core when the connection is established; a missing,
+              empty, or unreadable file surfaces as a connection error at that point.
+
+            - If None (default), no path-based client certificate is used.
+
+        client_key_path (Optional[StrPath]): Path to the PEM-encoded client private key for mutual TLS authentication.
+
+            - When provided along with ``client_cert_path``, completes the path-based mTLS pair
+              and participates in the same automatic reload described above.
+
+            - Same rules as ``client_cert_path``: must be paired with it, cannot be combined with
+              byte-based mTLS, and accepts a ``str`` or any ``os.PathLike``. The file is read and
+              validated by the GLIDE core at connection time.
+
+            - If None (default), no path-based client key is used.
+
+        cert_reload_interval_seconds (Optional[int]): Override for the path-based mTLS reload cadence, in seconds.
+
+            - Only meaningful with path-based mTLS. Setting it without both ``client_cert_path``
+              and ``client_key_path`` raises ``ConfigurationError`` when the connection request
+              is built.
+
+            - Must be a positive integer no greater than ``MAX_UINT32``.
+              Values outside that range raise ``ConfigurationError`` when the connection
+              request is built.
+
+            - If None (default), the GLIDE core applies its default reload cadence (see
+              ``DEFAULT_RELOAD_INTERVAL_SECONDS`` in glide-core's ``tls_reload`` module for the
+              authoritative value).
     """
 
     def __init__(
@@ -445,11 +584,65 @@ class TlsAdvancedConfiguration:
         root_pem_cacerts: Optional[bytes] = None,
         client_cert_pem: Optional[bytes] = None,
         client_key_pem: Optional[bytes] = None,
+        *,
+        client_cert_path: Optional[StrPath] = None,
+        client_key_path: Optional[StrPath] = None,
+        cert_reload_interval_seconds: Optional[int] = None,
     ):
         self.use_insecure_tls = use_insecure_tls
         self.root_pem_cacerts = root_pem_cacerts
         self.client_cert_pem = client_cert_pem
         self.client_key_pem = client_key_pem
+        # Store the paths as provided; normalization to ``str`` is deferred to
+        # protobuf creation so these public attributes reflect the user's input.
+        self.client_cert_path = client_cert_path
+        self.client_key_path = client_key_path
+        self.cert_reload_interval_seconds = cert_reload_interval_seconds
+
+
+class ClientCircuitBreakerConfiguration:
+    """
+    Configuration for the client-wide circuit breaker.
+
+    The circuit breaker detects when the GLIDE core is unhealthy (sustained error rate)
+    and rejects requests at the FFI boundary before threads park. Disabled by default.
+
+    Attributes:
+        window_size_ms (int): Sliding window duration in milliseconds for error rate calculation. Default: 10000.
+        failure_rate_threshold (float): Error rate (0.0-1.0) within the window to trip. Default: 0.5.
+        min_errors (int): Minimum errors within window before rate is evaluated. Default: 50.
+        open_timeout_ms (int): Time in milliseconds in Open state before allowing a probe. Default: 5000.
+        count_timeouts (bool): Whether timeouts count toward tripping. Default: False.
+        consecutive_successes (int): Successful probes needed before closing. Default: 3.
+    """
+
+    def __init__(
+        self,
+        window_size_ms: int = 10000,
+        failure_rate_threshold: float = 0.5,
+        min_errors: int = 50,
+        open_timeout_ms: int = 5000,
+        count_timeouts: bool = False,
+        consecutive_successes: int = 3,
+    ):
+        if window_size_ms <= 0:
+            raise ValueError("window_size_ms must be positive")
+        if not (0.0 < failure_rate_threshold <= 1.0):
+            raise ValueError(
+                "failure_rate_threshold must be between 0.0 (exclusive) and 1.0 (inclusive)"
+            )
+        if min_errors <= 0:
+            raise ValueError("min_errors must be positive")
+        if open_timeout_ms <= 0:
+            raise ValueError("open_timeout_ms must be positive")
+        if consecutive_successes <= 0:
+            raise ValueError("consecutive_successes must be positive")
+        self.window_size_ms = window_size_ms
+        self.failure_rate_threshold = failure_rate_threshold
+        self.min_errors = min_errors
+        self.open_timeout_ms = open_timeout_ms
+        self.count_timeouts = count_timeouts
+        self.consecutive_successes = consecutive_successes
 
 
 class AdvancedBaseClientConfiguration:
@@ -511,9 +704,75 @@ class AdvancedBaseClientConfiguration:
 
         return request
 
+    def _validate_mtls_config(self, tls_config: TlsAdvancedConfiguration) -> None:
+        """Validate the both-or-neither pairing and mode exclusivity for mTLS on the given tls_config when the request is built.
+
+        Covers presence, pairing, and the reload interval's range. The GLIDE core
+        checks file contents and path readability at connection time.
+        """
+        has_cert_path = tls_config.client_cert_path is not None
+        has_key_path = tls_config.client_key_path is not None
+        has_cert_pem = tls_config.client_cert_pem is not None
+        has_key_pem = tls_config.client_key_pem is not None
+
+        if has_cert_path != has_key_path:
+            raise ConfigurationError(
+                "client_cert_path and client_key_path must be provided together; "
+                "provide both to enable path-based mTLS or neither."
+            )
+
+        if has_cert_pem != has_key_pem:
+            raise ConfigurationError(
+                "client_cert_pem and client_key_pem must be provided together; "
+                "provide both to enable byte-based mTLS or neither."
+            )
+
+        if has_cert_path and has_cert_pem:
+            raise ConfigurationError(
+                "path-based and byte-based mTLS are mutually exclusive; choose one."
+            )
+
+        if has_cert_pem:
+            if not tls_config.client_cert_pem:
+                raise ConfigurationError(
+                    "client_cert_pem must not be empty; got zero-length bytes."
+                )
+            if not tls_config.client_key_pem:
+                raise ConfigurationError(
+                    "client_key_pem must not be empty; got zero-length bytes."
+                )
+
+        interval = tls_config.cert_reload_interval_seconds
+
+        # Only the path-based branch emits `cert_reload`.
+        if not has_cert_path and interval is not None:
+            raise ConfigurationError(
+                "cert_reload_interval_seconds may only be set when path-based mTLS is "
+                "configured (both client_cert_path and client_key_path)."
+            )
+
+        # The core silently maps `0` to unset and applies its default cadence, so
+        # reject it here instead of leaving callers with a surprising fallback.
+        if interval is not None and interval <= 0:
+            raise ConfigurationError(
+                "cert_reload_interval_seconds must be positive; omit it (None) to defer "
+                "to the GLIDE core's default reload cadence."
+            )
+
+        # The core cannot catch values above the uint32 wire field; it never
+        # sees them.
+        if interval is not None and interval > MAX_UINT32:
+            raise ConfigurationError(
+                "cert_reload_interval_seconds must be a positive integer no greater "
+                f"than {MAX_UINT32}; got {interval}. Omit it to defer "
+                "to the GLIDE core's default reload cadence."
+            )
+
     def _apply_tls_config(
         self, request: ConnectionRequest, tls_config: TlsAdvancedConfiguration
     ) -> None:
+        self._validate_mtls_config(tls_config)
+
         # Validate and handle insecure TLS
         if tls_config.use_insecure_tls:
             # Validate that TLS is enabled before allowing insecure mode
@@ -534,36 +793,30 @@ class AdvancedBaseClientConfiguration:
                 )
             request.root_certs.append(root_certs)
 
-        # Handle client certificate for mutual TLS
-        client_cert = tls_config.client_cert_pem
-        if client_cert is not None:
-            if len(client_cert) == 0:
-                raise ConfigurationError(
-                    "client_cert_pem cannot be an empty bytes object; use None if not providing client certificate"
-                )
-            request.client_cert = client_cert
+        # Byte-mode mTLS. Pairing is enforced by `_validate_mtls_config` above.
+        # We emit each byte field under its own presence check so an unset value
+        # stays at protobuf's default `b""` (proto3 scalar bytes) rather than
+        # being coerced to `None`, which would raise `TypeError` at assignment.
+        if tls_config.client_cert_pem is not None:
+            request.client_cert = tls_config.client_cert_pem
+        if tls_config.client_key_pem is not None:
+            request.client_key = tls_config.client_key_pem
 
-        # Handle client key for mutual TLS
-        client_key = tls_config.client_key_pem
-        if client_key is not None:
-            if len(client_key) == 0:
-                raise ConfigurationError(
-                    "client_key_pem cannot be an empty bytes object; use None if not providing client key"
-                )
-            request.client_key = client_key
-
-        # Ensure client cert and client key are both provided or not provided
-        self._validate_client_auth_tls()
-
-    def _validate_client_auth_tls(self):
-        if self.tls_config.client_cert_pem and not self.tls_config.client_key_pem:
-            raise ConfigurationError(
-                "client_cert_pem is provided but client_key_pem not provided. mTLS requires both",
-            )
-        if self.tls_config.client_key_pem and not self.tls_config.client_cert_pem:
-            raise ConfigurationError(
-                "client_key_pem is provided but client_cert_pem not provided. mTLS requires both",
-            )
+        # Path-based mTLS with automatic reload; the byte and path branches
+        # never both apply (enforced by `_validate_mtls_config` above). The two paths are
+        # validated as a pair, so they are either both set or both unset. Paths
+        # are normalized to `str` here (deferred from construction) so the
+        # public attributes keep the user's original input.
+        cert_path = tls_config.client_cert_path
+        key_path = tls_config.client_key_path
+        if cert_path is not None and key_path is not None:
+            request.client_cert_path = os.fspath(cert_path)
+            request.client_key_path = os.fspath(key_path)
+            reload_config = ProtobufClientCertReloadConfig()
+            reload_config.enabled = True
+            if tls_config.cert_reload_interval_seconds is not None:
+                reload_config.interval_seconds = tls_config.cert_reload_interval_seconds
+            request.cert_reload.CopyFrom(reload_config)
 
 
 class BaseClientConfiguration:
@@ -602,6 +855,14 @@ class BaseClientConfiguration:
             Must be a non-negative integer.If not set, the client will connect to database 0.
         client_name (Optional[str]): Client name to be used for the client. Will be used with CLIENT SETNAME command
             during connection establishment.
+        lib_name (Optional[str]): Library name to be used for the client. Will be used with CLIENT SETINFO LIB-NAME
+            command during connection establishment. Useful for identifying a wrapping library or framework in
+            ``CLIENT INFO``/``CLIENT LIST`` output. If not set, a client-specific default (e.g. ``GlidePy`` for the
+            async client, ``GlidePySync`` for the sync client) is used.
+        client_info_tag (Optional[str]): Optional tag appended to the library name in parentheses
+            (e.g. ``GlidePy(my-framework:1.2.3)``), preserving the underlying GLIDE library identity while
+            attributing a wrapping library or framework in ``CLIENT INFO``/``CLIENT LIST`` output. Applied on top of
+            the default library name or a configured ``lib_name``. Must not contain whitespace.
         protocol (ProtocolVersion): Serialization protocol to be used. If not set, `RESP3` will be used.
         inflight_requests_limit (Optional[int]): The maximum number of concurrent requests allowed to be in-flight
             (sent but not yet completed).
@@ -635,9 +896,46 @@ class BaseClientConfiguration:
             If not set, connections are established immediately during client creation (equivalent to `False`).
 
         compression (Optional[CompressionConfiguration]): Configuration for automatic compression of values.
+            ⚠️ WARNING: This feature is experimental and not recommended for production use.
             When enabled, the client will automatically compress values for set-type commands and decompress
             values for get-type commands. This can reduce bandwidth usage and storage requirements.
+            Compression is NOT compatible with server-side string manipulation commands (APPEND, GETRANGE, etc.).
             If not set, compression is disabled.
+
+        client_side_cache (Optional[ClientSideCache]): Configuration for client-side caching.
+            See `ClientSideCache` for caching behavior details, supported commands, and expiration semantics.
+
+            In order for 2 clients to share the same cache, they must be
+            created with the same ``ClientSideCache`` instance.
+
+            - Clients with different ``ClientSideCache`` instances will have separate caches,
+              even if the configurations are identical.
+            - Clients using different DBs cannot share the same cache.
+            - Clients using different ACL users cannot share the same cache.
+
+        address_resolver (Optional[AddressResolver]): Optional callback for resolving server addresses
+            before connection. When provided, this callback will be invoked for each configured address
+            during connection establishment and during cluster topology refreshes.
+            The callback receives the configured host and port, and should return the actual
+            host and port to use for the connection.
+
+            This is useful for:
+                - Custom DNS resolution for service discovery
+                - Address translation for proxy setups
+                - Dynamic endpoint resolution for cloud environments
+
+            If not set, addresses are used as configured without modification.
+
+            Example::
+
+                def my_resolver(host: str, port: int) -> Tuple[str, int]:
+                    resolved_host = my_dns_resolver.resolve(host)
+                    return (resolved_host, port)
+
+                config = GlideClientConfiguration(
+                    addresses=[NodeAddress("my-service", 6379)],
+                    address_resolver=my_resolver,
+                )
     """
 
     def __init__(
@@ -650,12 +948,17 @@ class BaseClientConfiguration:
         reconnect_strategy: Optional[BackoffStrategy] = None,
         database_id: Optional[int] = None,
         client_name: Optional[str] = None,
+        lib_name: Optional[str] = None,
+        client_info_tag: Optional[str] = None,
         protocol: ProtocolVersion = ProtocolVersion.RESP3,
         inflight_requests_limit: Optional[int] = None,
         client_az: Optional[str] = None,
         advanced_config: Optional[AdvancedBaseClientConfiguration] = None,
         lazy_connect: Optional[bool] = None,
         compression: Optional[CompressionConfiguration] = None,
+        client_side_cache: Optional[ClientSideCache] = None,
+        address_resolver: Optional[Callable[[str, int], Tuple[str, int]]] = None,
+        client_circuit_breaker: Optional[ClientCircuitBreakerConfiguration] = None,
     ):
         self.addresses = addresses
         self.use_tls = use_tls
@@ -665,12 +968,20 @@ class BaseClientConfiguration:
         self.reconnect_strategy = reconnect_strategy
         self.database_id = database_id
         self.client_name = client_name
+        self.lib_name = lib_name
+        self.client_info_tag = client_info_tag
         self.protocol = protocol
         self.inflight_requests_limit = inflight_requests_limit
         self.client_az = client_az
         self.advanced_config = advanced_config
         self.lazy_connect = lazy_connect
         self.compression = compression
+        self.client_side_cache = client_side_cache
+        self.address_resolver = address_resolver
+        self.client_circuit_breaker = client_circuit_breaker
+
+        if client_info_tag is not None and any(c.isspace() for c in client_info_tag):
+            raise ValueError("client_info_tag must not contain whitespace characters")
 
         if read_from == ReadFrom.AZ_AFFINITY and not client_az:
             raise ValueError(
@@ -749,6 +1060,23 @@ class BaseClientConfiguration:
                     iam_config.refresh_interval_seconds
                 )
 
+    def _set_client_side_cache_in_request(self, request: ConnectionRequest) -> None:
+        """Set client-side cache in the protobuf request."""
+        if not self.client_side_cache:
+            return
+
+        cache_config = self.client_side_cache
+        cache_request = request.client_side_cache
+
+        cache_request.cache_id = cache_config.cache_id
+        cache_request.max_cache_kb = cache_config.max_cache_kb
+        cache_request.entry_ttl_ms = cache_config.entry_ttl_ms
+        cache_request.enable_metrics = cache_config.enable_metrics
+        cache_request.server_assisted = cache_config.server_assisted
+
+        if cache_config.eviction_policy:
+            cache_request.eviction_policy = cache_config.eviction_policy.value
+
     def _create_a_protobuf_conn_request(
         self, cluster_mode: bool = False
     ) -> ConnectionRequest:
@@ -776,11 +1104,26 @@ class BaseClientConfiguration:
 
         self._set_reconnect_strategy_in_request(request)
         self._set_credentials_in_request(request)
+        self._set_client_side_cache_in_request(request)
 
         if self.client_name:
             request.client_name = self.client_name
+        if self.lib_name:
+            request.lib_name = self.lib_name
         if self.inflight_requests_limit:
             request.inflight_requests_limit = self.inflight_requests_limit
+        if self.client_circuit_breaker:
+            cb = self.client_circuit_breaker
+            request.client_circuit_breaker.window_size_ms = cb.window_size_ms
+            request.client_circuit_breaker.failure_rate_threshold = (
+                cb.failure_rate_threshold
+            )
+            request.client_circuit_breaker.min_errors = cb.min_errors
+            request.client_circuit_breaker.open_timeout_ms = cb.open_timeout_ms
+            request.client_circuit_breaker.count_timeouts = cb.count_timeouts
+            request.client_circuit_breaker.consecutive_successes = (
+                cb.consecutive_successes
+            )
         if self.client_az:
             request.client_az = self.client_az
         if self.database_id is not None:
@@ -792,10 +1135,6 @@ class BaseClientConfiguration:
         if self.compression is not None:
             request.compression_config.CopyFrom(self.compression._to_protobuf())
         return request
-
-    # TODO: remove this function once dynamic pubsub is implemented for the python wrappers
-    def _is_pubsub_configured(self) -> bool:
-        return False
 
     def _get_pubsub_callback_and_context(
         self,
@@ -851,6 +1190,13 @@ class GlideClientConfiguration(BaseClientConfiguration):
         database_id (Optional[int]): Index of the logical database to connect to.
         client_name (Optional[str]): Client name to be used for the client. Will be used with CLIENT SETNAME command during
             connection establishment.
+        lib_name (Optional[str]): Library name to be used for the client. Will be used with CLIENT SETINFO LIB-NAME command
+            during connection establishment. Useful for identifying a wrapping library or framework in
+            ``CLIENT INFO``/``CLIENT LIST`` output. If not set, a client-specific default is used.
+        client_info_tag (Optional[str]): Optional tag appended to the library name in parentheses
+            (e.g. ``GlidePy(my-framework:1.2.3)``), preserving the underlying GLIDE library identity while
+            attributing a wrapping library or framework in ``CLIENT INFO``/``CLIENT LIST`` output. Applied on top of
+            the default library name or a configured ``lib_name``. Must not contain whitespace.
         protocol (ProtocolVersion): The version of the RESP protocol to communicate with the server.
         pubsub_subscriptions (Optional[GlideClientConfiguration.PubSubSubscriptions]): Pubsub subscriptions to be used for the
                 client.
@@ -871,6 +1217,29 @@ class GlideClientConfiguration(BaseClientConfiguration):
             When enabled, the client will automatically compress values for set-type commands and decompress
             values for get-type commands. This can reduce bandwidth usage and storage requirements.
             If not set, compression is disabled.
+        read_only (bool): When True, enables read-only mode for the standalone client.
+            In read-only mode:
+            - The client skips primary node detection (INFO REPLICATION command)
+            - Write commands are blocked and will return an error
+            - All connected nodes are treated as valid read targets
+            - If no ReadFrom strategy is specified, defaults to PreferReplica
+            This is useful for connecting to replica-only deployments or when you want to
+            prevent accidental write operations.
+            Note: read_only mode is not compatible with AZAffinity or AZAffinityReplicasAndPrimary
+            read strategies.
+            Defaults to False.
+        client_side_cache (Optional[ClientSideCache]): Configuration for client-side caching.
+            See `ClientSideCache` for caching behavior details, supported commands, and expiration semantics.
+
+            In order for 2 clients to share the same cache, they must be
+            created with the same ``ClientSideCache`` instance.
+
+            - Clients with different ``ClientSideCache`` instances will have separate caches,
+              even if the configurations are identical.
+            - Clients using different DBs cannot share the same cache.
+            - Clients using different ACL users cannot share the same cache.
+        node_discovery_mode (NodeDiscoveryMode): Controls how the client discovers node roles
+            and topology in standalone mode. If not set, `STANDARD` will be used.
     """
 
     class PubSubChannelModes(IntEnum):
@@ -922,6 +1291,8 @@ class GlideClientConfiguration(BaseClientConfiguration):
         reconnect_strategy: Optional[BackoffStrategy] = None,
         database_id: Optional[int] = None,
         client_name: Optional[str] = None,
+        lib_name: Optional[str] = None,
+        client_info_tag: Optional[str] = None,
         protocol: ProtocolVersion = ProtocolVersion.RESP3,
         pubsub_subscriptions: Optional[PubSubSubscriptions] = None,
         inflight_requests_limit: Optional[int] = None,
@@ -929,6 +1300,11 @@ class GlideClientConfiguration(BaseClientConfiguration):
         advanced_config: Optional[AdvancedGlideClientConfiguration] = None,
         lazy_connect: Optional[bool] = None,
         compression: Optional[CompressionConfiguration] = None,
+        read_only: bool = False,
+        client_side_cache: Optional[ClientSideCache] = None,
+        node_discovery_mode: NodeDiscoveryMode = NodeDiscoveryMode.STANDARD,
+        address_resolver: Optional[Callable[[str, int], Tuple[str, int]]] = None,
+        client_circuit_breaker: Optional[ClientCircuitBreakerConfiguration] = None,
     ):
         super().__init__(
             addresses=addresses,
@@ -939,20 +1315,33 @@ class GlideClientConfiguration(BaseClientConfiguration):
             reconnect_strategy=reconnect_strategy,
             database_id=database_id,
             client_name=client_name,
+            lib_name=lib_name,
+            client_info_tag=client_info_tag,
             protocol=protocol,
             inflight_requests_limit=inflight_requests_limit,
             client_az=client_az,
             advanced_config=advanced_config,
             lazy_connect=lazy_connect,
             compression=compression,
+            client_side_cache=client_side_cache,
+            address_resolver=address_resolver,
+            client_circuit_breaker=client_circuit_breaker,
         )
         self.pubsub_subscriptions = pubsub_subscriptions
+        self.read_only = read_only
+        self.node_discovery_mode = node_discovery_mode
 
     def _create_a_protobuf_conn_request(
         self, cluster_mode: bool = False
     ) -> ConnectionRequest:
         assert cluster_mode is False
         request = super()._create_a_protobuf_conn_request(cluster_mode)
+
+        # Set read_only mode
+        request.read_only = self.read_only
+
+        # Set node discovery mode
+        request.node_discovery_mode = self.node_discovery_mode.value
 
         if self.pubsub_subscriptions:
             if self.protocol == ProtocolVersion.RESP2:
@@ -977,10 +1366,6 @@ class GlideClientConfiguration(BaseClientConfiguration):
                     entry.channels_or_patterns.append(str.encode(channel_pattern))
 
         return request
-
-    # TODO: remove this function once dynamic pubsub is implemented for the python wrappers
-    def _is_pubsub_configured(self) -> bool:
-        return self.pubsub_subscriptions is not None
 
     def _get_pubsub_callback_and_context(
         self,
@@ -1063,6 +1448,13 @@ class GlideClusterClientConfiguration(BaseClientConfiguration):
         database_id (Optional[int]): Index of the logical database to connect to.
         client_name (Optional[str]): Client name to be used for the client. Will be used with CLIENT SETNAME command during
             connection establishment.
+        lib_name (Optional[str]): Library name to be used for the client. Will be used with CLIENT SETINFO LIB-NAME command
+            during connection establishment. Useful for identifying a wrapping library or framework in
+            ``CLIENT INFO``/``CLIENT LIST`` output. If not set, a client-specific default is used.
+        client_info_tag (Optional[str]): Optional tag appended to the library name in parentheses
+            (e.g. ``GlidePy(my-framework:1.2.3)``), preserving the underlying GLIDE library identity while
+            attributing a wrapping library or framework in ``CLIENT INFO``/``CLIENT LIST`` output. Applied on top of
+            the default library name or a configured ``lib_name``. Must not contain whitespace.
         protocol (ProtocolVersion): The version of the RESP protocol to communicate with the server.
         periodic_checks (Union[PeriodicChecksStatus, PeriodicChecksManualInterval]): Configure the periodic topology checks.
             These checks evaluate changes in the cluster's topology, triggering a slot refresh when detected.
@@ -1076,6 +1468,12 @@ class GlideClusterClientConfiguration(BaseClientConfiguration):
             This limit is used to control the memory usage and prevent the client from overwhelming the server or getting
             stuck in case of a queue backlog.
             If not set, a default value will be used.
+        recovery_requests_queue_size (Optional[int]): The maximum number of requests to buffer in the
+            recovery queue when a cluster reconnect is in progress. Buffered requests are retried
+            transparently after reconnection. Requests beyond this limit are failed immediately to
+            provide bounded memory usage.
+            Set to 0 to disable the recovery queue and use fail-fast behavior.
+            If not set, a default value of 1000 will be used.
         client_az (Optional[str]): Availability Zone of the client.
             If ReadFrom strategy is AZAffinity, this setting ensures that readonly commands are directed to replicas within
             the specified AZ if exits.
@@ -1087,7 +1485,16 @@ class GlideClusterClientConfiguration(BaseClientConfiguration):
             When enabled, the client will automatically compress values for set-type commands and decompress
             values for get-type commands. This can reduce bandwidth usage and storage requirements.
             If not set, compression is disabled.
+        client_side_cache (Optional[ClientSideCache]): Configuration for client-side caching.
+            See `ClientSideCache` for caching behavior details, supported commands, and expiration semantics.
 
+            In order for 2 clients to share the same cache, they must be
+            created with the same ``ClientSideCache`` instance.
+
+            - Clients with different ``ClientSideCache`` instances will have separate caches,
+              even if the configurations are identical.
+            - Clients using different DBs cannot share the same cache.
+            - Clients using different ACL users cannot share the same cache.
 
     Note:
         Currently, the reconnection strategy in cluster mode is not configurable, and exponential backoff
@@ -1145,16 +1552,22 @@ class GlideClusterClientConfiguration(BaseClientConfiguration):
         reconnect_strategy: Optional[BackoffStrategy] = None,
         database_id: Optional[int] = None,
         client_name: Optional[str] = None,
+        lib_name: Optional[str] = None,
+        client_info_tag: Optional[str] = None,
         protocol: ProtocolVersion = ProtocolVersion.RESP3,
         periodic_checks: Union[
             PeriodicChecksStatus, PeriodicChecksManualInterval
         ] = PeriodicChecksStatus.ENABLED_DEFAULT_CONFIGS,
         pubsub_subscriptions: Optional[PubSubSubscriptions] = None,
         inflight_requests_limit: Optional[int] = None,
+        recovery_requests_queue_size: Optional[int] = None,
         client_az: Optional[str] = None,
         advanced_config: Optional[AdvancedGlideClusterClientConfiguration] = None,
         lazy_connect: Optional[bool] = None,
         compression: Optional[CompressionConfiguration] = None,
+        client_side_cache: Optional[ClientSideCache] = None,
+        address_resolver: Optional[Callable[[str, int], Tuple[str, int]]] = None,
+        client_circuit_breaker: Optional[ClientCircuitBreakerConfiguration] = None,
     ):
         super().__init__(
             addresses=addresses,
@@ -1165,15 +1578,21 @@ class GlideClusterClientConfiguration(BaseClientConfiguration):
             reconnect_strategy=reconnect_strategy,
             database_id=database_id,
             client_name=client_name,
+            lib_name=lib_name,
+            client_info_tag=client_info_tag,
             protocol=protocol,
             inflight_requests_limit=inflight_requests_limit,
             client_az=client_az,
             advanced_config=advanced_config,
             lazy_connect=lazy_connect,
             compression=compression,
+            client_side_cache=client_side_cache,
+            address_resolver=address_resolver,
+            client_circuit_breaker=client_circuit_breaker,
         )
         self.periodic_checks = periodic_checks
         self.pubsub_subscriptions = pubsub_subscriptions
+        self.recovery_requests_queue_size = recovery_requests_queue_size
 
     def _create_a_protobuf_conn_request(
         self, cluster_mode: bool = False
@@ -1211,11 +1630,9 @@ class GlideClusterClientConfiguration(BaseClientConfiguration):
 
         if self.lazy_connect is not None:
             request.lazy_connect = self.lazy_connect
+        if self.recovery_requests_queue_size is not None:
+            request.recovery_requests_queue_size = self.recovery_requests_queue_size
         return request
-
-    # TODO: remove this function once dynamic pubsub is implemented for the python wrappers
-    def _is_pubsub_configured(self) -> bool:
-        return self.pubsub_subscriptions is not None
 
     def _get_pubsub_callback_and_context(
         self,
@@ -1223,6 +1640,34 @@ class GlideClusterClientConfiguration(BaseClientConfiguration):
         if self.pubsub_subscriptions:
             return self.pubsub_subscriptions.callback, self.pubsub_subscriptions.context
         return None, None
+
+
+def _load_pem_file(path: str, label: str) -> bytes:
+    """Read a PEM file and return its contents.
+
+    ``label`` is embedded verbatim in error messages ("Certificate",
+    "Client certificate", "Client key") so callers can report which
+    file failed. Missing files raise ``FileNotFoundError``;
+    empty or unreadable files raise ``ConfigurationError``.
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        raise FileNotFoundError(f"{label} file not found: {path}")
+    except PermissionError as exc:
+        raise ConfigurationError(
+            f"{label} file is not readable ({path}): {exc}"
+        ) from exc
+    except OSError as exc:
+        raise ConfigurationError(
+            f"Failed to read {label.lower()} file {path}: {exc}"
+        ) from exc
+
+    if len(data) == 0:
+        raise ConfigurationError(f"{label} file is empty: {path}")
+
+    return data
 
 
 def load_root_certificates_from_file(path: str) -> bytes:
@@ -1246,24 +1691,10 @@ def load_root_certificates_from_file(path: str) -> bytes:
 
         from glide_shared.config import load_root_certificates_from_file, TlsAdvancedConfiguration
 
-        # Load certificates from file
         certs = load_root_certificates_from_file('/path/to/ca-cert.pem')
-
-        # Use in TLS configuration
         tls_config = TlsAdvancedConfiguration(root_pem_cacerts=certs)
     """
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-    except FileNotFoundError:
-        raise FileNotFoundError(f"Certificate file not found: {path}")
-    except Exception as e:
-        raise ConfigurationError(f"Failed to read certificate file: {e}")
-
-    if len(data) == 0:
-        raise ConfigurationError(f"Certificate file is empty: {path}")
-
-    return data
+    return _load_pem_file(path, "Certificate")
 
 
 def load_client_certificate_from_file(path: str) -> bytes:
@@ -1282,37 +1713,8 @@ def load_client_certificate_from_file(path: str) -> bytes:
     Raises:
         FileNotFoundError: If the certificate file does not exist.
         ConfigurationError: If the certificate file is empty.
-
-    Example usage::
-
-        from glide_shared.config import (
-            load_client_certificate_from_file,
-            load_client_key_from_file,
-            TlsAdvancedConfiguration
-        )
-
-        # Load client certificate and key from files
-        client_cert = load_client_certificate_from_file('/path/to/client-cert.pem')
-        client_key = load_client_key_from_file('/path/to/client-key.pem')
-
-        # Use in TLS configuration
-        tls_config = TlsAdvancedConfiguration(
-            client_cert_pem=client_cert,
-            client_key_pem=client_key
-        )
     """
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-    except FileNotFoundError:
-        raise FileNotFoundError(f"Client certificate file not found: {path}")
-    except Exception as e:
-        raise ConfigurationError(f"Failed to read client certificate file: {e}")
-
-    if len(data) == 0:
-        raise ConfigurationError(f"Client certificate file is empty: {path}")
-
-    return data
+    return _load_pem_file(path, "Client certificate")
 
 
 def load_client_key_from_file(path: str) -> bytes:
@@ -1331,34 +1733,50 @@ def load_client_key_from_file(path: str) -> bytes:
     Raises:
         FileNotFoundError: If the key file does not exist.
         ConfigurationError: If the key file is empty.
+    """
+    return _load_pem_file(path, "Client key")
 
-    Example usage::
+
+def load_client_certificate_and_key_from_file(
+    cert_path: StrPath,
+    key_path: StrPath,
+) -> Tuple[bytes, bytes]:
+    """
+    Load a PEM-encoded client certificate and its private key from disk
+    for byte-based mutual TLS (mTLS).
+
+    Both paths must exist and be non-empty. Use this helper when static,
+    byte-based mTLS is desired; for automatic reload from disk, pass
+    ``client_cert_path`` / ``client_key_path`` to
+    ``TlsAdvancedConfiguration`` instead.
+
+    Args:
+        cert_path: Path to the PEM-encoded client certificate file.
+        key_path: Path to the PEM-encoded client private key file.
+
+    Returns:
+        Tuple of ``(cert_bytes, key_bytes)`` in PEM format.
+
+    Raises:
+        FileNotFoundError: If either file does not exist.
+        ConfigurationError: If either file is empty or unreadable.
+
+    Example::
 
         from glide_shared.config import (
-            load_client_certificate_from_file,
-            load_client_key_from_file,
-            TlsAdvancedConfiguration
+            TlsAdvancedConfiguration,
+            load_client_certificate_and_key_from_file,
         )
 
-        # Load client certificate and key from files
-        client_cert = load_client_certificate_from_file('/path/to/client-cert.pem')
-        client_key = load_client_key_from_file('/path/to/client-key.pem')
-
-        # Use in TLS configuration
+        cert, key = load_client_certificate_and_key_from_file(
+            "/etc/mtls/client-cert.pem",
+            "/etc/mtls/client-key.pem",
+        )
         tls_config = TlsAdvancedConfiguration(
-            client_cert_pem=client_cert,
-            client_key_pem=client_key
+            client_cert_pem=cert,
+            client_key_pem=key,
         )
     """
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-    except FileNotFoundError:
-        raise FileNotFoundError(f"Client key file not found: {path}")
-    except Exception as e:
-        raise ConfigurationError(f"Failed to read client key file: {e}")
-
-    if len(data) == 0:
-        raise ConfigurationError(f"Client key file is empty: {path}")
-
-    return data
+    cert = load_client_certificate_from_file(os.fspath(cert_path))
+    key = load_client_key_from_file(os.fspath(key_path))
+    return cert, key

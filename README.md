@@ -16,14 +16,14 @@ Visit our official documentation at [glide.valkey.io](https://glide.valkey.io).
 
 ## Key Features
 - **[AZ Affinity](https://valkey.io/blog/az-affinity-strategy/)** – Ensures low-latency connections and minimal cross-zone costs by routing read traffic to replicas in the clients availability zone. **(Requires Valkey server version 8.0+ or AWS ElastiCache for Valkey 7.2+)**.
-- **[PubSub Auto-Reconnection](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#pubsub-support:~:text=PubSub%20Support,Receiving%2C%20and%20Unsubscribing.)** – Seamless background resubscription on topology updates or disconnection.
-- **[Sharded PubSub](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#pubsub-support:~:text=Receiving%2C%20and%20Unsubscribing.-,Subscribing,routed%20to%20the%20server%20holding%20the%20slot%20for%20the%20command%27s%20channel.,-Receiving)** – Native support for sharded PubSub across cluster slots.
-- **[Cluster-Aware MGET/MSET/DEL/FLUSHALL](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#multi-slot-command-handling:~:text=Multi%2DSlot%20Command%20Execution,JSON.MGET)** – Execute multi-key commands across cluster slots without manual key grouping.
-- **[Cluster Scan](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#cluster-scan)** – Unified key iteration across shards using a consistent, high-level API for cluster environments.
+- **[PubSub Auto-Reconnection](https://glide.valkey.io/concepts/client-features/pubsub-model/)** – Seamless background resubscription on topology updates or disconnection.
+- **[Sharded PubSub](https://glide.valkey.io/concepts/client-features/pubsub-model/)** – Native support for sharded PubSub across cluster slots.
+- **[Cluster-Aware MGET/MSET/DEL/FLUSHALL](https://glide.valkey.io/concepts/client-features/multi-slot-command-handling/)** – Execute multi-key commands across cluster slots without manual key grouping.
+- **[Cluster Scan](https://glide.valkey.io/concepts/client-features/cluster-scan/)** – Unified key iteration across shards using a consistent, high-level API for cluster environments.
 - **Support for TS / CJS / MJS** – Fully compatible with modern and legacy JavaScript/TypeScript runtimes.
 - **Support for asyncio / anyio / trio** – Native compatibility with modern Python async frameworks, enabling efficient and seamless integration into asynchronous workflows.
-- **[Batching (Pipeline and Transaction)](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#batching-pipeline-and-transaction)** – Efficiently execute multiple commands in a single network roundtrip, significantly reducing latency and improving throughput.
-- **[OpenTelemetry](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#opentelemetry)** – Integrated tracing support for enhanced observability and easier debugging in distributed environments.
+- **[Batching (Pipeline and Transaction)](https://glide.valkey.io/concepts/client-features/batch-commands/)** – Efficiently execute multiple commands in a single network roundtrip, significantly reducing latency and improving throughput.
+- **[OpenTelemetry](https://glide.valkey.io/concepts/client-features/open-telemetry/)** – Integrated tracing support for enhanced observability and easier debugging in distributed environments.
 
 ## Supported Engine Versions
 
@@ -38,44 +38,31 @@ Valkey GLIDE is API-compatible with the following engine versions:
 
 The client currently supports Python, Java, Node.js, Go, C#, and PHP. C# and PHP have preview releases, and have been moved to separate repositories to simplify development. Active development continues for C#, PHP, C++ and Ruby clients. Python, Java, Node.js and Go clients will be moved to separate repositories in the near future.
 
-#### v2.2 (Nov. 2025)
-- Windows Support for Java Client – Migrated the Java client to JNI-based communication
-- IAM authentication Support – Added automatic authentication token generation, enabling secure, password-free connections
-- Seed-Based Topology Refresh – Added topology refresh capability
-- Enhanced TLS Certificate Configuration – Added support for custom CA certificates in TLS connections
+### v2.4.0 (May 2026)
 
-### Previous Releases
+The following are some of the changes planned for 2.4.0 release:
+- Client-Side Caching: for Java, Node, Go.
+- Complete support for Valkey Search 1.2 and JSON module.
+- Add NodeDiscoveryMode option for all languages
+- Further improvements and fixes.
 
-#### v2.1 (Sep. 2025)
-- Valkey 9 Support – First-class support for Multi-DB and Hash Field Expiration (HFE)
-- Python Sync Support – Full synchronous API support for Python
-- Lazy Connection – Extended lazy connection support to Go and Java clients
-- Jedis Compatibility – Added Jedis compatibility layer for Java client
+For the detailed list of changes, see the release [page](https://github.com/valkey-io/valkey-glide/releases/tag/v2.4.0).
 
-#### v2.0 (June 2025)
+### Other Releases
 
-- Go GA – Official stable release for production environments
-- OpenTelemetry Integration – Enhanced observability and tracing
-- Batching Support – Improved performance through batch operations
-- Lazy Connection – Allows client creation even when the server is not active, deferring connection establishment.
-
-#### v1.3 (Feb. 2025)
-- Public preview release of Go client support
-
-#### v1.2 (Dec. 2024)
-- Vector Similarity Search and JSON module support
-- Availability zone-aware routing for read-from-replica operations
+See our releases [section](https://github.com/valkey-io/valkey-glide/releases)
 
 ## Getting Started
 
 **Documentation**
-GLIDE's [documentation site](https://valkey.io/valkey-glide/) currently offers documentation for the Python and Node wrappers.
+Visit our official Valkey GLIDE's documentation [site](https://glide.valkey.io/overview/).
 
-**SDKs**
-- [Java](./java/README.md)
-- [Python](./python/README.md)
-- [Node](./node/README.md)
-- [Go](./go/README.md)
+**Supported Languages**
+- [Java](https://glide.valkey.io/getting-started/quickstart/?lang=java)
+- [Python](https://glide.valkey.io/getting-started/quickstart/?lang=python)
+- [Node](https://glide.valkey.io/getting-started/quickstart/?lang=node)
+- [Go](https://glide.valkey.io/getting-started/quickstart/?lang=go)
+- [Php](https://glide.valkey.io/getting-started/quickstart/?lang=php)
 
 **Under Development SDKs**
 - [C#](https://github.com/valkey-io/valkey-glide-csharp)
@@ -83,31 +70,31 @@ GLIDE's [documentation site](https://valkey.io/valkey-glide/) currently offers d
 - [Ruby](https://github.com/valkey-io/valkey-glide-ruby)
 
 **General Concepts:**
-- [Custom Command](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#custom-command)
-- [Connection Management](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#connection-management)
-- [Multi-Slot Command Handling](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#multi-slot-command-handling)
-- [Inflight Request Limit](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#inflight-request-limit)
-- [PubSub Support](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#pubsub-support)
-- [Cluster Scan](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#cluster-scan)
-- [Dynamic Password Management](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#dynamic-password-management)
-- [Modules API](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#modules-api)
-- [Batching (Pipeline and Transaction)](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#batching-pipeline-and-transaction)
-- [OpenTelemetry](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#opentelemetry)
+- [Custom Command](https://glide.valkey.io/concepts/client-features/custom-commands/)
+- [Connection Management](https://glide.valkey.io/how-to/connection-management/)
+- [Multi-Slot Command Handling](https://glide.valkey.io/concepts/client-features/multi-slot-command-handling/)
+- [Inflight Request Limit](https://glide.valkey.io/how-to/connections/limit-inflight-requests/)
+- [PubSub Support](https://glide.valkey.io/concepts/client-features/pubsub-model/)
+- [Cluster Scan](https://glide.valkey.io/concepts/client-features/cluster-scan/)
+- [Dynamic Password Management](https://glide.valkey.io/how-to/security/dynamic-authentication/)
+- [Modules API](https://glide.valkey.io/concepts/client-features/modules/)
+- [Batching (Pipeline and Transaction)](https://glide.valkey.io/concepts/client-features/batch-commands/)
+- [OpenTelemetry](https://glide.valkey.io/concepts/client-features/open-telemetry/)
+- [Compression (EXPERIMENTAL)](https://glide.valkey.io/concepts/client-features/compression/)
+- [Client-Side Caching](https://glide.valkey.io/concepts/client-features/client-side-caching/)
 
 **Migration Guides**
-- [go-redis](https://github.com/valkey-io/valkey-glide/wiki/Migration-Guide-go%E2%80%90redis)
-- [ioredis](https://github.com/valkey-io/valkey-glide/wiki/Migration-Guide-ioredis)
-- [Jedis](https://github.com/valkey-io/valkey-glide/wiki/Migration-Guide-Jedis)
-- [Lettuce](https://github.com/valkey-io/valkey-glide/wiki/Migration-Guide-Lettuce)
-- [Redisson](https://github.com/valkey-io/valkey-glide/wiki/Migration-Guide-redisson)
-- [redis-py](https://github.com/valkey-io/valkey-glide/wiki/Migration-Guide-redis%E2%80%90py)
+- [go-redis](https://glide.valkey.io/migration/go/go-redis/)
+- [ioredis](https://glide.valkey.io/migration/nodejs/ioredis/)
+- [Jedis](https://glide.valkey.io/migration/java/jedis/)
+- [Lettuce](https://glide.valkey.io/migration/java/lettuce/)
+- [Redisson](https://glide.valkey.io/migration/java/redisson/)
+- [redis-py](https://glide.valkey.io/migration/python/redis-py/)
 - [StackExchange.Redis](https://github.com/valkey-io/valkey-glide/wiki/Migration-Guide-StackExchange.Redis)
-- [PHPRedis](https://github.com/valkey-io/valkey-glide-php/wiki/Migration-Guide-PHPRedis)
+- [PHPRedis](https://glide.valkey.io/migration/php/phpredis/)
 
 **Community**
 - [Contributors meeting](https://github.com/valkey-io/valkey-glide/wiki/Contributors-meeting)
-
-Looking for more? Check out the [Valkey Glide Wiki](https://github.com/valkey-io/valkey-glide/wiki).
 
 ## Ecosystem
 
@@ -119,6 +106,21 @@ Valkey GLIDE has a growing ecosystem of integrations and extensions that enhance
 - **[aws-lambda-powertools-typescript](https://github.com/aws-powertools/powertools-lambda-typescript)** - AWS Lambda Powertools for TypeScript with Valkey GLIDE integration in the idempotency feature (more integrations planned)
 - **[aws-lambda-powertools-python](https://github.com/aws-powertools/powertools-lambda-python)** - AWS Lambda Powertools for Python with Valkey GLIDE support in the idempotency feature (more integrations planned)
 - **[redlock-universal](https://www.npmjs.com/package/redlock-universal)** - Distributed lock library for Node.js with native GLIDE adapter, featuring auto-extension and atomic batch acquisition
+
+## Experimental Features
+
+### Compression (EXPERIMENTAL)
+
+**⚠️ WARNING: This feature is experimental**
+
+Valkey GLIDE supports automatic compression and decompression of string values to reduce memory usage and network bandwidth. Currently supports SET, GET, MGET, MSET, GETEX, GETDEL, SETEX, PSETEX, and SETNX commands.
+
+**Incompatible Commands**: Compression is NOT compatible with commands that manipulate string data on the server side:
+- APPEND, GETRANGE, SETRANGE, STRLEN, LCS
+- INCR, INCRBY, INCRBYFLOAT, DECR, DECRBY
+- GETBIT, SETBIT, BITCOUNT, BITPOS, BITFIELD, BITFIELD_RO, BITOP
+
+Using these commands with compressed values will result in incorrect behavior or errors.
 
 ## Getting Help
 

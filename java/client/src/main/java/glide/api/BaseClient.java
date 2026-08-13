@@ -1,6 +1,7 @@
 /** Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0 */
 package glide.api;
 
+import static command_request.CommandRequestOuterClass.CacheMetricsType;
 import static command_request.CommandRequestOuterClass.RequestType.AclCat;
 import static command_request.CommandRequestOuterClass.RequestType.AclDelUser;
 import static command_request.CommandRequestOuterClass.RequestType.AclDryRun;
@@ -328,9 +329,9 @@ import glide.managers.ConnectionManager;
 import glide.utils.ArgsBuilder;
 import glide.utils.BufferUtils;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.EnumSet;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -339,7 +340,6 @@ import java.util.concurrent.ExecutionException;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import lombok.NonNull;
-import lombok.RequiredArgsConstructor;
 import org.apache.commons.lang3.ArrayUtils;
 import response.ResponseOuterClass.ConstantResponse;
 import response.ResponseOuterClass.Response;
@@ -384,6 +384,9 @@ public abstract class BaseClient
     public static final String MINMATCHLEN_COMMAND_STRING = "MINMATCHLEN";
     public static final String WITHMATCHLEN_COMMAND_STRING = "WITHMATCHLEN";
     public static final String LCS_MATCHES_RESULT_KEY = "matches";
+
+    protected static final String SCHEDULE_VALKEY_API = "SCHEDULE";
+    protected static final String CANCEL_VALKEY_API = "CANCEL";
 
     // Constant empty arrays to reduce allocations
     protected static final String[] EMPTY_STRING_ARRAY = new String[0];
@@ -437,12 +440,22 @@ public abstract class BaseClient
     }
 
     /** Auxiliary builder which wraps all fields */
-    @RequiredArgsConstructor
     protected static class ClientBuilder {
         private final ConnectionManager connectionManager;
         private final CommandManager commandManager;
         private final MessageHandler messageHandler;
         private final Optional<BaseSubscriptionConfiguration> subscriptionConfiguration;
+
+        protected ClientBuilder(
+                ConnectionManager connectionManager,
+                CommandManager commandManager,
+                MessageHandler messageHandler,
+                Optional<BaseSubscriptionConfiguration> subscriptionConfiguration) {
+            this.connectionManager = connectionManager;
+            this.commandManager = commandManager;
+            this.messageHandler = messageHandler;
+            this.subscriptionConfiguration = subscriptionConfiguration;
+        }
     }
 
     /**
@@ -497,7 +510,7 @@ public abstract class BaseClient
                             });
         } catch (Exception e) {
             // Something bad happened during initial setup
-            var future = new CompletableFuture<T>();
+            CompletableFuture<T> future = new CompletableFuture<>();
             future.completeExceptionally(e);
             return future;
         }
@@ -590,6 +603,15 @@ public abstract class BaseClient
         }
         // Return a future for the next message (non-blocking await)
         return messageHandler.getQueue().popAsync();
+    }
+
+    /**
+     * Returns the number of pubsub messages currently buffered and ready for consumption.
+     *
+     * @return The number of buffered messages.
+     */
+    public int getPubSubMessageCount() {
+        return messageHandler.getQueue().size();
     }
 
     /**
@@ -692,7 +714,7 @@ public abstract class BaseClient
     }
 
     protected byte[] handleBytesOrNullResponse(Response response) throws GlideException {
-        var result =
+        GlideString result =
                 handleValkeyResponse(GlideString.class, EnumSet.of(ResponseFlags.IS_NULLABLE), response);
         if (result == null) return null;
 
@@ -867,7 +889,7 @@ public abstract class BaseClient
         Map<String, Object>[] data = castArray(response, Map.class);
         for (Map<String, Object> libraryInfo : data) {
             Object[] functions = (Object[]) libraryInfo.get("functions");
-            var functionInfo = castArray(functions, Map.class);
+            Map<String, Object>[] functionInfo = castArray(functions, Map.class);
             libraryInfo.put("functions", functionInfo);
         }
         return data;
@@ -879,7 +901,7 @@ public abstract class BaseClient
         Map<GlideString, Object>[] data = castArray(response, Map.class);
         for (Map<GlideString, Object> libraryInfo : data) {
             Object[] functions = (Object[]) libraryInfo.get(gs("functions"));
-            var functionInfo = castArray(functions, Map.class);
+            Map<String, Object>[] functionInfo = castArray(functions, Map.class);
             libraryInfo.put(gs("functions"), functionInfo);
         }
         return data;
@@ -914,7 +936,7 @@ public abstract class BaseClient
             return ClusterValue.ofSingleValue(handleFunctionStatsResponse(handleMapResponse(response)));
         } else {
             Map<String, Map<String, Map<String, Object>>> data = handleMapResponse(response);
-            for (var nodeInfo : data.entrySet()) {
+            for (Map.Entry<String, Map<String, Map<String, Object>>> nodeInfo : data.entrySet()) {
                 nodeInfo.setValue(handleFunctionStatsResponse(nodeInfo.getValue()));
             }
             return ClusterValue.ofMultiValue(data);
@@ -930,7 +952,8 @@ public abstract class BaseClient
         } else {
             Map<GlideString, Map<GlideString, Map<GlideString, Object>>> data =
                     handleBinaryStringMapResponse(response);
-            for (var nodeInfo : data.entrySet()) {
+            for (Map.Entry<GlideString, Map<GlideString, Map<GlideString, Object>>> nodeInfo :
+                    data.entrySet()) {
                 nodeInfo.setValue(handleFunctionStatsBinaryResponse(nodeInfo.getValue()));
             }
             return ClusterValue.ofMultiValueBinary(data);
@@ -1096,6 +1119,137 @@ public abstract class BaseClient
         }
 
         return commandManager.submitRefreshIamToken(this::handleStringResponse);
+    }
+
+    /**
+     * Get cache metrics.
+     *
+     * <p>This is the internal method that communicates with the core to retrieve cache metrics. All
+     * public cache metric methods delegate to this method.
+     *
+     * @param metricsType The type of metric to retrieve.
+     * @return A CompletableFuture that resolves to the requested cache metric.
+     * @throws RequestException if caching is not enabled or metrics are disabled.
+     */
+    private CompletableFuture<Object> getCacheMetrics(CacheMetricsType metricsType) {
+        return commandManager.submitGetCacheMetrics(metricsType, this::handleObjectOrNullResponse);
+    }
+
+    /**
+     * Get the cache hit rate metric.
+     *
+     * <p>This method returns the percentage of cache hits out of total cache requests. Only available
+     * when client-side caching is enabled with metrics collection.
+     *
+     * @return A CompletableFuture that resolves to the cache hit rate as a percentage (0.0 to 100.0).
+     * @throws RequestException if caching is not enabled or metrics are disabled.
+     * @example
+     *     <pre>{@code
+     * // Get cache hit rate
+     * Double hitRate = client.getCacheHitRate().get();
+     * System.out.println("Cache hit rate: " + hitRate + "%");
+     * }</pre>
+     */
+    public CompletableFuture<Double> getCacheHitRate() {
+        return getCacheMetrics(CacheMetricsType.HitRate).thenApply(result -> (Double) result);
+    }
+
+    /**
+     * Get the cache miss rate metric.
+     *
+     * <p>This method returns the percentage of cache misses out of total cache requests. Only
+     * available when client-side caching is enabled with metrics collection.
+     *
+     * @return A CompletableFuture that resolves to the cache miss rate as a percentage (0.0 to
+     *     100.0).
+     * @throws RequestException if caching is not enabled or metrics are disabled.
+     * @example
+     *     <pre>{@code
+     * // Get cache miss rate
+     * Double missRate = client.getCacheMissRate().get();
+     * System.out.println("Cache miss rate: " + missRate + "%");
+     * }</pre>
+     */
+    public CompletableFuture<Double> getCacheMissRate() {
+        return getCacheMetrics(CacheMetricsType.MissRate).thenApply(result -> (Double) result);
+    }
+
+    /**
+     * Get the current number of entries in the cache.
+     *
+     * <p>This method returns the total count of cached entries currently stored in the client-side
+     * cache. Available when client-side caching is enabled.
+     *
+     * @return A CompletableFuture that resolves to the number of cache entries.
+     * @throws RequestException if caching is not enabled.
+     * @example
+     *     <pre>{@code
+     * // Get cache entry count
+     * Long entryCount = client.getCacheEntryCount().get();
+     * System.out.println("Cache entries: " + entryCount);
+     * }</pre>
+     */
+    public CompletableFuture<Long> getCacheEntryCount() {
+        return getCacheMetrics(CacheMetricsType.EntryCount).thenApply(result -> (Long) result);
+    }
+
+    /**
+     * Get the total number of cache evictions.
+     *
+     * <p>This method returns the count of entries that have been evicted from the cache due to memory
+     * limits or eviction policies. Only available when client-side caching is enabled with metrics
+     * collection.
+     *
+     * @return A CompletableFuture that resolves to the total number of evictions.
+     * @throws RequestException if caching is not enabled or metrics are disabled.
+     * @example
+     *     <pre>{@code
+     * // Get cache evictions count
+     * Long evictions = client.getCacheEvictions().get();
+     * System.out.println("Cache evictions: " + evictions);
+     * }</pre>
+     */
+    public CompletableFuture<Long> getCacheEvictions() {
+        return getCacheMetrics(CacheMetricsType.Evictions).thenApply(result -> (Long) result);
+    }
+
+    /**
+     * Get the total number of cache expirations.
+     *
+     * <p>This method returns the count of entries that have expired from the cache due to TTL
+     * settings. Only available when client-side caching is enabled with metrics collection.
+     *
+     * @return A CompletableFuture that resolves to the total number of expirations.
+     * @throws RequestException if caching is not enabled or metrics are disabled.
+     * @example
+     *     <pre>{@code
+     * // Get cache expirations count
+     * Long expirations = client.getCacheExpirations().get();
+     * System.out.println("Cache expirations: " + expirations);
+     * }</pre>
+     */
+    public CompletableFuture<Long> getCacheExpirations() {
+        return getCacheMetrics(CacheMetricsType.Expirations).thenApply(result -> (Long) result);
+    }
+
+    /**
+     * Get the total number of cache lookups (hits + misses).
+     *
+     * <p>This method returns the sum of cache hits and misses, representing the total number of cache
+     * lookup operations performed. Only available when client-side caching is enabled with metrics
+     * collection.
+     *
+     * @return A CompletableFuture that resolves to the total number of cache lookups.
+     * @throws RequestException if caching is not enabled or metrics are disabled.
+     * @example
+     *     <pre>{@code
+     * // Get total cache lookups
+     * Long totalLookups = client.getCacheTotalLookups().get();
+     * System.out.println("Total cache lookups: " + totalLookups);
+     * }</pre>
+     */
+    public CompletableFuture<Long> getCacheTotalLookups() {
+        return getCacheMetrics(CacheMetricsType.TotalLookups).thenApply(result -> (Long) result);
     }
 
     @Override
@@ -2466,10 +2620,16 @@ public abstract class BaseClient
     public CompletableFuture<Object> invokeScript(@NonNull Script script) {
         if (script.getBinaryOutput()) {
             return commandManager.submitScript(
-                    script, List.of(), List.of(), this::handleBinaryObjectOrNullResponse);
+                    script,
+                    Collections.emptyList(),
+                    Collections.emptyList(),
+                    this::handleBinaryObjectOrNullResponse);
         } else {
             return commandManager.submitScript(
-                    script, List.of(), List.of(), this::handleObjectOrNullResponse);
+                    script,
+                    Collections.emptyList(),
+                    Collections.emptyList(),
+                    this::handleObjectOrNullResponse);
         }
     }
 
@@ -5459,15 +5619,15 @@ public abstract class BaseClient
         if (o instanceof byte[]) {
             o = GlideString.of((byte[]) o);
         } else if (o.getClass().isArray()) {
-            var array = (Object[]) o;
-            for (var i = 0; i < array.length; i++) {
+            Object[] array = (Object[]) o;
+            for (int i = 0; i < array.length; i++) {
                 array[i] = convertByteArrayToGlideString(array[i]);
             }
         } else if (o instanceof Set) {
-            var set = (Set<?>) o;
+            Set<?> set = (Set<?>) o;
             o = set.stream().map(this::convertByteArrayToGlideString).collect(Collectors.toSet());
         } else if (o instanceof Map) {
-            var map = (Map<?, ?>) o;
+            Map<?, ?> map = (Map<?, ?>) o;
             o =
                     map.entrySet().stream()
                             .collect(
@@ -6251,7 +6411,7 @@ public abstract class BaseClient
                 AclWhoami, EMPTY_STRING_ARRAY, this::handleStringResponse);
     }
 
-    public CompletableFuture<Void> subscribe(Set<String> channels) {
+    public CompletableFuture<Void> subscribeLazy(Set<String> channels) {
         return commandManager.submitNewCommand(
                 Subscribe, channels.toArray(EMPTY_STRING_ARRAY), response -> null);
     }
@@ -6269,7 +6429,7 @@ public abstract class BaseClient
         return commandManager.submitNewCommand(SubscribeBlocking, args, response -> null);
     }
 
-    public CompletableFuture<Void> psubscribe(Set<String> patterns) {
+    public CompletableFuture<Void> psubscribeLazy(Set<String> patterns) {
         return commandManager.submitNewCommand(
                 PSubscribe, patterns.toArray(EMPTY_STRING_ARRAY), response -> null);
     }
@@ -6287,11 +6447,11 @@ public abstract class BaseClient
         return commandManager.submitNewCommand(PSubscribeBlocking, args, response -> null);
     }
 
-    public CompletableFuture<Void> unsubscribe() {
+    public CompletableFuture<Void> unsubscribeLazy() {
         return commandManager.submitNewCommand(Unsubscribe, EMPTY_STRING_ARRAY, response -> null);
     }
 
-    public CompletableFuture<Void> unsubscribe(Set<String> channels) {
+    public CompletableFuture<Void> unsubscribeLazy(Set<String> channels) {
         return commandManager.submitNewCommand(
                 Unsubscribe, channels.toArray(EMPTY_STRING_ARRAY), response -> null);
     }
@@ -6317,11 +6477,11 @@ public abstract class BaseClient
                 UnsubscribeBlocking, new String[] {String.valueOf(timeoutMs)}, response -> null);
     }
 
-    public CompletableFuture<Void> punsubscribe() {
+    public CompletableFuture<Void> punsubscribeLazy() {
         return commandManager.submitNewCommand(PUnsubscribe, EMPTY_STRING_ARRAY, response -> null);
     }
 
-    public CompletableFuture<Void> punsubscribe(Set<String> patterns) {
+    public CompletableFuture<Void> punsubscribeLazy(Set<String> patterns) {
         return commandManager.submitNewCommand(
                 PUnsubscribe, patterns.toArray(EMPTY_STRING_ARRAY), response -> null);
     }
@@ -6349,11 +6509,15 @@ public abstract class BaseClient
 
     protected Object parseSubscriptionState(Object response) {
         if (!(response instanceof Object[])) {
-            throw new RuntimeException("Invalid response format from GetSubscriptions");
+            throw new RuntimeException(
+                    "Invalid response format from GetSubscriptions: expected Object[], got "
+                            + (response == null ? "null" : response.getClass().getName()));
         }
         Object[] arr = (Object[]) response;
         if (arr.length != 4) {
-            throw new RuntimeException("Invalid response format from GetSubscriptions");
+            throw new RuntimeException(
+                    "Invalid response format from GetSubscriptions: expected array length 4, got "
+                            + arr.length);
         }
 
         @SuppressWarnings("unchecked")

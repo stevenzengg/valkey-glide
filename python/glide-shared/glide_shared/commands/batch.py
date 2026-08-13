@@ -23,6 +23,7 @@ from glide_shared.commands.core_options import (
     HashFieldConditionalChange,
     InfoSection,
     InsertPosition,
+    MigrateOptions,
     UpdateOptions,
     _build_sort_args,
 )
@@ -94,13 +95,13 @@ class BaseBatch:
                 If `True`, the batch will be executed as an atomic transaction.
                 If `False`, the batch will be executed as a non-atomic pipeline.
         """
-        self.commands: List[Tuple[RequestType.ValueType, List[TEncodable]]] = []
+        self.commands: List[Tuple[int, List[TEncodable]]] = []
         self.lock = threading.Lock()
         self.is_atomic = is_atomic
 
     def append_command(
         self: TBatch,
-        request_type: RequestType.ValueType,
+        request_type: int,
         args: List[TEncodable],
     ) -> TBatch:
         self.lock.acquire()
@@ -193,8 +194,8 @@ class BaseBatch:
                 Equivalent to `GET` in the Valkey API. Defaults to False.
 
         Command response:
-            Optional[bytes]:
-                If the value is successfully set, return OK.
+            Optional[Union[TOK, bytes]]:
+                If the value is successfully set, return OK (a `str`).
 
                 If value isn't set because of only_if_exists or only_if_does_not_exist conditions, return None.
 
@@ -276,8 +277,8 @@ class BaseBatch:
         """
         Executes a single command, without checking inputs.
 
-        See the Valkey GLIDE Wiki
-        [custom command](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#custom-command)
+        See the Valkey GLIDE Documentation
+        [custom command](https://glide.valkey.io/concepts/client-features/custom-commands/)
         for details on the restrictions and limitations of the custom command API.
 
         This function should only be used for single-response commands. Commands that don't return complete response and awaits
@@ -1439,7 +1440,7 @@ class BaseBatch:
 
         Note:
             BLPOP is a client blocking command, see
-            [blocking commands](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands)
+            [blocking commands](https://glide.valkey.io/how-to/connection-management/#blocking-commands)
             for more details and best practices.
 
         Args:
@@ -1674,7 +1675,7 @@ class BaseBatch:
 
         Note:
             BRPOP is a client blocking command, see
-            [blocking commands](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands)
+            [blocking commands](https://glide.valkey.io/how-to/connection-management/#blocking-commands)
             for more details and best practices.
 
         Args:
@@ -2736,6 +2737,43 @@ class BaseBatch:
         if frequency is not None:
             args.extend(["FREQ", str(frequency)])
         return self.append_command(RequestType.Restore, args)
+
+    def migrate(
+        self: TBatch,
+        host: str,
+        port: int,
+        key: TEncodable,
+        destination_db: int,
+        timeout: int,
+        options: Optional[MigrateOptions] = None,
+    ) -> TBatch:
+        """
+        Atomically transfers a key from a source Valkey instance to a destination
+        Valkey instance. On success, the key is deleted from the source instance.
+
+        See [valkey.io](https://valkey.io/commands/migrate/) for details.
+
+        Args:
+            host (str): The host of the destination Valkey instance.
+            port (int): The port of the destination Valkey instance.
+            key (TEncodable): The key to migrate.
+            destination_db (int): The database index on the destination instance.
+            timeout (int): The maximum idle time in milliseconds for the bulk-transfer.
+            options (Optional[MigrateOptions]): Additional migration options.
+
+        Returns:
+            TBatch: The batch instance for chaining.
+        """
+        args: List[TEncodable] = [
+            host,
+            str(port),
+            key,
+            str(destination_db),
+            str(timeout),
+        ]
+        if options:
+            args.extend(options.to_args())
+        return self.append_command(RequestType.Migrate, args)
 
     def xadd(
         self: TBatch,
@@ -3821,7 +3859,7 @@ class BaseBatch:
 
         Note:
             `BZPOPMAX` is a client blocking command, see
-            [blocking commands](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands)
+            [blocking commands](https://glide.valkey.io/how-to/connection-management/#blocking-commands)
             for more details and best practices.
 
         See [valkey.io](https://valkey.io/commands/bzpopmax) for more details.
@@ -3872,7 +3910,7 @@ class BaseBatch:
 
         Note:
             `BZPOPMIN` is a client blocking command, see
-            [blocking commands](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands)
+            [blocking commands](https://glide.valkey.io/how-to/connection-management/#blocking-commands)
             for more details and best practices.
 
         See [valkey.io](https://valkey.io/commands/bzpopmin) for more details.
@@ -4614,7 +4652,7 @@ class BaseBatch:
 
         Note:
             `BZMPOP` is a client blocking command, see
-            [blocking commands](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands)
+            [blocking commands](https://glide.valkey.io/how-to/connection-management/#blocking-commands)
             for more details and best practices.
 
         Args:
@@ -5789,6 +5827,17 @@ class Batch(BaseBatch):
         """
         return self.append_command(RequestType.Select, [str(index)])
 
+    def reset(self) -> "Batch":
+        """
+        Reset the connection state.
+
+        See [valkey.io](https://valkey.io/commands/reset/) for details.
+
+        Command response:
+            bytes: The string "RESET".
+        """
+        return self.append_command(RequestType.Reset, [])
+
     def copy(
         self,
         source: TEncodable,
@@ -5824,6 +5873,51 @@ class Batch(BaseBatch):
             args.append("REPLACE")
 
         return self.append_command(RequestType.Copy, args)
+
+    def migrate(
+        self,
+        host: str,
+        port: int,
+        keys: Union[TEncodable, List[TEncodable]],
+        destination_db: int,
+        timeout: int,
+        options: Optional[MigrateOptions] = None,
+    ) -> "Batch":
+        """
+        Atomically transfers one or more keys from a source Valkey instance to a destination
+        Valkey instance. Pass a list to migrate multiple keys in one command.
+
+        See [valkey.io](https://valkey.io/commands/migrate/) for details.
+
+        Args:
+            host (str): The host of the destination Valkey instance.
+            port (int): The port of the destination Valkey instance.
+            keys (Union[TEncodable, List[TEncodable]]): The key or list of keys to migrate.
+            destination_db (int): The database index on the destination instance.
+            timeout (int): The maximum idle time in milliseconds for the bulk-transfer.
+            options (Optional[MigrateOptions]): Additional migration options.
+
+        Returns:
+            Batch: The batch instance for chaining.
+        """
+        if isinstance(keys, list):
+            if len(keys) == 0:
+                raise ValueError("migrate: 'keys' list must not be empty")
+            args: List[TEncodable] = [
+                host,
+                str(port),
+                "",
+                str(destination_db),
+                str(timeout),
+            ]
+            if options:
+                args.extend(options.to_args())
+            args += ["KEYS"] + list(keys)
+        else:
+            args = [host, str(port), keys, str(destination_db), str(timeout)]
+            if options:
+                args.extend(options.to_args())
+        return self.append_command(RequestType.Migrate, args)
 
     def publish(self, message: TEncodable, channel: TEncodable) -> "Batch":
         """

@@ -1,18 +1,18 @@
 [
     {
         "language": "java",
-        "versions": ["11", "17", "21"],
-        "always-run-versions": ["17"]
+        "versions": ["8", "11", "17", "21"],
+        "always-run-versions": ["8", "17"]
     },
     {
         "language": "python",
-        "versions": ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"],
-        "always-run-versions": ["3.9", "3.13"]
+        "versions": ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "3.14t"],
+        "always-run-versions": ["3.9", "3.13", "3.14t"]
     },
     {
         "language": "node",
-        "versions": ["20.x", "22.x", "24.x"],
-        "always-run-versions": ["20.x", "24.x"]
+        "versions": ["20.x", "22.x", "24.x", "26.x"],
+        "always-run-versions": ["20.x", "26.x"]
     },
     {
         "language": "go",

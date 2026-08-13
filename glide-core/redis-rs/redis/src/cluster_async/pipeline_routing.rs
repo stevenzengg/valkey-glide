@@ -1,7 +1,6 @@
 use crate::aio::ConnectionLike;
 use crate::cluster_async::ClusterConnInner;
 use crate::cluster_async::Connect;
-use crate::cluster_async::MUTEX_READ_ERR;
 use crate::cluster_routing::RoutingInfo;
 use crate::cluster_routing::SlotAddr;
 use crate::cluster_routing::{
@@ -23,6 +22,7 @@ use tokio::sync::oneshot;
 use tokio::sync::oneshot::error::RecvError;
 
 use super::boxed_sleep;
+use super::is_circular_moved_redirect;
 use super::testing::RefreshConnectionType;
 use super::CmdArg;
 use super::PendingRequest;
@@ -201,7 +201,7 @@ where
                     match multi_node_routing {
                         MultipleNodeRoutingInfo::AllNodes | MultipleNodeRoutingInfo::AllMasters => {
                             let connections: Vec<_> = {
-                                let lock = core.conn_lock.read().expect(MUTEX_READ_ERR);
+                                let lock = core.conn_lock.read();
                                 if matches!(multi_node_routing, MultipleNodeRoutingInfo::AllNodes) {
                                     lock.all_node_connections().collect()
                                 } else {
@@ -324,7 +324,7 @@ where
     // inner_index is used to keep track of the index of the sub-commands in the multi slot routing info vector.
     for (inner_index, (route, indices)) in slots.iter().enumerate() {
         let conn = {
-            let lock = core.conn_lock.read().expect(MUTEX_READ_ERR);
+            let lock = core.conn_lock.read();
             lock.connection_for_route(route)
         };
         if let Some((address, conn)) = conn {
@@ -391,13 +391,12 @@ where
         collect_pipeline_requests(pipeline_map, retry, pipeline_retry_strategy);
 
     // Add the pending requests to the pending_requests queue
-    core.pending_requests
-        .lock()
-        .unwrap()
-        .extend(pending_requests.into_iter());
+    for request in pending_requests {
+        let _ = core.pending_requests_tx.send(request);
+    }
 
     // Wait for all receivers to complete and collect the responses
-    let responses: Vec<_> = futures::future::join_all(receivers.into_iter())
+    let responses: Vec<_> = futures::future::join_all(receivers)
         .await
         .into_iter()
         .collect();
@@ -768,9 +767,7 @@ where
     C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
     // TODO: add support for user-defined retry configurations
-    let retry_params = core
-        .get_cluster_param(|params| params.retry_params.clone())
-        .expect(MUTEX_READ_ERR);
+    let retry_params = core.get_cluster_param(|params| params.retry_params.clone());
 
     let mut retry = 0;
 
@@ -997,9 +994,7 @@ async fn handle_retry_logic<C>(
 where
     C: Clone + Sync + ConnectionLike + Send + Connect + 'static,
 {
-    let retry_params = core
-        .get_cluster_param(|params| params.retry_params.clone())
-        .expect(MUTEX_READ_ERR);
+    let retry_params = core.get_cluster_param(|params| params.retry_params.clone());
 
     if matches!(retry_method, RetryMethod::WaitAndRetry) {
         let sleep_duration = retry_params.wait_time_for_retry(retry);
@@ -1046,6 +1041,9 @@ where
 /// This function processes the retry map entries that indicate a redirection error (e.g., MOVED or ASK).
 /// It attempts to obtain a new connection based on the redirection information and reassigns the command
 /// to the appropriate node pipeline for execution.
+///
+/// For circular MOVED redirects (where the redirect points to the same address), this function
+/// triggers a reconnect to get a fresh connection before retrying.
 async fn handle_redirect_logic<C>(
     retry_method: RetryMethod,
     core: Core<C>,
@@ -1058,7 +1056,44 @@ async fn handle_redirect_logic<C>(
 where
     C: Clone + ConnectionLike + Connect + Send + Sync + 'static,
 {
-    for (indices, address, mut error) in indices_addresses_and_error {
+    // Separate circular MOVED redirects from normal redirects
+    // Circular MOVED needs reconnect handling, not normal redirect handling
+    let mut circular_moved_entries: Vec<((usize, Option<usize>), String, ServerError)> = Vec::new();
+    let mut normal_redirect_entries: Vec<((usize, Option<usize>), String, ServerError)> =
+        Vec::new();
+
+    for (indices, address, error) in indices_addresses_and_error {
+        let redis_error: RedisError = error.clone().into();
+
+        // Check for circular MOVED redirect
+        // Use resolve_address to handle hostname vs IP mismatches
+        if matches!(retry_method, RetryMethod::MovedRedirect)
+            && is_circular_moved_redirect(redis_error.redirect_node(), &address, |addr| {
+                ClusterConnInner::resolve_address(&core, addr)
+            })
+        {
+            circular_moved_entries.push((indices, address, error));
+        } else {
+            normal_redirect_entries.push((indices, address, error));
+        }
+    }
+
+    // Handle circular MOVED redirects by triggering reconnect
+    if !circular_moved_entries.is_empty() {
+        handle_reconnect_logic(
+            circular_moved_entries,
+            core.clone(),
+            pipeline,
+            pipeline_responses,
+            true, // should_retry = true, we want to retry after reconnect
+            pipeline_map,
+            response_policies,
+        )
+        .await?;
+    }
+
+    // Handle normal redirects
+    for (indices, address, mut error) in normal_redirect_entries {
         // Convert the ServerError to a RedisError and try to extract redirect info.
         let redis_error: RedisError = error.clone().into();
         let (index, inner_index) = indices;

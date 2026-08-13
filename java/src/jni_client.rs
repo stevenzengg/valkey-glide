@@ -1,5 +1,5 @@
 //! JNI client management infrastructure extracted from JNI-java implementation
-//! This module provides direct JNI calls to glide-core while preserving protobuf serialization
+//! This module provides direct JNI calls to glide-core
 
 use anyhow::Result;
 use dashmap::DashMap;
@@ -55,6 +55,22 @@ pub extern "system" fn JNI_OnUnload(_vm: *const JavaVM, _reserved: *const c_void
     crate::cleanup_global_caches();
 }
 
+/// Invalidate cached JNI method IDs so the next call re-initializes them.
+/// Called when callback completion fails — stale method IDs (e.g. from classloader
+/// changes) would cause every subsequent callback to fail permanently. Clearing the
+/// cache lets the fallback `find_class` path re-discover the correct method IDs.
+///
+/// Safe to call at any time: the Mutex<Option<...>> pattern means the next caller
+/// will re-populate the cache from the current JNIEnv.
+fn invalidate_jni_caches() {
+    if let Some(cache_mutex) = METHOD_CACHE.get() {
+        *cache_mutex.lock() = None;
+    }
+    if let Some(cache_mutex) = GLIDE_CORE_CLIENT_CACHE.get() {
+        *cache_mutex.lock() = None;
+    }
+}
+
 // Type aliases for complex types
 type PushMessageTuple = (Vec<u8>, Vec<u8>, Option<Vec<u8>>);
 type CallbackResult = Result<ServerValue, ServerError>;
@@ -64,6 +80,8 @@ pub static JVM: std::sync::OnceLock<Arc<JavaVM>> = std::sync::OnceLock::new();
 static RUNTIME: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
 
 // Defaults for runtime and callback workers
+// NOTE: minimum 2 worker threads required for MultiplexedConnection (scope feature).
+// The connection's internal reader task must run concurrently with command sends.
 const DEFAULT_RUNTIME_WORKER_THREADS: usize = 1;
 const DEFAULT_CALLBACK_WORKER_THREADS: usize = 2;
 
@@ -192,6 +210,9 @@ pub async fn ensure_client_for_handle(handle_id: u64) -> Result<GlideClient> {
         let client = create_glide_client(cfg, Some(tx)).await?;
         table.insert(handle_id, client.clone());
 
+        // Register in the glide-core scope registry for scope command execution
+        glide_core::scope::register_client(handle_id, client.clone());
+
         // Always spawn push notification handler
         let jvm_arc = JVM.get().cloned();
         let handle_for_java = handle_id as jlong;
@@ -217,7 +238,7 @@ pub(crate) fn handle_push_notification(env: &mut JNIEnv, handle_id: jlong, push:
 
     let as_bytes = |v: &Value| -> Option<Vec<u8>> {
         match v {
-            Value::BulkString(b) => Some(b.clone()),
+            Value::BulkString(b) => Some(b.to_vec()),
             _ => None,
         }
     };
@@ -283,6 +304,7 @@ pub(crate) struct MethodCache {
     async_handle_table_class: GlobalRef,
     complete_callback_method: JStaticMethodID,
     complete_error_with_code_method: JStaticMethodID,
+    fail_all_method: JStaticMethodID,
 }
 
 static METHOD_CACHE: std::sync::OnceLock<Mutex<Option<MethodCache>>> = std::sync::OnceLock::new();
@@ -320,10 +342,15 @@ pub(crate) fn get_method_cache(env: &mut JNIEnv) -> Result<MethodCache> {
             anyhow::anyhow!("Failed to get completeCallbackWithErrorCode method ID: {e}")
         })?;
 
+    let fail_all_method = env
+        .get_static_method_id(&class, "failAllWithError", "(Ljava/lang/String;)V")
+        .map_err(|e| anyhow::anyhow!("Failed to get failAllWithError method ID: {e}"))?;
+
     let method_cache = MethodCache {
         async_handle_table_class: global_class,
         complete_callback_method,
         complete_error_with_code_method,
+        fail_all_method,
     };
 
     // Store in cache
@@ -362,17 +389,29 @@ pub fn init_callback_workers() -> &'static Sender<CallbackJob> {
             thread::Builder::new()
                 .name(format!("glide-jni-callback-{i}"))
                 .spawn(move || {
+                    // Pre-attach to JVM once at thread start. attach_current_thread_as_daemon
+                    // keeps the thread attached for its entire lifetime (no detach on drop).
+                    // This eliminates per-callback attach overhead and the attach failure window.
+                    let Some(jvm) = JVM.get() else {
+                        log::error!("Callback worker {i}: JVM not cached, cannot start");
+                        return;
+                    };
+                    let Ok(mut env) = jvm.attach_current_thread_as_daemon() else {
+                        log::error!("Callback worker {i}: failed to attach to JVM at startup");
+                        return;
+                    };
+
                     loop {
                         let job_opt = {
                             let guard = rx_clone.lock().unwrap();
                             guard.recv().ok()
                         };
-                        let Some((jvm, callback_id, result, binary_mode)) = job_opt else {
+                        let Some((_, callback_id, result, binary_mode)) = job_opt else {
                             break;
                         };
 
-                        // Process callback on this dedicated thread
-                        process_callback_job(jvm, callback_id, result, binary_mode);
+                        // Process callback with pre-attached env
+                        process_callback_job_with_env(&mut env, callback_id, result, binary_mode);
                     }
                 })
                 .expect("Failed to spawn callback worker thread");
@@ -382,72 +421,98 @@ pub fn init_callback_workers() -> &'static Sender<CallbackJob> {
     })
 }
 
-/// Drop callbacks that already timed out on the Java side.
-fn process_callback_job(
-    jvm: Arc<JavaVM>,
+/// Process a callback with an already-attached JNIEnv.
+/// Used by pre-attached callback worker threads.
+fn process_callback_job_with_env(
+    env: &mut JNIEnv,
     callback_id: jlong,
     result: CallbackResult,
     binary_mode: bool,
 ) {
     if take_timed_out_callback(callback_id) {
+        logger_core::log_debug_rate_limited!(
+            "jni_callback",
+            5,
+            format!(
+                "Rust task completed for callback_id={} after Java timeout — result discarded.",
+                callback_id
+            )
+        );
         return;
     }
 
-    match jvm.attach_current_thread_as_daemon() {
-        Ok(mut env) => match result {
-            Ok(server_value) => {
-                let _ = env.push_local_frame(16);
+    match result {
+        Ok(server_value) => {
+            let _ = env.push_local_frame(16);
 
-                let java_result = if should_use_direct_buffer(&server_value) {
-                    create_direct_byte_buffer(&mut env, server_value, !binary_mode)
-                } else {
-                    crate::resp_value_to_java(&mut env, server_value, !binary_mode)
-                };
+            let java_result = if should_use_direct_buffer(&server_value) {
+                create_direct_byte_buffer(env, server_value, !binary_mode)
+            } else {
+                crate::resp_value_to_java(env, server_value, !binary_mode)
+            };
 
-                if take_timed_out_callback(callback_id) {
-                    let _ = unsafe { env.pop_local_frame(&JObject::null()) };
-                    return;
-                }
+            if take_timed_out_callback(callback_id) {
+                let _ = unsafe { env.pop_local_frame(&JObject::null()) };
+                return;
+            }
 
-                match java_result {
-                    Ok(java_result) => {
-                        let _ = complete_java_callback(&mut env, callback_id, &java_result);
-                    }
-                    Err(e) => {
-                        let error_code = 0;
-                        let error_msg = format!("Response conversion failed: {e}");
-                        let _ = complete_java_callback_with_error_code(
-                            &mut env,
-                            callback_id,
-                            error_code,
-                            &error_msg,
+            match java_result {
+                Ok(java_result) => {
+                    if let Err(e) = complete_java_callback(env, callback_id, &java_result) {
+                        log::error!("JNI completion failed for callback {callback_id}: {e}");
+                        let _ = env.exception_clear();
+                        invalidate_jni_caches();
+                        fail_all_pending_futures(
+                            env,
+                            "JNI callback completion failed — cached method IDs may be stale",
                         );
                     }
                 }
-                let _ = unsafe { env.pop_local_frame(&JObject::null()) };
-            }
-            Err(server_err) => {
-                if take_timed_out_callback(callback_id) {
-                    return;
+                Err(e) => {
+                    let error_code = 0;
+                    let error_msg = format!("Response conversion failed: {e}");
+                    if let Err(e2) = complete_java_callback_with_error_code(
+                        env,
+                        callback_id,
+                        error_code,
+                        &error_msg,
+                    ) {
+                        log::error!("JNI error completion failed for callback {callback_id}: {e2}");
+                        let _ = env.exception_clear();
+                        invalidate_jni_caches();
+                        fail_all_pending_futures(
+                            env,
+                            "JNI error callback completion failed — cached method IDs may be stale",
+                        );
+                    }
                 }
+            }
+            let _ = unsafe { env.pop_local_frame(&JObject::null()) };
+        }
+        Err(server_err) => {
+            if take_timed_out_callback(callback_id) {
+                return;
+            }
 
-                let error_code = error_type(&server_err) as i32;
-                let error_msg = error_message(&server_err);
-                let _ = complete_java_callback_with_error_code(
-                    &mut env,
-                    callback_id,
-                    error_code,
-                    &error_msg,
+            let error_code = error_type(&server_err) as i32;
+            let error_msg = error_message(&server_err);
+            if let Err(e) =
+                complete_java_callback_with_error_code(env, callback_id, error_code, &error_msg)
+            {
+                log::error!("JNI error completion failed for callback {callback_id}: {e}");
+                let _ = env.exception_clear();
+                invalidate_jni_caches();
+                fail_all_pending_futures(
+                    env,
+                    "JNI error callback completion failed — cached method IDs may be stale",
                 );
             }
-        },
-        Err(e) => {
-            log::error!("JNI environment attachment failed: {e}");
         }
     }
 }
 
 /// Enqueue callback job to dedicated workers.
+/// If the channel is dead (all workers terminated), sweeps all pending futures with error.
 pub fn complete_callback(
     jvm: Arc<JavaVM>,
     callback_id: jlong,
@@ -455,9 +520,53 @@ pub fn complete_callback(
     binary_mode: bool,
 ) {
     let sender = init_callback_workers();
-    if let Err(e) = sender.send((jvm, callback_id, result, binary_mode)) {
-        log::error!("Callback queue send failed: {e}");
+    if let Err(e) = sender.send((jvm.clone(), callback_id, result, binary_mode)) {
+        log::error!("Callback channel dead, sweeping all pending futures: {e}");
+        // Workers are dead — sweep the entire AsyncRegistry table
+        if let Ok(mut env) = jvm.attach_current_thread_as_daemon() {
+            fail_all_pending_futures(
+                &mut env,
+                "Native callback workers terminated — all pending requests failed",
+            );
+        } else {
+            log::error!(
+                "FATAL: Cannot attach to JVM to sweep futures — all pending requests will hang"
+            );
+        }
     }
+}
+
+/// Fail all pending futures in AsyncRegistry by calling failAllWithError from Java.
+/// Used when fatal infrastructure failures are detected (channel dead, native panic).
+pub fn fail_all_pending_futures(env: &mut JNIEnv, error_msg: &str) {
+    let cache = match get_method_cache(env) {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("Cannot sweep futures — failed to get method cache: {e}");
+            return;
+        }
+    };
+    let _ = env.push_local_frame(4);
+    let msg = match env.new_string(error_msg) {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Cannot sweep futures — failed to create error string: {e}");
+            let _ = unsafe { env.pop_local_frame(&JObject::null()) };
+            return;
+        }
+    };
+    if let Err(e) = unsafe {
+        env.call_static_method_unchecked(
+            &cache.async_handle_table_class,
+            cache.fail_all_method,
+            signature::ReturnType::Primitive(signature::Primitive::Void),
+            &[JValue::Object(&msg).as_jni()],
+        )
+    } {
+        log::error!("Failed to sweep pending futures via failAllWithError: {e}");
+        let _ = env.exception_clear();
+    }
+    let _ = unsafe { env.pop_local_frame(&JObject::null()) };
 }
 
 /// Complete Java CompletableFuture with success result using cached method IDs.
@@ -608,7 +717,7 @@ fn create_direct_byte_buffer<'local>(
 ) -> Result<JObject<'local>, crate::errors::FFIError> {
     match value {
         redis::Value::BulkString(data) => {
-            let (id, ptr, len) = register_native_buffer(data);
+            let (id, ptr, len) = register_native_buffer(data.into());
             let bb = unsafe { env.new_direct_byte_buffer(ptr.cast(), len)? };
             // Register Java-side cleaner to free native buffer when GC'd
             let obj: JObject = bb.into();
@@ -670,6 +779,10 @@ fn serialize_array_to_bytes(
     arr: Vec<ServerValue>,
     _encoding_utf8: bool,
 ) -> Result<Vec<u8>, crate::errors::FFIError> {
+    const NULL_VALUE: i32 = -1;
+    const FALSE_BOOL: u8 = 0;
+    const TRUE_BOOL: u8 = 1;
+
     let mut bytes = Vec::new();
 
     // Write array marker and length
@@ -678,6 +791,10 @@ fn serialize_array_to_bytes(
 
     for value in arr {
         match value {
+            redis::Value::Nil => {
+                bytes.push(b'$'); // Bulk string marker
+                bytes.extend_from_slice(&NULL_VALUE.to_be_bytes()); // -1 indicates null in binary format
+            }
             redis::Value::BulkString(data) => {
                 bytes.push(b'$'); // Bulk string marker
                 bytes.extend_from_slice(&(data.len() as u32).to_be_bytes());
@@ -710,6 +827,20 @@ fn serialize_array_to_bytes(
             redis::Value::Int(n) => {
                 bytes.push(b':'); // Integer marker
                 bytes.extend_from_slice(&n.to_be_bytes());
+            }
+            redis::Value::Double(n) => {
+                bytes.push(b','); // Double marker
+                bytes.extend_from_slice(&n.to_be_bytes());
+            }
+            redis::Value::Boolean(b) => {
+                bytes.push(b'?'); // Boolean marker
+                bytes.push(if b { TRUE_BOOL } else { FALSE_BOOL });
+            }
+            redis::Value::BigNumber(n) => {
+                let data = n.to_string().into_bytes();
+                bytes.push(b'('); // BigNumber marker
+                bytes.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                bytes.extend_from_slice(&data);
             }
             _ => {
                 // For complex nested types, store as serialized string representation
@@ -774,14 +905,46 @@ pub fn get_optional_string_param_raw(env: &mut JNIEnv, param: jstring) -> Option
     }
 }
 
-/// JNI init hook to ensure JVM cached for push callbacks
+/// JNI init hook to cache JVM and GlideCoreClient class/methods with correct classloader context.
+///
+/// This is called from `GlideCoreClient`'s static initializer in Java. We cache the class and
+/// method IDs here rather than in `JNI_OnLoad` because `GlideCoreClient` may not be findable
+/// via `env.find_class()` during `JNI_OnLoad` in environments with non-standard classloaders
+/// (AWS Lambda, Spring Boot with nested JARs). The `class` parameter passed by JNI is already
+/// loaded by the application classloader, bypassing `find_class` issues entirely.
+///
+/// Other caches (`MethodCache`, `JavaValueConversionCache`) are safe to initialize in
+/// `JNI_OnLoad` because they only reference standard Java classes (`java/lang/Long`,
+/// `java/util/HashMap`, etc.) which are always available from the bootstrap classloader.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_glide_internal_GlideCoreClient_onNativeInit(
-    env: JNIEnv,
-    _class: JClass,
+    mut env: JNIEnv,
+    class: JClass,
 ) {
+    // Cache JVM
     if let Ok(jvm) = env.get_java_vm() {
         let _ = JVM.set(Arc::new(jvm));
+    }
+
+    // Cache GlideCoreClient class and method IDs with correct classloader context.
+    // The 'class' parameter is GlideCoreClient, already loaded by the application classloader.
+    if let Ok(global) = env.new_global_ref(&class)
+        && let (Ok(on_native_push), Ok(register_cleaner)) = (
+            env.get_static_method_id(&class, "onNativePush", "(J[B[B[B)V"),
+            env.get_static_method_id(
+                &class,
+                "registerNativeBufferCleaner",
+                "(Ljava/nio/ByteBuffer;J)V",
+            ),
+        )
+    {
+        let cache = GlideCoreClientCache {
+            class: global,
+            on_native_push,
+            register_native_buffer_cleaner: register_cleaner,
+        };
+        let cache_mutex = GLIDE_CORE_CLIENT_CACHE.get_or_init(|| Mutex::new(None));
+        *cache_mutex.lock() = Some(cache);
     }
 }
 
@@ -806,42 +969,149 @@ struct GlideCoreClientCache {
 static GLIDE_CORE_CLIENT_CACHE: std::sync::OnceLock<Mutex<Option<GlideCoreClientCache>>> =
     std::sync::OnceLock::new();
 
-/// Get GLIDE core client cache using correct classloader context
-fn get_glide_core_client_cache_safe(fallback_env: &mut JNIEnv) -> Result<GlideCoreClientCache> {
-    // Try cached JVM env first
-    if let Some(cached_jvm) = JVM.get()
-        && let Ok(mut cached_env) = cached_jvm.get_env()
-    {
-        return get_glide_core_client_cache(&mut cached_env);
-    }
-    // Otherwise fallback to provided env
-    get_glide_core_client_cache(fallback_env)
-}
-
-fn get_glide_core_client_cache(env: &mut JNIEnv) -> Result<GlideCoreClientCache> {
+/// Get GlideCoreClient cache, with fallback dynamic initialization.
+///
+/// Preferred path: return the cache populated by `onNativeInit` (correct classloader context).
+/// Fallback: if `onNativeInit` wasn't called or failed, attempt `find_class` with the provided
+/// `env`. This may fail in non-standard classloader environments but keeps the client resilient
+/// in standard JVM setups.
+fn get_glide_core_client_cache_safe(env: &mut JNIEnv) -> Result<GlideCoreClientCache> {
     let cache_mutex = GLIDE_CORE_CLIENT_CACHE.get_or_init(|| Mutex::new(None));
     {
         let guard = cache_mutex.lock();
-        if let Some(c) = guard.as_ref() {
-            return Ok(c.clone());
+        if let Some(ref cache) = *guard {
+            return Ok(cache.clone());
         }
     }
+
+    // Fallback: try to initialize dynamically using the provided env
     let class = env.find_class("glide/internal/GlideCoreClient")?;
     let global = env.new_global_ref(&class)?;
     let on_native_push = env.get_static_method_id(&class, "onNativePush", "(J[B[B[B)V")?;
-    let register_native_buffer_cleaner = env.get_static_method_id(
+    let register_cleaner = env.get_static_method_id(
         &class,
         "registerNativeBufferCleaner",
         "(Ljava/nio/ByteBuffer;J)V",
     )?;
+
     let cache = GlideCoreClientCache {
         class: global,
         on_native_push,
-        register_native_buffer_cleaner,
+        register_native_buffer_cleaner: register_cleaner,
     };
-    {
-        let mut guard = cache_mutex.lock();
-        *guard = Some(cache.clone());
+
+    let mut guard = cache_mutex.lock();
+    if guard.is_none() {
+        *guard = Some(cache);
     }
-    Ok(cache)
+
+    Ok(guard.as_ref().cloned().unwrap())
+}
+
+/// Complete a callback with an error synchronously from the JNI calling thread.
+/// This bypasses the async callback channel entirely — used for immediate rejection
+/// (e.g., inflight limit exceeded) where the Java thread must not park.
+///
+/// Requires the calling thread to already have a JNIEnv (which JNI entry points always do).
+pub fn complete_error_sync(
+    env: &mut JNIEnv,
+    callback_id: jni::sys::jlong,
+    message: &str,
+    error_code: i32,
+) {
+    let Ok(method_cache) = get_method_cache(env) else {
+        log::error!(
+            "complete_error_sync: method cache not initialized for callback_id={}",
+            callback_id
+        );
+        return;
+    };
+
+    // Create the error message string — a small Java heap allocation,
+    // not affected by native memory pressure.
+    let Ok(error_msg) = env.new_string(message) else {
+        log::error!(
+            "complete_error_sync: failed to create error string for callback_id={}",
+            callback_id
+        );
+        return;
+    };
+
+    // Call AsyncRegistry.completeCallbackWithErrorCode(callbackId, errorCode, errorMessage)
+    let result = unsafe {
+        env.call_static_method_unchecked(
+            &method_cache.async_handle_table_class,
+            method_cache.complete_error_with_code_method,
+            jni::signature::ReturnType::Primitive(jni::signature::Primitive::Boolean),
+            &[
+                jni::sys::jvalue { j: callback_id },
+                jni::sys::jvalue { i: error_code },
+                jni::sys::jvalue {
+                    l: error_msg.as_raw(),
+                },
+            ],
+        )
+    };
+
+    if let Err(e) = result {
+        log::error!(
+            "complete_error_sync: JNI call failed for callback_id={}: {:?}",
+            callback_id,
+            e
+        );
+        let _ = env.exception_clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::serialize_array_to_bytes;
+    use redis::{Value, parse_redis_value};
+
+    #[test]
+    fn serialize_array_to_bytes_encodes_bool_double_bignumber_and_nil() {
+        let big_number_value = parse_redis_value(b"(123456789012345678901234567890\r\n").unwrap();
+        let Value::BigNumber(big_number) = big_number_value else {
+            panic!("expected big number from parser");
+        };
+
+        let payload = vec![
+            Value::Boolean(true),
+            Value::Double(42.25),
+            Value::BigNumber(big_number),
+            Value::Nil,
+        ];
+
+        let bytes = match serialize_array_to_bytes(payload, false) {
+            Ok(bytes) => bytes,
+            Err(err) => panic!("serialization failed: {err}"),
+        };
+
+        // Array header: '*' + 4-byte element count.
+        assert_eq!(bytes[0], b'*');
+        assert_eq!(u32::from_be_bytes(bytes[1..5].try_into().unwrap()), 4);
+
+        // Element 1: boolean true ('?'+1).
+        assert_eq!(bytes[5], b'?');
+        assert_eq!(bytes[6], 1);
+
+        // Element 2: double (',' + 8 bytes).
+        assert_eq!(bytes[7], b',');
+        let decoded_double = f64::from_be_bytes(bytes[8..16].try_into().unwrap());
+        assert_eq!(decoded_double, 42.25);
+
+        // Element 3: big number ('(' + len + utf8 digits).
+        assert_eq!(bytes[16], b'(');
+        let big_number_len = u32::from_be_bytes(bytes[17..21].try_into().unwrap()) as usize;
+        let big_number_text = std::str::from_utf8(&bytes[21..21 + big_number_len]).unwrap();
+        assert_eq!(big_number_text, "123456789012345678901234567890");
+
+        // Element 4: null bulk string ('$' + -1).
+        let null_offset = 21 + big_number_len;
+        assert_eq!(bytes[null_offset], b'$');
+        assert_eq!(
+            i32::from_be_bytes(bytes[null_offset + 1..null_offset + 5].try_into().unwrap()),
+            -1
+        );
+    }
 }

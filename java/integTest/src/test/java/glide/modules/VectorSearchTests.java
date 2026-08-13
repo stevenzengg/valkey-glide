@@ -2,18 +2,22 @@
 package glide.modules;
 
 import static glide.TestUtilities.assertDeepEquals;
+import static glide.TestUtilities.commonClientConfig;
 import static glide.TestUtilities.commonClusterClientConfig;
 import static glide.api.BaseClient.OK;
 import static glide.api.models.GlideString.gs;
-import static glide.api.models.configuration.RequestRoutingConfiguration.SimpleMultiNodeRoute.ALL_PRIMARIES;
-import static glide.api.models.configuration.RequestRoutingConfiguration.SimpleSingleNodeRoute.RANDOM;
+import static glide.utils.Java8Utils.createMap;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Named.named;
 
+import glide.TestConfiguration;
+import glide.api.BaseClient;
+import glide.api.GlideClient;
 import glide.api.GlideClusterClient;
 import glide.api.commands.servermodules.FT;
 import glide.api.commands.servermodules.Json;
@@ -34,11 +38,15 @@ import glide.api.models.commands.FT.FTCreateOptions.TagField;
 import glide.api.models.commands.FT.FTCreateOptions.TextField;
 import glide.api.models.commands.FT.FTCreateOptions.VectorFieldFlat;
 import glide.api.models.commands.FT.FTCreateOptions.VectorFieldHnsw;
+import glide.api.models.commands.FT.FTInfoOptions;
 import glide.api.models.commands.FT.FTProfileOptions;
 import glide.api.models.commands.FT.FTSearchOptions;
 import glide.api.models.commands.FlushMode;
 import glide.api.models.commands.InfoOptions.Section;
+import glide.api.models.configuration.RequestRoutingConfiguration.SimpleMultiNodeRoute;
+import glide.api.models.configuration.RequestRoutingConfiguration.SimpleSingleNodeRoute;
 import glide.api.models.exceptions.RequestException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
@@ -47,14 +55,20 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import lombok.SneakyThrows;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Disabled;
+import org.junit.jupiter.api.Named;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
 public class VectorSearchTests {
 
-    private static GlideClusterClient client;
+    private static final List<Arguments> clients = new ArrayList<>();
 
     /** Waiting interval to let server process the data before querying */
     private static final int DATA_PROCESSING_TIMEOUT = 1000; // ms
@@ -62,29 +76,89 @@ public class VectorSearchTests {
     @BeforeAll
     @SneakyThrows
     public static void init() {
-        client =
+        GlideClusterClient clusterClient =
                 GlideClusterClient.createClient(commonClusterClientConfig().requestTimeout(5000).build())
                         .get();
-        client.flushall(FlushMode.SYNC, ALL_PRIMARIES).get();
+        clusterClient.flushall(FlushMode.SYNC, SimpleMultiNodeRoute.ALL_PRIMARIES).get();
+        clients.add(Arguments.of(named("cluster", clusterClient)));
+
+        if (!TestConfiguration.STANDALONE_HOSTS[0].isEmpty()) {
+            GlideClient standaloneClient =
+                    GlideClient.createClient(commonClientConfig().requestTimeout(5000).build()).get();
+            standaloneClient.flushall(FlushMode.SYNC).get();
+            clients.add(Arguments.of(named("standalone", standaloneClient)));
+        }
     }
 
     @AfterAll
     @SneakyThrows
+    @SuppressWarnings("unchecked")
     public static void teardown() {
-        client.flushall(FlushMode.SYNC, ALL_PRIMARIES).get();
-        client.close();
+        for (Arguments args : clients) {
+            BaseClient client = ((Named<BaseClient>) args.get()[0]).getPayload();
+            if (client instanceof GlideClusterClient) {
+                ((GlideClusterClient) client)
+                        .flushall(FlushMode.SYNC, SimpleMultiNodeRoute.ALL_PRIMARIES)
+                        .get();
+            } else {
+                ((GlideClient) client).flushall(FlushMode.SYNC).get();
+            }
+            client.close();
+        }
     }
 
-    @Test
+    @AfterEach
     @SneakyThrows
-    public void check_module_loaded() {
-        var info = client.info(new Section[] {Section.MODULES}, RANDOM).get().getSingleValue();
+    @SuppressWarnings("unchecked")
+    public void cleanup() {
+        for (Arguments args : clients) {
+            BaseClient client = ((Named<BaseClient>) args.get()[0]).getPayload();
+            if (client instanceof GlideClusterClient) {
+                ((GlideClusterClient) client)
+                        .flushall(FlushMode.SYNC, SimpleMultiNodeRoute.ALL_PRIMARIES)
+                        .get();
+            } else {
+                ((GlideClient) client).flushall(FlushMode.SYNC).get();
+            }
+        }
+    }
+
+    static Stream<Arguments> getClients() {
+        return clients.stream();
+    }
+
+    /** Returns only cluster clients for tests that require cluster-specific features. */
+    static Stream<Arguments> getClusterClients() {
+        return clients.stream()
+                .filter(
+                        args -> {
+                            @SuppressWarnings("unchecked")
+                            Named<BaseClient> named = (Named<BaseClient>) args.get()[0];
+                            return named.getPayload() instanceof GlideClusterClient;
+                        });
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void check_module_loaded(BaseClient client) {
+        String info;
+        if (client instanceof GlideClusterClient) {
+            info =
+                    ((GlideClusterClient) client)
+                            .info(new Section[] {Section.MODULES}, SimpleSingleNodeRoute.RANDOM)
+                            .get()
+                            .getSingleValue();
+        } else {
+            info = ((GlideClient) client).info(new Section[] {Section.MODULES}).get();
+        }
         assertTrue(info.contains("# search_index_stats"));
     }
 
     @SneakyThrows
-    @Test
-    public void ft_create() {
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void ft_create(BaseClient client) {
         // create few simple indices
         assertEquals(
                 OK,
@@ -93,7 +167,11 @@ public class VectorSearchTests {
                                 UUID.randomUUID().toString(),
                                 new FieldInfo[] {
                                     new FieldInfo("vec", "VEC", VectorFieldHnsw.builder(DistanceMetric.L2, 2).build())
-                                })
+                                },
+                                FTCreateOptions.builder()
+                                        .dataType(DataType.HASH)
+                                        .prefixes(new String[] {"vec:"})
+                                        .build())
                         .get());
         assertEquals(
                 OK,
@@ -149,7 +227,7 @@ public class VectorSearchTests {
                         .get());
 
         // create an index with multiple prefixes
-        var index = UUID.randomUUID().toString();
+        String index = UUID.randomUUID().toString();
         assertEquals(
                 OK,
                 FT.create(
@@ -168,7 +246,7 @@ public class VectorSearchTests {
                         .get());
 
         // create a duplicating index
-        var exception =
+        ExecutionException exception =
                 assertThrows(
                         ExecutionException.class,
                         () ->
@@ -178,7 +256,11 @@ public class VectorSearchTests {
                                                 new FieldInfo[] {
                                                     new FieldInfo("title", new TextField()),
                                                     new FieldInfo("name", new TextField())
-                                                })
+                                                },
+                                                FTCreateOptions.builder()
+                                                        .dataType(DataType.HASH)
+                                                        .prefixes(new String[] {"author:details:"})
+                                                        .build())
                                         .get());
         assertInstanceOf(RequestException.class, exception.getCause());
         assertTrue(exception.getMessage().contains("already exists"));
@@ -187,9 +269,18 @@ public class VectorSearchTests {
         exception =
                 assertThrows(
                         ExecutionException.class,
-                        () -> FT.create(client, UUID.randomUUID().toString(), new FieldInfo[0]).get());
+                        () ->
+                                FT.create(
+                                                client,
+                                                UUID.randomUUID().toString(),
+                                                new FieldInfo[0],
+                                                FTCreateOptions.builder()
+                                                        .dataType(DataType.HASH)
+                                                        .prefixes(new String[] {"empty:"})
+                                                        .build())
+                                        .get());
         assertInstanceOf(RequestException.class, exception.getCause());
-        assertTrue(exception.getMessage().contains("wrong number of arguments"));
+        assertTrue(exception.getMessage().contains("schema must have at least one attribute"));
 
         // duplicated field name
         exception =
@@ -202,15 +293,20 @@ public class VectorSearchTests {
                                                 new FieldInfo[] {
                                                     new FieldInfo("name", new TextField()),
                                                     new FieldInfo("name", new TextField())
-                                                })
+                                                },
+                                                FTCreateOptions.builder()
+                                                        .dataType(DataType.HASH)
+                                                        .prefixes(new String[] {"dup:"})
+                                                        .build())
                                         .get());
         assertInstanceOf(RequestException.class, exception.getCause());
-        assertTrue(exception.getMessage().contains("already exists"));
+        assertTrue(exception.getMessage().contains("Duplicate: field in schema"));
     }
 
     @SneakyThrows
-    @Test
-    public void ft_search() {
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void ft_search(BaseClient client) {
         String prefix = "{" + UUID.randomUUID() + "}:";
         String index = prefix + "index";
 
@@ -233,7 +329,7 @@ public class VectorSearchTests {
                 client
                         .hset(
                                 gs(prefix + 0),
-                                Map.of(
+                                createMap(
                                         gs("vec"),
                                         gs(
                                                 new byte[] {
@@ -246,7 +342,7 @@ public class VectorSearchTests {
                 client
                         .hset(
                                 gs(prefix + 1),
-                                Map.of(
+                                createMap(
                                         gs("vec"),
                                         gs(
                                                 new byte[] {
@@ -264,10 +360,10 @@ public class VectorSearchTests {
 
         // FT.SEARCH hash_idx1 "*=>[KNN 2 @VEC $query_vec]" PARAMS 2 query_vec
         // "\x00\x00\x00\x00\x00\x00\x00\x00" DIALECT 2
-        var options =
+        FTSearchOptions options =
                 FTSearchOptions.builder()
                         .params(
-                                Map.of(
+                                createMap(
                                         gs("query_vec"),
                                         gs(
                                                 new byte[] {
@@ -276,17 +372,17 @@ public class VectorSearchTests {
                                                 })))
                         .addReturnField("vec")
                         .build();
-        var query = "*=>[KNN 2 @VEC $query_vec]";
-        var ftsearch = FT.search(client, index, query, options).get();
+        String query = "*=>[KNN 2 @VEC $query_vec]";
+        Object[] ftsearch = FT.search(client, index, query, options).get();
 
         assertArrayEquals(
                 new Object[] {
                     2L,
-                    Map.of(
+                    createMap(
                             gs(prefix + 0),
-                            Map.of(gs("vec"), gs("\0\0\0\0\0\0\0\0")),
+                            createMap(gs("vec"), gs("\0\0\0\0\0\0\0\0")),
                             gs(prefix + 1),
-                            Map.of(
+                            createMap(
                                     gs("vec"),
                                     gs(
                                             new byte[] {
@@ -304,22 +400,117 @@ public class VectorSearchTests {
 
         // TODO more tests with json index
 
-        var ftprofile = FT.profile(client, index, new FTProfileOptions(query, options)).get();
-        assertArrayEquals(ftsearch, (Object[]) ftprofile[0]);
+        // FT.PROFILE may not be available on all server versions (e.g. valkey-search).
+        try {
+            Object[] ftprofile = FT.profile(client, index, new FTProfileOptions(query, options)).get();
+            assertArrayEquals(ftsearch, (Object[]) ftprofile[0]);
+        } catch (ExecutionException e) {
+            assertInstanceOf(RequestException.class, e.getCause());
+        }
 
         // querying non-existing index
-        var exception =
+        ExecutionException exception =
                 assertThrows(
                         ExecutionException.class,
                         () -> FT.search(client, UUID.randomUUID().toString(), "*").get());
         assertInstanceOf(RequestException.class, exception.getCause());
-        assertTrue(exception.getMessage().contains("Index not found"));
+        assertTrue(exception.getMessage().contains("not found in database"));
     }
 
     @SneakyThrows
-    @Test
-    public void ft_drop_and_ft_list() {
-        var index = gs(UUID.randomUUID().toString());
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void ft_search_nocontent(BaseClient client) {
+        String prefix = "{" + UUID.randomUUID() + "}:";
+        String index = prefix + "index";
+        String key = prefix + "doc";
+
+        assertEquals(
+                OK,
+                FT.create(
+                                client,
+                                index,
+                                new FieldInfo[] {new FieldInfo("title", new TextField())},
+                                FTCreateOptions.builder()
+                                        .dataType(DataType.HASH)
+                                        .prefixes(new String[] {prefix})
+                                        .build())
+                        .get());
+
+        assertEquals(1L, client.hset(gs(key), createMap(gs("title"), gs("hello world"))).get());
+        Thread.sleep(DATA_PROCESSING_TIMEOUT);
+
+        // NOCONTENT: only keys are returned, no field content
+        Object[] result =
+                FT.search(client, index, "hello", FTSearchOptions.builder().nocontent().build()).get();
+        assertArrayEquals(new Object[] {1L, createMap(gs(key), createMap())}, result);
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void ft_search_dialect(BaseClient client) {
+        String prefix = "{" + UUID.randomUUID() + "}:";
+        String index = prefix + "index";
+        String key = prefix + "doc";
+
+        assertEquals(
+                OK,
+                FT.create(
+                                client,
+                                index,
+                                new FieldInfo[] {new FieldInfo("title", new TextField())},
+                                FTCreateOptions.builder()
+                                        .dataType(DataType.HASH)
+                                        .prefixes(new String[] {prefix})
+                                        .build())
+                        .get());
+
+        assertEquals(1L, client.hset(gs(key), createMap(gs("title"), gs("hello world"))).get());
+        Thread.sleep(DATA_PROCESSING_TIMEOUT);
+
+        // dialect 2 is accepted; assert the document is returned
+        Object[] result =
+                FT.search(client, index, "hello", FTSearchOptions.builder().dialect(2).build()).get();
+        assertEquals(2, result.length);
+        assertEquals(1L, result[0]);
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void ft_search_dialect_invalid(BaseClient client) {
+        String prefix = "{" + UUID.randomUUID() + "}:";
+        String index = prefix + "index";
+
+        assertEquals(
+                OK,
+                FT.create(
+                                client,
+                                index,
+                                new FieldInfo[] {new FieldInfo("title", new TextField())},
+                                FTCreateOptions.builder()
+                                        .dataType(DataType.HASH)
+                                        .prefixes(new String[] {prefix})
+                                        .build())
+                        .get());
+
+        // dialect < 2 is not supported; expect an error
+        ExecutionException exception =
+                assertThrows(
+                        ExecutionException.class,
+                        () ->
+                                FT.search(client, index, "hello", FTSearchOptions.builder().dialect(1).build())
+                                        .get());
+        assertInstanceOf(RequestException.class, exception.getCause());
+        assertTrue(exception.getMessage().contains("DIALECT"));
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void ft_drop_and_ft_list(BaseClient client) {
+        GlideString index = gs(UUID.randomUUID().toString());
         assertEquals(
                 OK,
                 FT.create(
@@ -327,31 +518,40 @@ public class VectorSearchTests {
                                 index,
                                 new FieldInfo[] {
                                     new FieldInfo("vec", VectorFieldHnsw.builder(DistanceMetric.L2, 2).build())
-                                })
+                                },
+                                FTCreateOptions.builder()
+                                        .dataType(DataType.HASH)
+                                        .prefixes(new String[] {"vec:"})
+                                        .build())
                         .get());
 
-        var before = Set.of(FT.list(client).get());
+        GlideString[] beforeArray = FT.list(client).get();
+        Set<GlideString> before = new HashSet<>(Arrays.asList(beforeArray));
 
         assertEquals(OK, FT.dropindex(client, index).get());
 
-        var after = new HashSet<>(Set.of(FT.list(client).get()));
+        GlideString[] afterArray = FT.list(client).get();
+        Set<GlideString> after = new HashSet<>(Arrays.asList(afterArray));
 
         assertFalse(after.contains(index));
         after.add(index);
         assertEquals(after, before);
 
-        var exception = assertThrows(ExecutionException.class, () -> FT.dropindex(client, index).get());
+        ExecutionException exception =
+                assertThrows(ExecutionException.class, () -> FT.dropindex(client, index).get());
         assertInstanceOf(RequestException.class, exception.getCause());
-        assertTrue(exception.getMessage().contains("Index does not exist"));
+        assertTrue(exception.getMessage().contains("not found in database"));
     }
 
     @SneakyThrows
-    @Test
-    public void ft_aggregate() {
-        var prefixBicycles = "{bicycles}:";
-        var indexBicycles = prefixBicycles + UUID.randomUUID();
-        var prefixMovies = "{movies}:";
-        var indexMovies = prefixMovies + UUID.randomUUID();
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @Disabled("AGGREGATE is currently not fully supported")
+    public void ft_aggregate(BaseClient client) {
+        String prefixBicycles = "{bicycles}:";
+        String indexBicycles = prefixBicycles + UUID.randomUUID();
+        String prefixMovies = "{movies}:";
+        String indexMovies = prefixMovies + UUID.randomUUID();
 
         // FT.CREATE idx:bicycle ON JSON PREFIX 1 bicycle: SCHEMA $.model AS model TEXT $.description AS
         // description TEXT $.price AS price NUMERIC $.condition AS condition TAG SEPARATOR ,
@@ -447,7 +647,7 @@ public class VectorSearchTests {
         Thread.sleep(DATA_PROCESSING_TIMEOUT); // let server digest the data and update index
 
         // FT.AGGREGATE idx:bicycle "*" LOAD 1 "__key" GROUPBY 1 "@condition" REDUCE COUNT 0 AS bicylces
-        var options =
+        FTAggregateOptions options =
                 FTAggregateOptions.builder()
                         .loadFields(new String[] {"__key"})
                         .addClause(
@@ -455,14 +655,15 @@ public class VectorSearchTests {
                                         new String[] {"@condition"},
                                         new Reducer[] {new Reducer("COUNT", new String[0], "bicycles")}))
                         .build();
-        var aggreg = FT.aggregate(client, indexBicycles, "*", options).get();
+        Object[] aggreg = FT.aggregate(client, indexBicycles, "*", options).get();
         // elements (maps in array) could be reordered, comparing as sets
         assertDeepEquals(
-                Set.of(
-                        Map.of(gs("condition"), gs("new"), gs("bicycles"), 5.),
-                        Map.of(gs("condition"), gs("used"), gs("bicycles"), 4.),
-                        Map.of(gs("condition"), gs("refurbished"), gs("bicycles"), 1.)),
-                Set.of(aggreg));
+                new HashSet<>(
+                        Arrays.asList(
+                                createMap(gs("condition"), gs("new"), gs("bicycles"), 5.),
+                                createMap(gs("condition"), gs("used"), gs("bicycles"), 4.),
+                                createMap(gs("condition"), gs("refurbished"), gs("bicycles"), 1.))),
+                new HashSet<>(Arrays.asList(aggreg)));
 
         // FT.CREATE idx:movie ON hash PREFIX 1 "movie:" SCHEMA title TEXT release_year NUMERIC rating
         // NUMERIC genre TAG votes NUMERIC
@@ -487,7 +688,7 @@ public class VectorSearchTests {
         client
                 .hset(
                         prefixMovies + 11002,
-                        Map.of(
+                        createMap(
                                 "title",
                                 "Star Wars: Episode V - The Empire Strikes Back",
                                 "release_year",
@@ -504,7 +705,7 @@ public class VectorSearchTests {
         client
                 .hset(
                         prefixMovies + 11003,
-                        Map.of(
+                        createMap(
                                 "title",
                                 "The Godfather",
                                 "release_year",
@@ -521,7 +722,7 @@ public class VectorSearchTests {
         client
                 .hset(
                         prefixMovies + 11004,
-                        Map.of(
+                        createMap(
                                 "title",
                                 "Heat",
                                 "release_year",
@@ -538,7 +739,7 @@ public class VectorSearchTests {
         client
                 .hset(
                         prefixMovies + 11005,
-                        Map.of(
+                        createMap(
                                 "title",
                                 "Star Wars: Episode VI - Return of the Jedi",
                                 "genre",
@@ -579,45 +780,47 @@ public class VectorSearchTests {
         aggreg = FT.aggregate(client, indexMovies, "*", options).get();
         // elements (maps in array) could be reordered, comparing as sets
         assertDeepEquals(
-                Set.of(
-                        Map.of(
-                                gs("genre"),
-                                gs("Drama"),
-                                gs("nb_of_movies"),
-                                1.,
-                                gs("nb_of_votes"),
-                                1563839.,
-                                gs("avg_rating"),
-                                10.),
-                        Map.of(
-                                gs("genre"),
-                                gs("Action"),
-                                gs("nb_of_movies"),
-                                2.,
-                                gs("nb_of_votes"),
-                                2033895.,
-                                gs("avg_rating"),
-                                9.),
-                        Map.of(
-                                gs("genre"),
-                                gs("Thriller"),
-                                gs("nb_of_movies"),
-                                1.,
-                                gs("nb_of_votes"),
-                                559490.,
-                                gs("avg_rating"),
-                                9.)),
-                Set.of(aggreg));
+                new HashSet<>(
+                        Arrays.asList(
+                                createMap(
+                                        gs("genre"),
+                                        gs("Drama"),
+                                        gs("nb_of_movies"),
+                                        1.,
+                                        gs("nb_of_votes"),
+                                        1563839.,
+                                        gs("avg_rating"),
+                                        10.),
+                                createMap(
+                                        gs("genre"),
+                                        gs("Action"),
+                                        gs("nb_of_movies"),
+                                        2.,
+                                        gs("nb_of_votes"),
+                                        2033895.,
+                                        gs("avg_rating"),
+                                        9.),
+                                createMap(
+                                        gs("genre"),
+                                        gs("Thriller"),
+                                        gs("nb_of_movies"),
+                                        1.,
+                                        gs("nb_of_votes"),
+                                        559490.,
+                                        gs("avg_rating"),
+                                        9.))),
+                new HashSet<>(Arrays.asList(aggreg)));
 
-        var ftprofile = FT.profile(client, indexMovies, new FTProfileOptions("*", options)).get();
+        Object[] ftprofile = FT.profile(client, indexMovies, new FTProfileOptions("*", options)).get();
         assertDeepEquals(aggreg, ftprofile[0]);
     }
 
     @SuppressWarnings("unchecked")
-    @Test
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
     @SneakyThrows
-    public void ft_info() {
-        var index = UUID.randomUUID().toString();
+    public void ft_info(BaseClient client) {
+        String index = UUID.randomUUID().toString();
         assertEquals(
                 OK,
                 FT.create(
@@ -626,7 +829,7 @@ public class VectorSearchTests {
                                 new FieldInfo[] {
                                     new FieldInfo(
                                             "$.vec", "VEC", VectorFieldHnsw.builder(DistanceMetric.COSINE, 42).build()),
-                                    new FieldInfo("$.name", new TextField()),
+                                    new FieldInfo("$.name", "name", new TextField()),
                                 },
                                 FTCreateOptions.builder()
                                         .dataType(DataType.JSON)
@@ -634,46 +837,38 @@ public class VectorSearchTests {
                                         .build())
                         .get());
 
-        var response = FT.info(client, index).get();
+        Map<String, Object> response = FT.info(client, index).get();
         assertEquals(gs(index), response.get("index_name"));
-        assertEquals(gs("JSON"), response.get("key_type"));
-        assertArrayEquals(new GlideString[] {gs("123")}, (Object[]) response.get("key_prefixes"));
-        var fields = (Object[]) response.get("fields");
-        assertEquals(2, fields.length);
-        var f1 = (Map<GlideString, Object>) fields[1];
-        assertEquals(gs("$.vec"), f1.get(gs("identifier")));
-        assertEquals(gs("VECTOR"), f1.get(gs("type")));
-        assertEquals(gs("VEC"), f1.get(gs("field_name")));
-        var f1params = (Map<GlideString, Object>) f1.get(gs("vector_params"));
-        assertEquals(gs("COSINE"), f1params.get(gs("distance_metric")));
-        assertEquals(42L, f1params.get(gs("dimension")));
+        assertTrue(Arrays.deepToString((Object[]) response.get("index_definition")).contains("JSON"));
+        assertTrue(Arrays.deepToString((Object[]) response.get("index_definition")).contains("123"));
 
-        assertEquals(
-                Map.of(
-                        gs("identifier"),
-                        gs("$.name"),
-                        gs("type"),
-                        gs("TEXT"),
-                        gs("field_name"),
-                        gs("$.name"),
-                        gs("option"),
-                        gs("")),
-                fields[0]);
+        // Verify field details via the "attributes" key
+        String attributesStr = Arrays.deepToString((Object[]) response.get("attributes"));
+        assertTrue(attributesStr.contains("$.vec"));
+        assertTrue(attributesStr.contains("VEC"));
+        assertTrue(attributesStr.contains("VECTOR"));
+        assertTrue(attributesStr.contains("COSINE"));
+        assertTrue(attributesStr.contains("42"));
+        assertTrue(attributesStr.contains("$.name"));
+        assertTrue(attributesStr.contains("TEXT"));
 
         // querying a missing index
         assertEquals(OK, FT.dropindex(client, index).get());
-        var exception = assertThrows(ExecutionException.class, () -> FT.info(client, index).get());
+        ExecutionException exception =
+                assertThrows(ExecutionException.class, () -> FT.info(client, index).get());
         assertInstanceOf(RequestException.class, exception.getCause());
-        assertTrue(exception.getMessage().contains("Index not found"));
+        assertTrue(exception.getMessage().contains("not found in database"));
     }
 
     @SneakyThrows
-    @Test
-    public void ft_aliasadd_aliasdel_aliasupdate_aliaslist() {
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @Disabled("ALIAS is currently unsupported")
+    public void ft_aliasadd_aliasdel_aliasupdate_aliaslist(BaseClient client) {
 
-        var alias1 = "alias1";
-        var alias2 = "a2";
-        var indexName = "{" + UUID.randomUUID() + "-index}";
+        String alias1 = "alias1";
+        String alias2 = "a2";
+        String indexName = "{" + UUID.randomUUID() + "-index}";
 
         // create some indices
         assertEquals(
@@ -688,17 +883,18 @@ public class VectorSearchTests {
 
         assertEquals(0, FT.aliaslist(client).get().size());
         assertEquals(OK, FT.aliasadd(client, alias1, indexName).get());
-        assertEquals(Map.of(gs(alias1), gs(indexName)), FT.aliaslist(client).get());
+        assertEquals(createMap(gs(alias1), gs(indexName)), FT.aliaslist(client).get());
 
         // error with adding the same alias to the same index
-        var exception =
+        ExecutionException exception =
                 assertThrows(ExecutionException.class, () -> FT.aliasadd(client, alias1, indexName).get());
         assertInstanceOf(RequestException.class, exception.getCause());
         assertTrue(exception.getMessage().contains("Alias already exists"));
 
         assertEquals(OK, FT.aliasupdate(client, alias2, indexName).get());
         assertEquals(
-                Map.of(gs(alias1), gs(indexName), gs(alias2), gs(indexName)), FT.aliaslist(client).get());
+                createMap(gs(alias1), gs(indexName), gs(alias2), gs(indexName)),
+                FT.aliaslist(client).get());
         assertEquals(OK, FT.aliasdel(client, alias2).get());
 
         // with GlideString:
@@ -721,11 +917,13 @@ public class VectorSearchTests {
     }
 
     @SneakyThrows
-    @Test
-    public void ft_explain() {
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @Disabled("EXPLAIN is not supported yet")
+    public void ft_explain(BaseClient client) {
 
         String indexName = UUID.randomUUID().toString();
-        createIndexHelper(indexName);
+        createIndexHelper(client, indexName);
 
         // search query containing numeric field.
         String query = "@price:[0 10]";
@@ -746,7 +944,7 @@ public class VectorSearchTests {
         assertEquals(OK, FT.dropindex(client, indexName).get());
 
         // missing index throws an error.
-        var exception =
+        ExecutionException exception =
                 assertThrows(
                         ExecutionException.class,
                         () -> FT.explain(client, UUID.randomUUID().toString(), "*").get());
@@ -755,11 +953,13 @@ public class VectorSearchTests {
     }
 
     @SneakyThrows
-    @Test
-    public void ft_explaincli() {
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @Disabled("EXPLAIN is currently unsupported")
+    public void ft_explaincli(BaseClient client) {
 
         String indexName = UUID.randomUUID().toString();
-        createIndexHelper(indexName);
+        createIndexHelper(client, indexName);
 
         // search query containing numeric field.
         String query = "@price:[0 10]";
@@ -793,7 +993,7 @@ public class VectorSearchTests {
         assertEquals(OK, FT.dropindex(client, indexName).get());
 
         // missing index throws an error.
-        var exception =
+        ExecutionException exception =
                 assertThrows(
                         ExecutionException.class,
                         () -> FT.explaincli(client, UUID.randomUUID().toString(), "*").get());
@@ -801,13 +1001,566 @@ public class VectorSearchTests {
         assertTrue(exception.getMessage().contains("Index not found"));
     }
 
-    private void createIndexHelper(String indexName) throws ExecutionException, InterruptedException {
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void ft_search_1_2_sortby(BaseClient client) {
+        String prefix = "{" + UUID.randomUUID() + "}:";
+        String index = prefix + "index";
+
+        assertEquals(
+                OK,
+                FT.create(
+                                client,
+                                index,
+                                new FieldInfo[] {
+                                    new FieldInfo("price", new NumericField(true)),
+                                    new FieldInfo("name", new TextField()),
+                                },
+                                FTCreateOptions.builder()
+                                        .dataType(DataType.HASH)
+                                        .prefixes(new String[] {prefix})
+                                        .build())
+                        .get());
+
+        client.hset(prefix + "1", createMap("price", "10", "name", "Aardvark")).get();
+        client.hset(prefix + "2", createMap("price", "20", "name", "Mango")).get();
+        client.hset(prefix + "3", createMap("price", "30", "name", "Zebra")).get();
+        Thread.sleep(DATA_PROCESSING_TIMEOUT);
+
+        // SORTBY price ASC
+        FTSearchOptions options =
+                FTSearchOptions.builder().sortBy("price", FTSearchOptions.SortOrder.ASC).build();
+        Object[] result = FT.search(client, index, "@price:[1 +inf]", options).get();
+        assertEquals(3L, result[0]);
+        @SuppressWarnings("unchecked")
+        Map<GlideString, Map<GlideString, GlideString>> docs =
+                (Map<GlideString, Map<GlideString, GlideString>>) result[1];
+        GlideString firstKey = docs.keySet().iterator().next();
+        assertEquals(gs("10"), docs.get(firstKey).get(gs("price")));
+
+        // SORTBY price DESC
+        options = FTSearchOptions.builder().sortBy("price", FTSearchOptions.SortOrder.DESC).build();
+        result = FT.search(client, index, "@price:[1 +inf]", options).get();
+        assertEquals(3L, result[0]);
+        docs = (Map<GlideString, Map<GlideString, GlideString>>) result[1];
+        // First result should have highest price (30)
+        firstKey = docs.keySet().iterator().next();
+        assertEquals(gs("30"), docs.get(firstKey).get(gs("price")));
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void ft_search_1_2_withsortkeys(BaseClient client) {
+        String prefix = "{" + UUID.randomUUID() + "}:";
+        String index = prefix + "index";
+
+        assertEquals(
+                OK,
+                FT.create(
+                                client,
+                                index,
+                                new FieldInfo[] {
+                                    new FieldInfo("price", new NumericField(true)),
+                                    new FieldInfo("name", new TextField()),
+                                },
+                                FTCreateOptions.builder()
+                                        .dataType(DataType.HASH)
+                                        .prefixes(new String[] {prefix})
+                                        .build())
+                        .get());
+
+        client.hset(prefix + "1", createMap("price", "10", "name", "Aardvark")).get();
+        client.hset(prefix + "2", createMap("price", "20", "name", "Mango")).get();
+        client.hset(prefix + "3", createMap("price", "30", "name", "Zebra")).get();
+        Thread.sleep(DATA_PROCESSING_TIMEOUT);
+
+        // WITHSORTKEYS — each doc value becomes [sortKey, fieldMap]
+        FTSearchOptions options =
+                FTSearchOptions.builder()
+                        .sortBy("price", FTSearchOptions.SortOrder.ASC)
+                        .withSortKeys()
+                        .build();
+        Object[] result = FT.search(client, index, "@price:[1 +inf]", options).get();
+        assertEquals(3L, result[0]);
+
+        // With WITHSORTKEYS the doc map values are Object[] { sortKey, fieldMap }
+        @SuppressWarnings("unchecked")
+        Map<GlideString, Object[]> docs = (Map<GlideString, Object[]>) result[1];
+        assertEquals(3, docs.size());
+
+        // Verify sort keys are in ascending order and field maps are accessible
+        int i = 0;
+        String[] expectedPrices = {"10", "20", "30"};
+        for (Map.Entry<GlideString, Object[]> entry : docs.entrySet()) {
+            Object[] pair = entry.getValue();
+            // pair[0] is the sort key (numeric sort keys are prefixed with #)
+            GlideString sortKey = (GlideString) pair[0];
+            assertTrue(sortKey.toString().contains(expectedPrices[i]));
+            // pair[1] is the field map
+            @SuppressWarnings("unchecked")
+            Map<GlideString, GlideString> fields = (Map<GlideString, GlideString>) pair[1];
+            assertEquals(gs(expectedPrices[i]), fields.get(gs("price")));
+            i++;
+        }
+
+        assertEquals(OK, FT.dropindex(client, index).get());
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void ft_search_1_2_text_query_flags(BaseClient client) {
+        String prefix = "{" + UUID.randomUUID() + "}:";
+        String index = prefix + "index";
+
+        assertEquals(
+                OK,
+                FT.create(
+                                client,
+                                index,
+                                new FieldInfo[] {
+                                    new FieldInfo("title", new TextField()),
+                                },
+                                FTCreateOptions.builder()
+                                        .dataType(DataType.HASH)
+                                        .prefixes(new String[] {prefix})
+                                        .build())
+                        .get());
+
+        client.hset(prefix + "1", createMap("title", "hello world")).get();
+        client.hset(prefix + "2", createMap("title", "hello there")).get();
+        client.hset(prefix + "3", createMap("title", "goodbye world")).get();
+        client.hset(prefix + "4", createMap("title", "world hello")).get();
+        Thread.sleep(DATA_PROCESSING_TIMEOUT);
+
+        // VERBATIM - no stemming
+        FTSearchOptions verbatimOptions = FTSearchOptions.builder().verbatim().build();
+        Object[] verbatimResult = FT.search(client, index, "hello", verbatimOptions).get();
+        assertEquals(3L, (Long) verbatimResult[0]); // hello world, hello there, world hello
+
+        // SLOP without INORDER
+        FTSearchOptions noInorderOptions = FTSearchOptions.builder().slop(1).build();
+        Object[] noInorderResult = FT.search(client, index, "hello world", noInorderOptions).get();
+        assertEquals(2L, (Long) noInorderResult[0]); // world hello, hello world
+
+        // SLOP with INORDER
+        FTSearchOptions inorderOptions = FTSearchOptions.builder().inorder().slop(1).build();
+        Object[] inorderResult = FT.search(client, index, "hello world", inorderOptions).get();
+        assertEquals(1L, (Long) inorderResult[0]); // hello world
+    }
+
+    /** Shard/consistency options are cluster-only concepts. */
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClusterClients")
+    public void ft_search_1_2_shard_consistency(BaseClient client) {
+        String prefix = "{" + UUID.randomUUID() + "}:";
+        String index = prefix + "index";
+
+        assertEquals(
+                OK,
+                FT.create(
+                                client,
+                                index,
+                                new FieldInfo[] {
+                                    new FieldInfo("tag", new TagField()), new FieldInfo("score", new NumericField()),
+                                },
+                                FTCreateOptions.builder()
+                                        .dataType(DataType.HASH)
+                                        .prefixes(new String[] {prefix})
+                                        .build())
+                        .get());
+
+        client.hset(prefix + "1", createMap("tag", "test", "score", "1")).get();
+        client.hset(prefix + "2", createMap("tag", "test", "score", "2")).get();
+        Thread.sleep(DATA_PROCESSING_TIMEOUT);
+
+        // SOMESHARDS + INCONSISTENT
+        FTSearchOptions options =
+                FTSearchOptions.builder()
+                        .shardScope(FTSearchOptions.ShardScope.SOMESHARDS)
+                        .consistency(FTSearchOptions.ConsistencyMode.INCONSISTENT)
+                        .build();
+        Object[] result = FT.search(client, index, "@tag:{test}", options).get();
+
+        // In a healthy cluster, SOMESHARDS still returns all results.
+        // This test verifies the option is accepted; partial results only occur with unavailable
+        // shards.
+        // If it ends up being flakey, relax the equality to a GEQ check
+        assertEquals(2L, (Long) result[0]);
+
+        // ALLSHARDS + CONSISTENT (defaults)
+        options =
+                FTSearchOptions.builder()
+                        .shardScope(FTSearchOptions.ShardScope.ALLSHARDS)
+                        .consistency(FTSearchOptions.ConsistencyMode.CONSISTENT)
+                        .build();
+        result = FT.search(client, index, "@tag:{test}", options).get();
+        assertEquals(2L, (Long) result[0]);
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void ft_aggregate_1_2_query_flags(BaseClient client) {
+        String prefix = "{" + UUID.randomUUID() + "}:";
+        String index = prefix + "index";
+
+        assertEquals(
+                OK,
+                FT.create(
+                                client,
+                                index,
+                                new FieldInfo[] {
+                                    new FieldInfo("score", new NumericField()),
+                                    new FieldInfo("title", new TextField()),
+                                },
+                                FTCreateOptions.builder()
+                                        .dataType(DataType.HASH)
+                                        .prefixes(new String[] {prefix})
+                                        .build())
+                        .get());
+
+        client.hset(prefix + "1", createMap("score", "10", "title", "hello world")).get();
+        client.hset(prefix + "2", createMap("score", "20", "title", "hello there")).get();
+        Thread.sleep(DATA_PROCESSING_TIMEOUT);
+
+        // VERBATIM - disables stemming on the query
+        FTAggregateOptions verbatimOptions = FTAggregateOptions.builder().verbatim().build();
+        Map<GlideString, Object>[] result =
+                FT.aggregate(client, index, "@score:[1 +inf]", verbatimOptions).get();
+        // Both docs match; no LOAD so each record is an empty map
+        assertEquals(2, result.length);
+        assertTrue(result[0].isEmpty());
+        assertTrue(result[1].isEmpty());
+
+        // INORDER + SLOP - proximity matching flags
+        FTAggregateOptions inorderOptions = FTAggregateOptions.builder().inorder().slop(1).build();
+        result = FT.aggregate(client, index, "@score:[1 +inf]", inorderOptions).get();
+        assertEquals(2, result.length);
+        assertTrue(result[0].isEmpty());
+        assertTrue(result[1].isEmpty());
+
+        // DIALECT
+        FTAggregateOptions dialectOptions = FTAggregateOptions.builder().dialect(2).build();
+        result = FT.aggregate(client, index, "@score:[1 +inf]", dialectOptions).get();
+        assertEquals(2, result.length);
+        assertTrue(result[0].isEmpty());
+        assertTrue(result[1].isEmpty());
+
+        // LOAD
+        FTAggregateOptions loadOptions = FTAggregateOptions.builder().loadAll().build();
+        result = FT.aggregate(client, index, "@score:[20 +inf]", loadOptions).get();
+        assertEquals(1, result.length);
+        assertFalse(result[0].isEmpty());
+        assertEquals(gs("hello there"), result[0].get(gs("title")));
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void ft_create_1_2_index_options(BaseClient client) {
+        String prefix = "{" + UUID.randomUUID() + "}:";
+        String index = prefix + "index";
+
+        // Test SCORE, LANGUAGE, SKIPINITIALSCAN are accepted by the server
+        assertEquals(
+                OK,
+                FT.create(
+                                client,
+                                index,
+                                new FieldInfo[] {new FieldInfo("title", new TextField())},
+                                FTCreateOptions.builder()
+                                        .dataType(DataType.HASH)
+                                        .prefixes(new String[] {prefix})
+                                        .score(1.0)
+                                        .language("english")
+                                        .skipInitialScan(true)
+                                        .build())
+                        .get());
+        assertEquals(OK, FT.dropindex(client, index).get());
+
+        // Test MINSTEMSIZE
+        assertEquals(
+                OK,
+                FT.create(
+                                client,
+                                index,
+                                new FieldInfo[] {new FieldInfo("title", new TextField())},
+                                FTCreateOptions.builder()
+                                        .dataType(DataType.HASH)
+                                        .prefixes(new String[] {prefix})
+                                        .minStemSize(6)
+                                        .build())
+                        .get());
+        client.hset(prefix + "1", createMap("title", "running")).get();
+        client.hset(prefix + "2", createMap("title", "plays")).get();
+        Thread.sleep(DATA_PROCESSING_TIMEOUT);
+
+        Object[] result = FT.search(client, index, "run").get();
+        assertEquals(1L, (Long) result[0]);
+
+        result = FT.search(client, index, "play").get();
+        assertEquals(0L, (Long) result[0]);
+        assertEquals(OK, FT.dropindex(client, index).get());
+
+        // Test NOSTOPWORDS
+        assertEquals(
+                OK,
+                FT.create(
+                                client,
+                                index,
+                                new FieldInfo[] {new FieldInfo("title", new TextField())},
+                                FTCreateOptions.builder()
+                                        .dataType(DataType.HASH)
+                                        .prefixes(new String[] {prefix})
+                                        .noStopWords(true)
+                                        .build())
+                        .get());
+        client.hset(prefix + "1", createMap("title", "the quick fox")).get();
+        assertEquals(1L, (Long) FT.search(client, index, "the").get()[0]);
+        assertEquals(OK, FT.dropindex(client, index).get());
+
+        // Test STOPWORDS
+        assertEquals(
+                OK,
+                FT.create(
+                                client,
+                                index,
+                                new FieldInfo[] {new FieldInfo("title", new TextField())},
+                                FTCreateOptions.builder()
+                                        .dataType(DataType.HASH)
+                                        .prefixes(new String[] {prefix})
+                                        .stopWords(new String[] {"fox", "an"})
+                                        .build())
+                        .get());
+        client.hset(prefix + "1", createMap("title", "the quick fox")).get();
+        assertEquals(1L, (Long) FT.search(client, index, "the").get()[0]);
+        assertEquals(1L, (Long) FT.search(client, index, "quick").get()[0]);
+
+        // RequestException: Filter epression 'fox' invalid query.
+        assertThrows(ExecutionException.class, () -> FT.search(client, index, "fox").get());
+        assertEquals(OK, FT.dropindex(client, index).get());
+
+        // Test NOOFFSETS
+        assertEquals(
+                OK,
+                FT.create(
+                                client,
+                                index,
+                                new FieldInfo[] {new FieldInfo("title", new TextField())},
+                                FTCreateOptions.builder()
+                                        .dataType(DataType.HASH)
+                                        .prefixes(new String[] {prefix})
+                                        .noOffsets(true)
+                                        .build())
+                        .get());
+        client.hset(prefix + "1", createMap("title", "hello")).get();
+        assertEquals(
+                1L, (Long) FT.search(client, index, "hello", FTSearchOptions.builder().build()).get()[0]);
+        assertThrows(
+                ExecutionException.class,
+                () -> FT.search(client, index, "hello", FTSearchOptions.builder().slop(1).build()).get());
+        assertEquals(OK, FT.dropindex(client, index).get());
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void ft_create_1_2_field_options(BaseClient client) {
+        String prefix = "{" + UUID.randomUUID() + "}:";
+        String index = prefix + "index";
+
+        // TextField with nostem, weight, sortable
+        assertEquals(
+                OK,
+                FT.create(
+                                client,
+                                index,
+                                new FieldInfo[] {
+                                    new FieldInfo(
+                                            "title",
+                                            new TextField(
+                                                    /* noStem= */ true,
+                                                    /* weight= */ 1.0,
+                                                    /* withSuffixTrie= */ false,
+                                                    /* noSuffixTrie= */ false,
+                                                    /* sortable= */ true)),
+                                    new FieldInfo("price", new NumericField(/* sortable= */ true)),
+                                    new FieldInfo("tag", new TagField(',', false, /* sortable= */ true)),
+                                },
+                                FTCreateOptions.builder()
+                                        .dataType(DataType.HASH)
+                                        .prefixes(new String[] {prefix})
+                                        .build())
+                        .get());
+
+        client.hset(prefix + "1", createMap("title", "hello", "price", "10", "tag", "a,b")).get();
+        Thread.sleep(DATA_PROCESSING_TIMEOUT);
+
+        // Verify index works with sortable fields
+        FTSearchOptions options =
+                FTSearchOptions.builder().sortBy("price", FTSearchOptions.SortOrder.ASC).build();
+        Object[] result = FT.search(client, index, "@price:[1 +inf]", options).get();
+        assertEquals(1L, (Long) result[0]);
+
+        // noStemming
+        result = FT.search(client, index, "hello").get();
+        assertEquals(1L, (Long) result[0]);
+        result = FT.search(client, index, "hellos").get();
+        assertEquals(0L, (Long) result[0]);
+
+        assertEquals(OK, FT.dropindex(client, index).get());
+
+        // TextField with withSuffixTrie
+        assertEquals(
+                OK,
+                FT.create(
+                                client,
+                                index,
+                                new FieldInfo[] {
+                                    new FieldInfo(
+                                            "title",
+                                            new TextField(
+                                                    /* noStem= */ false,
+                                                    /* weight= */ null,
+                                                    /* withSuffixTrie= */ true,
+                                                    /* noSuffixTrie= */ false,
+                                                    /* sortable= */ false)),
+                                },
+                                FTCreateOptions.builder()
+                                        .dataType(DataType.HASH)
+                                        .prefixes(new String[] {prefix})
+                                        .build())
+                        .get());
+        client.hset(prefix + "1", createMap("title", "hello world")).get();
+        Thread.sleep(DATA_PROCESSING_TIMEOUT);
+
+        // Suffix query - should work with suffix trie
+        result = FT.search(client, index, "*orld").get();
+        assertEquals(1L, (Long) result[0]);
+        assertEquals(OK, FT.dropindex(client, index).get());
+
+        // TextField with NOSUFFIXTRIE
+        assertEquals(
+                OK,
+                FT.create(
+                                client,
+                                index,
+                                new FieldInfo[] {
+                                    new FieldInfo(
+                                            "title",
+                                            new TextField(
+                                                    /* noStem= */ false,
+                                                    /* weight= */ null,
+                                                    /* withSuffixTrie= */ false,
+                                                    /* noSuffixTrie= */ true,
+                                                    /* sortable= */ false)),
+                                },
+                                FTCreateOptions.builder()
+                                        .dataType(DataType.HASH)
+                                        .prefixes(new String[] {prefix})
+                                        .build())
+                        .get());
+        client.hset(prefix + "1", createMap("title", "hello world")).get();
+        Thread.sleep(DATA_PROCESSING_TIMEOUT);
+
+        // Suffix query - should NOT work with NOSUFFIXTRIE
+        assertThrows(ExecutionException.class, () -> FT.search(client, index, "*orld").get());
+
+        assertEquals(OK, FT.dropindex(client, index).get());
+    }
+
+    /** FT.INFO with scope options is a cluster-only feature. */
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClusterClients")
+    public void ft_info_1_2_options(BaseClient client) {
+        String prefix = "{" + UUID.randomUUID() + "}:";
+        String index = prefix + "index";
+
+        assertEquals(
+                OK,
+                FT.create(
+                                client,
+                                index,
+                                new FieldInfo[] {new FieldInfo("title", new TextField())},
+                                FTCreateOptions.builder()
+                                        .dataType(DataType.HASH)
+                                        .prefixes(new String[] {prefix})
+                                        .build())
+                        .get());
+
+        client.hset(prefix + "1", createMap("title", "hello world")).get();
+        Thread.sleep(DATA_PROCESSING_TIMEOUT);
+
+        // LOCAL scope — returns detailed per-node info with fields, num_docs, etc.
+        Map<String, Object> localInfo =
+                FT.info(client, index, new FTInfoOptions(FTInfoOptions.InfoScope.LOCAL)).get();
+        assertEquals(gs(index), localInfo.get("index_name"));
+        assertTrue(localInfo.containsKey("num_docs"));
+
+        // LOCAL with ALLSHARDS + CONSISTENT — smoke test that these flags are accepted
+        Map<String, Object> localWithFlags =
+                FT.info(
+                                client,
+                                index,
+                                new FTInfoOptions(
+                                        FTInfoOptions.InfoScope.LOCAL,
+                                        FTInfoOptions.ShardScope.ALLSHARDS,
+                                        FTInfoOptions.ConsistencyMode.CONSISTENT))
+                        .get();
+        assertEquals(gs(index), localWithFlags.get("index_name"));
+
+        // LOCAL with SOMESHARDS + INCONSISTENT — smoke test
+        Map<String, Object> localWithAltFlags =
+                FT.info(
+                                client,
+                                index,
+                                new FTInfoOptions(
+                                        FTInfoOptions.InfoScope.LOCAL,
+                                        FTInfoOptions.ShardScope.SOMESHARDS,
+                                        FTInfoOptions.ConsistencyMode.INCONSISTENT))
+                        .get();
+        assertEquals(gs(index), localWithAltFlags.get("index_name"));
+
+        // PRIMARY and CLUSTER scopes require the coordinator to be enabled
+        // (use-coordinator module arg). If available, verify the response shape;
+        // otherwise, verify the server rejects with the expected error.
+        try {
+            Map<String, Object> primaryInfo =
+                    FT.info(client, index, new FTInfoOptions(FTInfoOptions.InfoScope.PRIMARY)).get();
+            assertEquals(gs(index), primaryInfo.get("index_name"));
+            assertEquals(gs("PRIMARY"), primaryInfo.get("mode"));
+        } catch (ExecutionException e) {
+            assertInstanceOf(RequestException.class, e.getCause());
+            assertTrue(e.getMessage().contains("PRIMARY option is not valid"));
+        }
+
+        try {
+            Map<String, Object> clusterInfo =
+                    FT.info(client, index, new FTInfoOptions(FTInfoOptions.InfoScope.CLUSTER)).get();
+            assertEquals(gs(index), clusterInfo.get("index_name"));
+            assertEquals(gs("CLUSTER"), clusterInfo.get("mode"));
+        } catch (ExecutionException e) {
+            assertInstanceOf(RequestException.class, e.getCause());
+            assertTrue(e.getMessage().contains("CLUSTER option is not valid"));
+        }
+
+        assertEquals(OK, FT.dropindex(client, index).get());
+    }
+
+    private void createIndexHelper(BaseClient client, String indexName)
+            throws ExecutionException, InterruptedException {
         FieldInfo numericField = new FieldInfo("price", new NumericField());
         FieldInfo textField = new FieldInfo("title", new TextField());
 
         FieldInfo[] fields = new FieldInfo[] {numericField, textField};
 
-        String prefix = "{hash-search-" + UUID.randomUUID().toString() + "}:";
+        // Prefix must not contain a hash tag when the index name is not hash-tagged.
+        String prefix = "hash-search-" + UUID.randomUUID().toString() + ":";
 
         assertEquals(
                 OK,

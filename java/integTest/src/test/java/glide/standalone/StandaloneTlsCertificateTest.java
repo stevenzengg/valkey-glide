@@ -1,6 +1,8 @@
 /** Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0 */
 package glide.standalone;
 
+import static glide.Constants.IP_ADDRESS_V4;
+import static glide.Constants.IP_ADDRESS_V6;
 import static glide.TestUtilities.getCaCertificate;
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -25,6 +27,8 @@ import java.security.cert.CertificateFactory;
 import java.util.concurrent.ExecutionException;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 public class StandaloneTlsCertificateTest {
 
@@ -59,8 +63,7 @@ public class StandaloneTlsCertificateTest {
                 TestUtilities.createStandaloneConfigWithRootCert(caCert, nodeAddr);
 
         try (GlideClient client = GlideClient.createClient(config).get()) {
-            String result = client.ping().get();
-            assertEquals("PONG", result);
+            TestUtilities.assertConnected(client);
         }
     }
 
@@ -74,8 +77,7 @@ public class StandaloneTlsCertificateTest {
                 TestUtilities.createStandaloneConfigWithRootCert(certBundle, nodeAddr);
 
         try (GlideClient client = GlideClient.createClient(config).get()) {
-            String result = client.ping().get();
-            assertEquals("PONG", result);
+            TestUtilities.assertConnected(client);
         }
     }
 
@@ -104,6 +106,20 @@ public class StandaloneTlsCertificateTest {
                 () -> {
                     GlideClient.createClient(config).get();
                 });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {IP_ADDRESS_V4, IP_ADDRESS_V6})
+    void testStandaloneTlsWithIpAddressSucceeds(String ipAddress)
+            throws ExecutionException, InterruptedException {
+        Integer port = nodeAddr.getPort();
+        NodeAddress address = NodeAddress.builder().host(ipAddress).port(port).build();
+        GlideClientConfiguration config =
+                TestUtilities.createStandaloneConfigWithRootCert(caCert, address);
+
+        try (GlideClient client = GlideClient.createClient(config).get()) {
+            TestUtilities.assertConnected(client);
+        }
     }
 
     @Test
@@ -144,8 +160,7 @@ public class StandaloneTlsCertificateTest {
             ;
 
             try (GlideClient client = GlideClient.createClient(config).get()) {
-                String result = client.ping().get();
-                assertEquals("PONG", result);
+                TestUtilities.assertConnected(client);
             }
         } finally {
             Files.deleteIfExists(keyStorePath);

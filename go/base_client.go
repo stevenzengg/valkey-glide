@@ -20,6 +20,10 @@ package glide
 //                     const uint8_t *message, int64_t message_len,
 //                     const uint8_t *channel, int64_t channel_len,
 //                     const uint8_t *pattern, int64_t pattern_len);
+// uint16_t addressResolverCallback(uintptr_t client_id, const uint8_t *host, uintptr_t host_len,
+//                                  uint16_t port,
+//                                  uint8_t *resolved_host_buf, uintptr_t resolved_host_buf_len,
+//                                  uintptr_t *resolved_host_len);
 import "C"
 
 import (
@@ -29,6 +33,7 @@ import (
 	"math"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -44,6 +49,8 @@ import (
 
 const OK = "OK"
 
+var clientIDCounter atomic.Uintptr
+
 type payload struct {
 	value *C.struct_CommandResponse
 	error error
@@ -51,6 +58,7 @@ type payload struct {
 
 type clientConfiguration interface {
 	ToProtobuf() (*protobuf.ConnectionRequest, error)
+	GetAddressResolver() config.AddressResolver
 }
 
 type baseClient struct {
@@ -58,6 +66,7 @@ type baseClient struct {
 	coreClient     unsafe.Pointer
 	mu             *sync.Mutex
 	messageHandler *MessageHandler
+	resolverID     uintptr
 }
 
 // setMessageHandler assigns a message handler to the client for processing pub/sub messages
@@ -71,12 +80,11 @@ func (client *baseClient) getMessageHandler() *MessageHandler {
 }
 
 // GetQueue returns the pub/sub queue for the client.
-// This method is only available for clients that have a subscription,
-// and returns an error if the client does not have a subscription.
+// GetQueue returns the pub/sub queue for the client.
+// Returns an error if the client is configured with a callback.
 func (client *baseClient) GetQueue() (*PubSubMessageQueue, error) {
-	// MessageHandler is only configured when a subscription is defined
-	if client.getMessageHandler() == nil {
-		return nil, errors.New("no subscriptions configured for this client")
+	if client.getMessageHandler().callback != nil {
+		return nil, errors.New("cannot get queue for callback-only client")
 	}
 	return client.getMessageHandler().GetQueue(), nil
 }
@@ -134,8 +142,8 @@ func buildAsyncClientType(successCb C.SuccessCallback, failureCb C.FailureCallba
 // Passes the pointers to callback functions which will be invoked when the command succeeds or fails.
 // Once the connection is established, this function invokes `free_connection_response` exposed by rust library to free the
 // connection_response to avoid any memory leaks.
-func createClient(config clientConfiguration) (*baseClient, error) {
-	request, err := config.ToProtobuf()
+func createClient(cfg clientConfiguration) (*baseClient, error) {
+	request, err := cfg.ToProtobuf()
 	if err != nil {
 		return nil, err
 	}
@@ -149,30 +157,48 @@ func createClient(config clientConfiguration) (*baseClient, error) {
 	defer C.free(requestBytes)
 
 	clientType, err := buildAsyncClientType(
-		(C.SuccessCallback)(unsafe.Pointer(C.successCallback)),
-		(C.FailureCallback)(unsafe.Pointer(C.failureCallback)),
+		C.SuccessCallback(unsafe.Pointer(C.successCallback)),
+		C.FailureCallback(unsafe.Pointer(C.failureCallback)),
 	)
 	if err != nil {
 		return nil, NewClosingError(err.Error())
 	}
 	client := &baseClient{pending: make(map[unsafe.Pointer]struct{}), mu: &sync.Mutex{}}
 
+	// Determine resolver callback and client ID
+	var resolverCallback C.AddressResolverCallback
+	var clientID uintptr
+	if cfgWithResolver, ok := cfg.(interface{ GetAddressResolver() config.AddressResolver }); ok {
+		if resolver := cfgWithResolver.GetAddressResolver(); resolver != nil {
+			clientID = uintptr(clientIDCounter.Add(1))
+			registerResolver(clientID, resolver)
+			resolverCallback = C.AddressResolverCallback(unsafe.Pointer(C.addressResolverCallback))
+		}
+	}
+
 	cResponse := (*C.struct_ConnectionResponse)(
 		C.create_client(
 			(*C.uchar)(requestBytes),
 			C.uintptr_t(byteCount),
 			&clientType,
-			(C.PubSubCallback)(unsafe.Pointer(C.pubSubCallback)),
+			C.PubSubCallback(unsafe.Pointer(C.pubSubCallback)),
+			resolverCallback,
+			C.uintptr_t(clientID),
 		),
 	)
+
 	defer C.free_connection_response(cResponse)
 	cErr := cResponse.connection_error_message
 	if cErr != nil {
 		message := C.GoString(cErr)
+		if clientID != 0 {
+			unregisterResolver(clientID)
+		}
 		return nil, NewConnectionError(message)
 	}
 
 	client.coreClient = cResponse.conn_ptr
+	client.resolverID = clientID
 
 	// Register the client in our registry using the pointer value from C
 	registerClient(client, uintptr(cResponse.conn_ptr))
@@ -193,6 +219,11 @@ func (client *baseClient) Close() {
 
 	C.close_client(client.coreClient)
 	client.coreClient = nil
+
+	if client.resolverID != 0 {
+		unregisterResolver(client.resolverID)
+		client.resolverID = 0
+	}
 
 	// iterating the channel map while holding the lock guarantees those unsafe.Pointers is still valid
 	// because holding the lock guarantees the owner of the unsafe.Pointer hasn't exit.
@@ -294,14 +325,7 @@ func (client *baseClient) executeCommandWithRoute(
 	var spanPtr uint64
 	otelInstance := GetOtelInstance()
 	if otelInstance != nil && otelInstance.shouldSample() {
-		// Check if there's a parent span in the context
-		if parentSpanPtr := otelInstance.extractSpanPointer(ctx); parentSpanPtr != 0 {
-			// Create child span with parent
-			spanPtr = otelInstance.createSpanWithParent(requestType, parentSpanPtr)
-		} else {
-			// Create independent span (current behavior)
-			spanPtr = otelInstance.createSpan(requestType)
-		}
+		spanPtr = otelInstance.createCommandSpanForContext(ctx, requestType)
 		defer otelInstance.dropSpan(spanPtr)
 	}
 	var cArgsPtr *C.uintptr_t = nil
@@ -424,16 +448,7 @@ func (client *baseClient) executeBatch(
 	var spanPtr uint64
 	otelInstance := GetOtelInstance()
 	if otelInstance != nil && otelInstance.shouldSample() {
-		// Check if there's a parent span in the context
-		if parentSpanPtr := otelInstance.extractSpanPointer(ctx); parentSpanPtr != 0 {
-			// Create child batch span with parent
-			// Since we don't have create_batch_otel_span_with_parent, we create a named child span
-			// using the parent span pointer to establish the parent-child relationship
-			spanPtr = otelInstance.createBatchSpanWithParent(parentSpanPtr)
-		} else {
-			// Create independent batch span
-			spanPtr = otelInstance.createBatchSpan()
-		}
+		spanPtr = otelInstance.createBatchSpanForContext(ctx)
 		defer otelInstance.dropSpan(spanPtr)
 	}
 
@@ -539,12 +554,12 @@ func createRouteInfo(pinner pinner, route config.Route) *C.RouteInfo {
 		routeInfo := C.RouteInfo{}
 		switch r := route.(type) {
 		case config.SimpleSingleNodeRoute:
-			routeInfo.route_type = (uint32)(r)
+			routeInfo.route_type = uint32(r)
 		case config.SimpleMultiNodeRoute:
-			routeInfo.route_type = (uint32)(r)
+			routeInfo.route_type = uint32(r)
 		case config.SimpleNodeRoute:
 			// enum variants have the same ordinals
-			routeInfo.route_type = (uint32)(r)
+			routeInfo.route_type = uint32(r)
 		case *config.SlotIdRoute:
 			routeInfo.route_type = C.SlotId
 			routeInfo.slot_id = C.int(r.SlotID)
@@ -596,7 +611,7 @@ func createCmdInfo(pinner pinner, cmd internal.Cmd) C.CmdInfo {
 	for i, str := range cmd.Args {
 		// TODO do we need to pin there too?
 		// cArgsPtr[i] = (*C.uchar)(pinner.Pin(unsafe.Pointer(unsafe.StringData((str)))))
-		cArgsPtr[i] = (*C.uchar)(unsafe.Pointer(unsafe.StringData((str))))
+		cArgsPtr[i] = (*C.uchar)(unsafe.Pointer(unsafe.StringData(str)))
 		argLengthsPtr[i] = C.size_t(len(str))
 	}
 	info.arg_count = C.ulong(numArgs)
@@ -855,6 +870,317 @@ func (client *baseClient) submitRefreshIamToken(ctx context.Context) (string, er
 // See also: [IamAuthConfig], [ServerCredentials], [NewServerCredentialsWithIam]
 func (client *baseClient) RefreshIamToken(ctx context.Context) (string, error) {
 	return client.submitRefreshIamToken(ctx)
+}
+
+// submitGetCacheMetrics is the internal implementation for retrieving cache metrics.
+//
+// This method sends a cache metrics request to the core client to get the specified
+// metric value. It handles context cancellation and manages the asynchronous communication
+// with the underlying C client.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution and cancellation.
+//	metricsType - The type of metrics to retrieve using protobuf.CacheMetricsType.
+//
+// Return value:
+//
+//	Returns the requested metric value, or an error if the operation fails.
+//
+// Note: This is an internal method. Use the specific cache metrics methods for the public API.
+func (client *baseClient) submitGetCacheMetrics(
+	ctx context.Context,
+	metricsType protobuf.CacheMetricsType,
+) (*C.struct_CommandResponse, error) {
+	// Check if context is already done
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+		// Continue with execution
+	}
+
+	// Create a channel to receive the result
+	resultChannel := make(chan payload, 1)
+	resultChannelPtr := unsafe.Pointer(&resultChannel)
+
+	pinner := pinner{}
+	pinnedChannelPtr := uintptr(pinner.Pin(resultChannelPtr))
+	defer pinner.Unpin()
+
+	client.mu.Lock()
+	if client.coreClient == nil {
+		client.mu.Unlock()
+		return nil, NewClosingError("GetCacheMetrics failed. The client is closed.")
+	}
+	client.pending[resultChannelPtr] = struct{}{}
+
+	C.get_cache_metrics(
+		client.coreClient,
+		C.uintptr_t(pinnedChannelPtr),
+		C.int(metricsType),
+	)
+	client.mu.Unlock()
+
+	// Wait for result or context cancellation
+	var payload payload
+	select {
+	case <-ctx.Done():
+		client.mu.Lock()
+		if client.pending != nil {
+			delete(client.pending, resultChannelPtr)
+		}
+		client.mu.Unlock()
+		// Start cleanup goroutine
+		go func() {
+			// Wait for payload on separate channel
+			if payload := <-resultChannel; payload.value != nil {
+				C.free_command_response(payload.value)
+			}
+		}()
+		return nil, ctx.Err()
+	case payload = <-resultChannel:
+		// Continue with normal processing
+	}
+
+	client.mu.Lock()
+	if client.pending != nil {
+		delete(client.pending, resultChannelPtr)
+	}
+	client.mu.Unlock()
+
+	if payload.error != nil {
+		return nil, payload.error
+	}
+
+	return payload.value, nil
+}
+
+// GetCacheHitRate returns the cache hit rate as a percentage (0.0 to 1.0).
+//
+// This method retrieves the ratio of cache hits to total cache requests.
+// A higher hit rate indicates better cache performance.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution and cancellation.
+//
+// Return value:
+//
+//	Returns the cache hit rate as a float64 (0.0 to 1.0).
+//
+// Errors:
+//
+//	Returns an error if:
+//	  - Client-side caching is not enabled
+//	  - Metrics collection is disabled
+//	  - The context is cancelled
+//	  - The client is closed
+//
+// Example:
+//
+//	hitRate, err := client.GetCacheHitRate(context.Background())
+//	if err != nil {
+//	    log.Printf("Failed to get cache hit rate: %v", err)
+//	    return
+//	}
+//	log.Printf("Cache hit rate: %.2f%%", hitRate*100)
+func (client *baseClient) GetCacheHitRate(ctx context.Context) (float64, error) {
+	result, err := client.submitGetCacheMetrics(ctx, protobuf.CacheMetricsType_HitRate)
+	if err != nil {
+		return 0.0, err
+	}
+
+	return handleFloatResponse(result)
+}
+
+// GetCacheMissRate returns the cache miss rate as a percentage (0.0 to 1.0).
+//
+// This method retrieves the ratio of cache misses to total cache requests.
+// A lower miss rate indicates better cache performance.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution and cancellation.
+//
+// Return value:
+//
+//	Returns the cache miss rate as a float64 (0.0 to 1.0).
+//
+// Errors:
+//
+//	Returns an error if:
+//	  - Client-side caching is not enabled
+//	  - Metrics collection is disabled
+//	  - The context is cancelled
+//	  - The client is closed
+//
+// Example:
+//
+//	missRate, err := client.GetCacheMissRate(context.Background())
+//	if err != nil {
+//	    log.Printf("Failed to get cache miss rate: %v", err)
+//	    return
+//	}
+//	log.Printf("Cache miss rate: %.2f%%", missRate*100)
+func (client *baseClient) GetCacheMissRate(ctx context.Context) (float64, error) {
+	result, err := client.submitGetCacheMetrics(ctx, protobuf.CacheMetricsType_MissRate)
+	if err != nil {
+		return 0.0, err
+	}
+
+	return handleFloatResponse(result)
+}
+
+// GetCacheEntryCount returns the current number of entries in the cache.
+//
+// This method retrieves the total count of cached entries currently stored
+// in the client-side cache.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution and cancellation.
+//
+// Return value:
+//
+//	Returns the number of cache entries as an int64.
+//
+// Errors:
+//
+//	Returns an error if:
+//	  - Client-side caching is not enabled
+//	  - The context is cancelled
+//	  - The client is closed
+//
+// Example:
+//
+//	entryCount, err := client.GetCacheEntryCount(context.Background())
+//	if err != nil {
+//	    log.Printf("Failed to get cache entry count: %v", err)
+//	    return
+//	}
+//	log.Printf("Cache contains %d entries", entryCount)
+func (client *baseClient) GetCacheEntryCount(ctx context.Context) (int64, error) {
+	result, err := client.submitGetCacheMetrics(ctx, protobuf.CacheMetricsType_EntryCount)
+	if err != nil {
+		return 0, err
+	}
+
+	return handleIntResponse(result)
+}
+
+// GetCacheEvictions returns the total number of cache evictions.
+//
+// This method retrieves the count of entries that have been evicted from
+// the cache due to memory pressure or eviction policy enforcement.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution and cancellation.
+//
+// Return value:
+//
+//	Returns the number of cache evictions as an int64.
+//
+// Errors:
+//
+//	Returns an error if:
+//	  - Client-side caching is not enabled
+//	  - Metrics collection is disabled
+//	  - The context is cancelled
+//	  - The client is closed
+//
+// Example:
+//
+//	evictions, err := client.GetCacheEvictions(context.Background())
+//	if err != nil {
+//	    log.Printf("Failed to get cache evictions: %v", err)
+//	    return
+//	}
+//	log.Printf("Cache has evicted %d entries", evictions)
+func (client *baseClient) GetCacheEvictions(ctx context.Context) (int64, error) {
+	result, err := client.submitGetCacheMetrics(ctx, protobuf.CacheMetricsType_Evictions)
+	if err != nil {
+		return 0, err
+	}
+
+	return handleIntResponse(result)
+}
+
+// GetCacheExpirations returns the total number of cache expirations.
+//
+// This method retrieves the count of entries that have expired from
+// the cache due to TTL (Time-To-Live) expiration.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution and cancellation.
+//
+// Return value:
+//
+//	Returns the number of cache expirations as an int64.
+//
+// Errors:
+//
+//	Returns an error if:
+//	  - Client-side caching is not enabled
+//	  - Metrics collection is disabled
+//	  - The context is cancelled
+//	  - The client is closed
+//
+// Example:
+//
+//	expirations, err := client.GetCacheExpirations(context.Background())
+//	if err != nil {
+//	    log.Printf("Failed to get cache expirations: %v", err)
+//	    return
+//	}
+//	log.Printf("Cache has expired %d entries", expirations)
+func (client *baseClient) GetCacheExpirations(ctx context.Context) (int64, error) {
+	result, err := client.submitGetCacheMetrics(ctx, protobuf.CacheMetricsType_Expirations)
+	if err != nil {
+		return 0, err
+	}
+
+	return handleIntResponse(result)
+}
+
+// GetCacheTotalLookups returns the total number of cache lookups (hits + misses).
+//
+// This method retrieves the sum of cache hits and misses, representing the
+// total number of cache lookup operations performed.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution and cancellation.
+//
+// Return value:
+//
+//	Returns the total number of cache lookups as an int64.
+//
+// Errors:
+//
+//	Returns an error if:
+//	  - Client-side caching is not enabled
+//	  - Metrics collection is disabled
+//	  - The context is cancelled
+//	  - The client is closed
+//
+// Example:
+//
+//	totalLookups, err := client.GetCacheTotalLookups(context.Background())
+//	if err != nil {
+//	    log.Printf("Failed to get total cache lookups: %v", err)
+//	    return
+//	}
+//	log.Printf("Total cache lookups: %d", totalLookups)
+func (client *baseClient) GetCacheTotalLookups(ctx context.Context) (int64, error) {
+	result, err := client.submitGetCacheMetrics(ctx, protobuf.CacheMetricsType_TotalLookups)
+	if err != nil {
+		return 0, err
+	}
+
+	return handleIntResponse(result)
 }
 
 // Set the given key with the given value. The return value is a response from Valkey containing the string "OK".
@@ -1193,7 +1519,8 @@ func (client *baseClient) IncrBy(ctx context.Context, key string, amount int64) 
 //
 // [valkey.io]: https://valkey.io/commands/incrbyfloat/
 func (client *baseClient) IncrByFloat(ctx context.Context, key string, amount float64) (float64, error) {
-	result, err := client.executeCommand(ctx,
+	result, err := client.executeCommand(
+		ctx,
 		C.IncrByFloat,
 		[]string{key, utils.FloatToString(amount)},
 	)
@@ -2633,7 +2960,8 @@ func (client *baseClient) LPosCountWithOptions(
 	if err != nil {
 		return nil, err
 	}
-	result, err := client.executeCommand(ctx,
+	result, err := client.executeCommand(
+		ctx,
 		C.LPos,
 		append([]string{key, element, constants.CountKeyword, utils.IntToString(count)}, optionArgs...),
 	)
@@ -3473,7 +3801,8 @@ func (client *baseClient) LInsert(
 		return models.DefaultIntResponse, err
 	}
 
-	result, err := client.executeCommand(ctx,
+	result, err := client.executeCommand(
+		ctx,
 		C.LInsert,
 		[]string{key, insertPositionStr, pivot, element},
 	)
@@ -3507,7 +3836,7 @@ func (client *baseClient) LInsert(
 //	If no element could be popped and the timeout expired, returns `nil`.
 //
 // [valkey.io]: https://valkey.io/commands/blpop/
-// [Blocking Commands]: https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands
+// [Blocking Commands]: https://glide.valkey.io/how-to/connection-management/#blocking-commands
 func (client *baseClient) BLPop(ctx context.Context, keys []string, timeout time.Duration) ([]string, error) {
 	result, err := client.executeCommand(ctx, C.BLPop, append(keys, utils.FloatToString(timeout.Seconds())))
 	if err != nil {
@@ -3540,7 +3869,7 @@ func (client *baseClient) BLPop(ctx context.Context, keys []string, timeout time
 //	If no element could be popped and the timeout expired, returns `nil`.
 //
 // [valkey.io]: https://valkey.io/commands/brpop/
-// [Blocking Commands]: https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands
+// [Blocking Commands]: https://glide.valkey.io/how-to/connection-management/#blocking-commands
 func (client *baseClient) BRPop(ctx context.Context, keys []string, timeout time.Duration) ([]string, error) {
 	result, err := client.executeCommand(ctx, C.BRPop, append(keys, utils.FloatToString(timeout.Seconds())))
 	if err != nil {
@@ -3732,7 +4061,7 @@ func (client *baseClient) LMPopCount(
 //	If no member could be popped and the timeout expired, returns `nil`.
 //
 // [valkey.io]: https://valkey.io/commands/blmpop/
-// [Blocking Commands]: https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands
+// [Blocking Commands]: https://glide.valkey.io/how-to/connection-management/#blocking-commands
 func (client *baseClient) BLMPop(
 	ctx context.Context,
 	keys []string,
@@ -3791,7 +4120,7 @@ func (client *baseClient) BLMPop(
 //	If no member could be popped and the timeout expired, returns `nil`.
 //
 // [valkey.io]: https://valkey.io/commands/blmpop/
-// [Blocking Commands]: https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands
+// [Blocking Commands]: https://glide.valkey.io/how-to/connection-management/#blocking-commands
 func (client *baseClient) BLMPopCount(
 	ctx context.Context,
 	keys []string,
@@ -3922,7 +4251,7 @@ func (client *baseClient) LMove(
 //	the operation timed-out.
 //
 // [valkey.io]: https://valkey.io/commands/blmove/
-// [Blocking Commands]: https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands
+// [Blocking Commands]: https://glide.valkey.io/how-to/connection-management/#blocking-commands
 func (client *baseClient) BLMove(
 	ctx context.Context,
 	source string,
@@ -3940,7 +4269,8 @@ func (client *baseClient) BLMove(
 		return models.CreateNilStringResult(), err
 	}
 
-	result, err := client.executeCommand(ctx,
+	result, err := client.executeCommand(
+		ctx,
 		C.BLMove,
 		[]string{source, destination, whereFromStr, whereToStr, utils.FloatToString(timeout.Seconds())},
 	)
@@ -4152,7 +4482,8 @@ func (client *baseClient) ExpireAtWithOptions(
 	if err != nil {
 		return models.DefaultBoolResponse, err
 	}
-	result, err := client.executeCommand(ctx,
+	result, err := client.executeCommand(
+		ctx,
 		C.ExpireAt,
 		[]string{key, utils.IntToString(expireTime.Unix()), expireConditionStr},
 	)
@@ -4289,7 +4620,8 @@ func (client *baseClient) PExpireAtWithOptions(
 	if err != nil {
 		return models.DefaultBoolResponse, err
 	}
-	result, err := client.executeCommand(ctx,
+	result, err := client.executeCommand(
+		ctx,
 		C.PExpireAt,
 		[]string{key, utils.IntToString(expireTime.UnixMilli()), expireConditionStr},
 	)
@@ -4843,7 +5175,8 @@ func (client *baseClient) ZAdd(
 	key string,
 	membersScoreMap map[string]float64,
 ) (int64, error) {
-	result, err := client.executeCommand(ctx,
+	result, err := client.executeCommand(
+		ctx,
 		C.ZAdd,
 		append([]string{key}, utils.ConvertMapToValueKeyStringArray(membersScoreMap)...),
 	)
@@ -4881,7 +5214,8 @@ func (client *baseClient) ZAddWithOptions(
 		return models.DefaultIntResponse, err
 	}
 	commandArgs := append([]string{key}, optionArgs...)
-	result, err := client.executeCommand(ctx,
+	result, err := client.executeCommand(
+		ctx,
 		C.ZAdd,
 		append(commandArgs, utils.ConvertMapToValueKeyStringArray(membersScoreMap)...),
 	)
@@ -5209,7 +5543,7 @@ func (client *baseClient) ZCard(ctx context.Context, key string) (int64, error) 
 //
 // [valkey.io]: https://valkey.io/commands/bzpopmin/
 //
-// [Blocking commands]: https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands
+// [Blocking commands]: https://glide.valkey.io/how-to/connection-management/#blocking-commands
 func (client *baseClient) BZPopMin(
 	ctx context.Context,
 	keys []string,
@@ -5254,7 +5588,7 @@ func (client *baseClient) BZPopMin(
 //	Returns `nil` if no member could be popped and the timeout expired.
 //
 // [valkey.io]: https://valkey.io/commands/bzmpop/
-// [Blocking Commands]: https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands
+// [Blocking Commands]: https://glide.valkey.io/how-to/connection-management/#blocking-commands
 func (client *baseClient) BZMPop(
 	ctx context.Context,
 	keys []string,
@@ -5317,7 +5651,7 @@ func (client *baseClient) BZMPop(
 //	Returns `nil` if no member could be popped and the timeout expired.
 //
 // [valkey.io]: https://valkey.io/commands/bzmpop/
-// [Blocking Commands]: https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands
+// [Blocking Commands]: https://glide.valkey.io/how-to/connection-management/#blocking-commands
 func (client *baseClient) BZMPopWithOptions(
 	ctx context.Context,
 	keys []string,
@@ -7356,6 +7690,87 @@ func (client *baseClient) CopyWithOptions(
 	return handleBoolResponse(result)
 }
 
+// Transfers keys from the current Valkey instance to a destination Valkey instance.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	ctx           - The context for controlling the command execution.
+//	host          - The host of the destination Valkey instance.
+//	port          - The port of the destination Valkey instance.
+//	keys          - The keys to migrate. Must not be empty.
+//	destinationDB - The database index on the destination instance.
+//	timeout       - The maximum idle time in milliseconds for the bulk-transfer.
+//
+// Return value:
+//
+//	"OK" on success, or "NOKEY" if none of the keys exist.
+//
+// [valkey.io]: https://valkey.io/commands/migrate/
+func (client *baseClient) Migrate(
+	ctx context.Context,
+	host string,
+	port int64,
+	keys []string,
+	destinationDB int64,
+	timeout int64,
+) (string, error) {
+	return client.MigrateWithOptions(ctx, host, port, keys, destinationDB, timeout, options.MigrateOptions{})
+}
+
+// Transfers keys from the current Valkey instance to a destination Valkey instance with options.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	ctx            - The context for controlling the command execution.
+//	host           - The host of the destination Valkey instance.
+//	port           - The port of the destination Valkey instance.
+//	keys           - The keys to migrate. Must not be empty.
+//	destinationDB  - The database index on the destination instance.
+//	timeout        - The maximum idle time in milliseconds for the bulk-transfer.
+//	migrateOptions - Additional options (COPY, REPLACE, AUTH, AUTH2).
+//
+// Return value:
+//
+//	"OK" on success, or "NOKEY" if none of the keys exist.
+//
+// [valkey.io]: https://valkey.io/commands/migrate/
+func (client *baseClient) MigrateWithOptions(
+	ctx context.Context,
+	host string,
+	port int64,
+	keys []string,
+	destinationDB int64,
+	timeout int64,
+	migrateOptions options.MigrateOptions,
+) (string, error) {
+	if len(keys) == 0 {
+		return models.DefaultStringResponse, errors.New("keys must not be empty")
+	}
+	optionArgs, err := migrateOptions.ToArgs()
+	if err != nil {
+		return models.DefaultStringResponse, err
+	}
+	var args []string
+	if len(keys) == 1 {
+		args = []string{host, utils.IntToString(port), keys[0], utils.IntToString(destinationDB), utils.IntToString(timeout)}
+		args = append(args, optionArgs...)
+	} else {
+		args = []string{host, utils.IntToString(port), "", utils.IntToString(destinationDB), utils.IntToString(timeout)}
+		args = append(args, optionArgs...)
+		args = append(args, constants.KeysKeyword)
+		args = append(args, keys...)
+	}
+	result, err := client.executeCommand(ctx, C.Migrate, args)
+	if err != nil {
+		return models.DefaultStringResponse, err
+	}
+	return handleOkOrStringResponse(result)
+}
+
 // Returns stream entries matching a given range of IDs.
 //
 // See [valkey.io] for details.
@@ -7987,7 +8402,8 @@ func (client *baseClient) ZDiffWithScores(ctx context.Context, keys []string) ([
 //
 // [valkey.io]: https://valkey.io/commands/zdiffstore/
 func (client *baseClient) ZDiffStore(ctx context.Context, destination string, keys []string) (int64, error) {
-	result, err := client.executeCommand(ctx,
+	result, err := client.executeCommand(
+		ctx,
 		C.ZDiffStore,
 		append([]string{destination, strconv.Itoa(len(keys))}, keys...),
 	)
@@ -8280,7 +8696,7 @@ func (client *baseClient) ZLexCount(ctx context.Context, key string, rangeQuery 
 //	returns `nil`.
 //
 // [valkey.io]: https://valkey.io/commands/bzpopmax/
-// [Blocking Commands]: https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands
+// [Blocking Commands]: https://glide.valkey.io/how-to/connection-management/#blocking-commands
 func (client *baseClient) BZPopMax(
 	ctx context.Context,
 	keys []string,
@@ -8414,7 +8830,8 @@ func (client *baseClient) GeoAdd(
 	key string,
 	membersToGeospatialData map[string]options.GeospatialData,
 ) (int64, error) {
-	result, err := client.executeCommand(ctx,
+	result, err := client.executeCommand(
+		ctx,
 		C.GeoAdd,
 		append([]string{key}, options.MapGeoDataToArray(membersToGeospatialData)...),
 	)
@@ -8481,7 +8898,8 @@ func (client *baseClient) GeoAddWithOptions(
 //
 // [valkey.io]: https://valkey.io/commands/geohash/
 func (client *baseClient) GeoHash(ctx context.Context, key string, members []string) ([]models.Result[string], error) {
-	result, err := client.executeCommand(ctx,
+	result, err := client.executeCommand(
+		ctx,
 		C.GeoHash,
 		append([]string{key}, members...),
 	)
@@ -8542,7 +8960,8 @@ func (client *baseClient) GeoDist(
 	member1 string,
 	member2 string,
 ) (models.Result[float64], error) {
-	result, err := client.executeCommand(ctx,
+	result, err := client.executeCommand(
+		ctx,
 		C.GeoDist,
 		[]string{key, member1, member2},
 	)
@@ -8578,7 +8997,8 @@ func (client *baseClient) GeoDistWithUnit(
 	member2 string,
 	unit constants.GeoUnit,
 ) (models.Result[float64], error) {
-	result, err := client.executeCommand(ctx,
+	result, err := client.executeCommand(
+		ctx,
 		C.GeoDist,
 		[]string{key, member1, member2, string(unit)},
 	)
@@ -9529,6 +9949,16 @@ func (client *baseClient) executeScriptWithRoute(
 	pinnedChannelPtr := uintptr(pinner.Pin(resultChannelPtr))
 	defer pinner.Unpin()
 
+	// Create span if OpenTelemetry is enabled and sampling is configured
+	var spanPtr uint64
+	otelInstance := GetOtelInstance()
+	if otelInstance != nil && otelInstance.shouldSample() {
+		spanPtr, _ = otelInstance.CreateSpan("EVALSHA")
+		if spanPtr != 0 {
+			defer otelInstance.dropSpan(spanPtr)
+		}
+	}
+
 	client.mu.Lock()
 	if client.coreClient == nil {
 		client.mu.Unlock()
@@ -9549,6 +9979,7 @@ func (client *baseClient) executeScriptWithRoute(
 		argsLengthsPtr,
 		routeBytesPtr,
 		routeBytesCount,
+		C.uint64_t(spanPtr),
 	)
 	client.mu.Unlock()
 
@@ -9709,7 +10140,7 @@ func (client *baseClient) ScriptKill(ctx context.Context) (string, error) {
 // Transactions will only execute commands if the watched keys are not modified before execution of the
 // transaction.
 //
-// See [valkey.io] and [Valkey Glide Wiki] for details.
+// See [valkey.io] and [Valkey GLIDE Documentation] for details.
 //
 // Note:
 //
@@ -9731,7 +10162,7 @@ func (client *baseClient) ScriptKill(ctx context.Context) (string, error) {
 //	A simple "OK" response.
 //
 // [valkey.io]: https://valkey.io/commands/watch
-// [Valkey Glide Wiki]: https://valkey.io/topics/transactions/#cas
+// [Valkey GLIDE Documentation]: https://valkey.io/topics/transactions/#cas
 func (client *baseClient) Watch(ctx context.Context, keys []string) (string, error) {
 	result, err := client.executeCommand(ctx, C.Watch, keys)
 	if err != nil {
@@ -9772,14 +10203,64 @@ func (client *baseClient) GetStatistics() map[string]uint64 {
 }
 
 // AllChannels represents "unsubscribe from all channels".
-// Pass this to Unsubscribe or UnsubscribeBlocking to unsubscribe from all channels.
+// Pass nil to Unsubscribe or UnsubscribeLazy to unsubscribe from all channels.
 var AllChannels []string = nil
 
 // AllPatterns represents "unsubscribe from all patterns".
-// Pass this to PUnsubscribe or PUnsubscribeBlocking to unsubscribe from all patterns.
+// Pass nil to PUnsubscribe or PUnsubscribeLazy to unsubscribe from all patterns.
 var AllPatterns []string = nil
 
-// Subscribe subscribes the client to the specified channels (lazy, non-blocking).
+// AllShardedChannels represents "unsubscribe from all sharded channels".
+// Pass nil to SUnsubscribe or SUnsubscribeLazy to unsubscribe from all sharded channels.
+var AllShardedChannels []string = nil
+
+// Subscribe subscribes the client to the specified channels (blocking).
+// This command updates the client's internal desired subscription state and waits
+// for server confirmation.
+//
+// Parameters:
+//
+//	ctx - The context for the operation.
+//	channels - A slice of channel names to subscribe to.
+//	timeoutMs - Maximum time in milliseconds to wait for server confirmation.
+//	            A value of 0 blocks indefinitely until confirmation.
+//
+// Return value:
+//
+//	An error if the operation fails or times out.
+//
+// Example:
+//
+//	err := client.Subscribe(ctx, []string{"channel1"}, 5000)
+//
+// Subscribe subscribes the client to the specified channels (blocking).
+// This command updates the client's internal desired subscription state and waits
+// for server confirmation.
+//
+// Parameters:
+//
+//	ctx - The context for the operation.
+//	channels - A slice of channel names to subscribe to.
+//	timeoutMs - Maximum time in milliseconds to wait for server confirmation.
+//	            A value of 0 blocks indefinitely until confirmation.
+//
+// Return value:
+//
+//	An error if the operation fails or times out.
+//
+// Example:
+//
+//	err := client.Subscribe(ctx, []string{"channel1", "channel2"}, 0)
+func (client *baseClient) Subscribe(ctx context.Context, channels []string, timeoutMs int) error {
+	if timeoutMs < 0 {
+		return fmt.Errorf("timeout must be non-negative: %d", timeoutMs)
+	}
+	args := append(channels, strconv.Itoa(timeoutMs))
+	_, err := client.executeCommand(ctx, C.SubscribeBlocking, args)
+	return err
+}
+
+// SubscribeLazy subscribes the client to the specified channels (non-blocking).
 // This command updates the client's internal desired subscription state without waiting
 // for server confirmation. It returns immediately after updating the local state.
 // The client will attempt to subscribe asynchronously in the background.
@@ -9797,20 +10278,20 @@ var AllPatterns []string = nil
 //
 // Example:
 //
-//	err := client.Subscribe(ctx, []string{"channel1", "channel2"})
-func (client *baseClient) Subscribe(ctx context.Context, channels []string) error {
+//	err := client.SubscribeLazy(ctx, []string{"channel1", "channel2"})
+func (client *baseClient) SubscribeLazy(ctx context.Context, channels []string) error {
 	_, err := client.executeCommand(ctx, C.Subscribe, channels)
 	return err
 }
 
-// SubscribeBlocking subscribes the client to the specified channels (blocking).
+// PSubscribe subscribes the client to the specified patterns (blocking).
 // This command updates the client's internal desired subscription state and waits
 // for server confirmation.
 //
 // Parameters:
 //
 //	ctx - The context for the operation.
-//	channels - A slice of channel names to subscribe to.
+//	patterns - A slice of patterns to subscribe to (e.g., []string{"news.*"}).
 //	timeoutMs - Maximum time in milliseconds to wait for server confirmation.
 //	            A value of 0 blocks indefinitely until confirmation.
 //
@@ -9820,17 +10301,17 @@ func (client *baseClient) Subscribe(ctx context.Context, channels []string) erro
 //
 // Example:
 //
-//	err := client.SubscribeBlocking(ctx, []string{"channel1"}, 5000)
-func (client *baseClient) SubscribeBlocking(ctx context.Context, channels []string, timeoutMs int) error {
+//	err := client.PSubscribe(ctx, []string{"news.*"}, 5000)
+func (client *baseClient) PSubscribe(ctx context.Context, patterns []string, timeoutMs int) error {
 	if timeoutMs < 0 {
 		return fmt.Errorf("timeout must be non-negative: %d", timeoutMs)
 	}
-	args := append(channels, strconv.Itoa(timeoutMs))
-	_, err := client.executeCommand(ctx, C.SubscribeBlocking, args)
+	args := append(patterns, strconv.Itoa(timeoutMs))
+	_, err := client.executeCommand(ctx, C.PSubscribeBlocking, args)
 	return err
 }
 
-// PSubscribe subscribes the client to the specified patterns (lazy, non-blocking).
+// PSubscribeLazy subscribes the client to the specified patterns (non-blocking).
 // This command updates the client's internal desired subscription state without waiting
 // for server confirmation. It returns immediately after updating the local state.
 //
@@ -9845,8 +10326,28 @@ func (client *baseClient) SubscribeBlocking(ctx context.Context, channels []stri
 //
 // Example:
 //
-//	err := client.PSubscribe(ctx, []string{"news.*", "updates.*"})
-func (client *baseClient) PSubscribe(ctx context.Context, patterns []string) error {
+//	err := client.PSubscribeLazy(ctx, []string{"news.*", "updates.*"})
+//
+// PSubscribeLazy subscribes the client to the specified patterns (non-blocking).
+// This command updates the client's internal desired subscription state without waiting
+// for server confirmation. It returns immediately after updating the local state.
+// The client will attempt to subscribe asynchronously in the background.
+//
+// Note: Use GetSubscriptions() to verify the actual server-side subscription state.
+//
+// Parameters:
+//
+//	ctx - The context for the operation.
+//	patterns - A slice of patterns to subscribe to (e.g., []string{"news.*"}).
+//
+// Return value:
+//
+//	An error if the operation fails.
+//
+// Example:
+//
+//	err := client.PSubscribeLazy(ctx, []string{"news.*", "updates.*"})
+func (client *baseClient) PSubscribeLazy(ctx context.Context, patterns []string) error {
 	_, err := client.executeCommand(ctx, C.PSubscribe, patterns)
 	return err
 }
@@ -9878,34 +10379,15 @@ func (client *baseClient) PSubscribeBlocking(ctx context.Context, patterns []str
 	return err
 }
 
-// Unsubscribe unsubscribes the client from the specified channels (lazy, non-blocking).
-// If no channels are specified, unsubscribes from all exact channels.
-//
-// Parameters:
-//
-//	ctx - The context for the operation.
-//	channels - A slice of channel names to unsubscribe from. Empty slice unsubscribes from all.
-//
-// Return value:
-//
-//	An error if the operation fails.
-//
-// Example:
-//
-//	err := client.Unsubscribe(ctx, []string{"channel1"})
-//	err := client.Unsubscribe(ctx, []string{}) // Unsubscribe from all
-func (client *baseClient) Unsubscribe(ctx context.Context, channels []string) error {
-	_, err := client.executeCommand(ctx, C.Unsubscribe, channels)
-	return err
-}
-
-// UnsubscribeBlocking unsubscribes the client from the specified channels (blocking).
+// Unsubscribe unsubscribes the client from the specified channels (blocking).
+// This command updates the client's internal desired subscription state and waits
+// for server confirmation.
 // If no channels are specified (nil or empty slice), unsubscribes from all exact channels.
 //
 // Parameters:
 //
 //	ctx - The context for the operation.
-//	channels - A slice of channel names to unsubscribe from. Pass nil or AllChannels to unsubscribe from all.
+//	channels - A slice of channel names to unsubscribe from. Pass nil to unsubscribe from all.
 //	timeoutMs - Maximum time in milliseconds to wait for server confirmation.
 //	            A value of 0 blocks indefinitely until confirmation.
 //
@@ -9915,9 +10397,9 @@ func (client *baseClient) Unsubscribe(ctx context.Context, channels []string) er
 //
 // Example:
 //
-//	err := client.UnsubscribeBlocking(ctx, []string{"channel1"}, 5000)
-//	err := client.UnsubscribeBlocking(ctx, AllChannels, 5000) // Unsubscribe from all
-func (client *baseClient) UnsubscribeBlocking(ctx context.Context, channels []string, timeoutMs int) error {
+//	err := client.Unsubscribe(ctx, []string{"channel1"}, 5000)
+//	err := client.Unsubscribe(ctx, nil, 5000) // Unsubscribe from all
+func (client *baseClient) Unsubscribe(ctx context.Context, channels []string, timeoutMs int) error {
 	if timeoutMs < 0 {
 		return fmt.Errorf("timeout must be non-negative: %d", timeoutMs)
 	}
@@ -9926,11 +10408,15 @@ func (client *baseClient) UnsubscribeBlocking(ctx context.Context, channels []st
 	return err
 }
 
-// UnsubscribeAll unsubscribes the client from all exact channels (lazy, non-blocking).
+// UnsubscribeLazy unsubscribes the client from the specified channels (non-blocking).
+// This command updates the client's internal desired subscription state without waiting
+// for server confirmation. It returns immediately after updating the local state.
+// If no channels are specified (nil), unsubscribes from all exact channels.
 //
 // Parameters:
 //
 //	ctx - The context for the operation.
+//	channels - A slice of channel names to unsubscribe from. Pass nil to unsubscribe from all.
 //
 // Return value:
 //
@@ -9938,57 +10424,22 @@ func (client *baseClient) UnsubscribeBlocking(ctx context.Context, channels []st
 //
 // Example:
 //
-//	err := client.UnsubscribeAll(ctx)
-func (client *baseClient) UnsubscribeAll(ctx context.Context) error {
-	return client.Unsubscribe(ctx, nil)
-}
-
-// UnsubscribeAllBlocking unsubscribes the client from all exact channels (blocking).
-//
-// Parameters:
-//
-//	ctx - The context for the operation.
-//	timeoutMs - Maximum time in milliseconds to wait for server confirmation.
-//	            A value of 0 blocks indefinitely until confirmation.
-//
-// Return value:
-//
-//	An error if the operation fails or times out.
-//
-// Example:
-//
-//	err := client.UnsubscribeAllBlocking(ctx, 5000)
-func (client *baseClient) UnsubscribeAllBlocking(ctx context.Context, timeoutMs int) error {
-	return client.UnsubscribeBlocking(ctx, nil, timeoutMs)
-}
-
-// PUnsubscribe unsubscribes the client from the specified patterns (lazy, non-blocking).
-// If no patterns are specified, unsubscribes from all patterns.
-//
-// Parameters:
-//
-//	ctx - The context for the operation.
-//	patterns - A slice of patterns to unsubscribe from. Empty slice unsubscribes from all.
-//
-// Return value:
-//
-//	An error if the operation fails.
-//
-// Example:
-//
-//	err := client.PUnsubscribe(ctx, []string{"news.*"})
-func (client *baseClient) PUnsubscribe(ctx context.Context, patterns []string) error {
-	_, err := client.executeCommand(ctx, C.PUnsubscribe, patterns)
+//	err := client.UnsubscribeLazy(ctx, []string{"channel1"})
+//	err := client.UnsubscribeLazy(ctx, nil) // Unsubscribe from all
+func (client *baseClient) UnsubscribeLazy(ctx context.Context, channels []string) error {
+	_, err := client.executeCommand(ctx, C.Unsubscribe, channels)
 	return err
 }
 
-// PUnsubscribeBlocking unsubscribes the client from the specified patterns (blocking).
+// PUnsubscribe unsubscribes the client from the specified patterns (blocking).
+// This command updates the client's internal desired subscription state and waits
+// for server confirmation.
 // If no patterns are specified (nil or empty slice), unsubscribes from all patterns.
 //
 // Parameters:
 //
 //	ctx - The context for the operation.
-//	patterns - A slice of patterns to unsubscribe from. Pass nil or AllPatterns to unsubscribe from all.
+//	patterns - A slice of patterns to unsubscribe from. Pass nil to unsubscribe from all.
 //	timeoutMs - Maximum time in milliseconds to wait for server confirmation.
 //	            A value of 0 blocks indefinitely until confirmation.
 //
@@ -9998,9 +10449,9 @@ func (client *baseClient) PUnsubscribe(ctx context.Context, patterns []string) e
 //
 // Example:
 //
-//	err := client.PUnsubscribeBlocking(ctx, []string{"news.*"}, 5000)
-//	err := client.PUnsubscribeBlocking(ctx, AllPatterns, 5000) // Unsubscribe from all
-func (client *baseClient) PUnsubscribeBlocking(ctx context.Context, patterns []string, timeoutMs int) error {
+//	err := client.PUnsubscribe(ctx, []string{"news.*"}, 5000)
+//	err := client.PUnsubscribe(ctx, nil, 5000) // Unsubscribe from all
+func (client *baseClient) PUnsubscribe(ctx context.Context, patterns []string, timeoutMs int) error {
 	if timeoutMs < 0 {
 		return fmt.Errorf("timeout must be non-negative: %d", timeoutMs)
 	}
@@ -10009,11 +10460,15 @@ func (client *baseClient) PUnsubscribeBlocking(ctx context.Context, patterns []s
 	return err
 }
 
-// PUnsubscribeAll unsubscribes the client from all patterns (lazy, non-blocking).
+// PUnsubscribeLazy unsubscribes the client from the specified patterns (non-blocking).
+// This command updates the client's internal desired subscription state without waiting
+// for server confirmation. It returns immediately after updating the local state.
+// If no patterns are specified (nil), unsubscribes from all patterns.
 //
 // Parameters:
 //
 //	ctx - The context for the operation.
+//	patterns - A slice of patterns to unsubscribe from. Pass nil to unsubscribe from all.
 //
 // Return value:
 //
@@ -10021,28 +10476,11 @@ func (client *baseClient) PUnsubscribeBlocking(ctx context.Context, patterns []s
 //
 // Example:
 //
-//	err := client.PUnsubscribeAll(ctx)
-func (client *baseClient) PUnsubscribeAll(ctx context.Context) error {
-	return client.PUnsubscribe(ctx, nil)
-}
-
-// PUnsubscribeAllBlocking unsubscribes the client from all patterns (blocking).
-//
-// Parameters:
-//
-//	ctx - The context for the operation.
-//	timeoutMs - Maximum time in milliseconds to wait for server confirmation.
-//	            A value of 0 blocks indefinitely until confirmation.
-//
-// Return value:
-//
-//	An error if the operation fails or times out.
-//
-// Example:
-//
-//	err := client.PUnsubscribeAllBlocking(ctx, 5000)
-func (client *baseClient) PUnsubscribeAllBlocking(ctx context.Context, timeoutMs int) error {
-	return client.PUnsubscribeBlocking(ctx, nil, timeoutMs)
+//	err := client.PUnsubscribeLazy(ctx, []string{"news.*"})
+//	err := client.PUnsubscribeLazy(ctx, nil) // Unsubscribe from all
+func (client *baseClient) PUnsubscribeLazy(ctx context.Context, patterns []string) error {
+	_, err := client.executeCommand(ctx, C.PUnsubscribe, patterns)
+	return err
 }
 
 // GetSubscriptions retrieves both the desired and current subscription states.
@@ -10073,4 +10511,373 @@ func (client *baseClient) GetSubscriptions(ctx context.Context) (*models.PubSubS
 		return nil, err
 	}
 	return handlePubSubStateResponse(response)
+}
+
+// AclCat returns a list of all ACL categories.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution.
+//
+// Return value:
+//
+//	An array of ACL categories.
+//
+// [valkey.io]: https://valkey.io/commands/acl-cat/
+func (client *baseClient) AclCat(ctx context.Context) ([]string, error) {
+	result, err := client.executeCommand(ctx, C.AclCat, []string{})
+	if err != nil {
+		return nil, err
+	}
+	return handleStringArrayResponse(result)
+}
+
+// AclCatWithCategory returns a list of commands within the specified ACL category.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution.
+//	category - The ACL category to list commands for.
+//
+// Return value:
+//
+//	An array of commands within the specified category.
+//
+// [valkey.io]: https://valkey.io/commands/acl-cat/
+func (client *baseClient) AclCatWithCategory(ctx context.Context, category string) ([]string, error) {
+	result, err := client.executeCommand(ctx, C.AclCat, []string{category})
+	if err != nil {
+		return nil, err
+	}
+	return handleStringArrayResponse(result)
+}
+
+// AclDelUser deletes all specified ACL users and terminates their connections.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution.
+//	usernames - An array of usernames to delete.
+//
+// Return value:
+//
+//	The number of users deleted.
+//
+// [valkey.io]: https://valkey.io/commands/acl-deluser/
+func (client *baseClient) AclDelUser(ctx context.Context, usernames []string) (int64, error) {
+	result, err := client.executeCommand(ctx, C.AclDelUser, usernames)
+	if err != nil {
+		return models.DefaultIntResponse, err
+	}
+	return handleIntResponse(result)
+}
+
+// AclDryRun simulates the execution of a command by a user without actually executing it.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution.
+//	username - The username to simulate command execution for.
+//	command - The command to simulate.
+//	args - The command arguments.
+//
+// Return value:
+//
+//	"OK" if the user can execute the command, otherwise a string describing why the command cannot be executed.
+//
+// [valkey.io]: https://valkey.io/commands/acl-dryrun/
+func (client *baseClient) AclDryRun(ctx context.Context, username string, command string, args []string) (string, error) {
+	cmdArgs := append([]string{username, command}, args...)
+	result, err := client.executeCommand(ctx, C.AclDryRun, cmdArgs)
+	if err != nil {
+		return models.DefaultStringResponse, err
+	}
+	return handleOkOrStringResponse(result)
+}
+
+// AclGenPass generates a random password for ACL users.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution.
+//
+// Return value:
+//
+//	A randomly generated password string (64 hex characters by default).
+//
+// [valkey.io]: https://valkey.io/commands/acl-genpass/
+func (client *baseClient) AclGenPass(ctx context.Context) (string, error) {
+	result, err := client.executeCommand(ctx, C.AclGenPass, []string{})
+	if err != nil {
+		return models.DefaultStringResponse, err
+	}
+	return handleStringResponse(result)
+}
+
+// AclGenPassWithBits generates a random password with the specified number of bits.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution.
+//	bits - The number of bits for the password (must be between 1 and 4096).
+//
+// Return value:
+//
+//	A randomly generated password string.
+//
+// [valkey.io]: https://valkey.io/commands/acl-genpass/
+func (client *baseClient) AclGenPassWithBits(ctx context.Context, bits int64) (string, error) {
+	result, err := client.executeCommand(ctx, C.AclGenPass, []string{utils.IntToString(bits)})
+	if err != nil {
+		return models.DefaultStringResponse, err
+	}
+	return handleStringResponse(result)
+}
+
+// AclGetUser returns all ACL rules for the specified user.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution.
+//	username - The username to get ACL rules for.
+//
+// Return value:
+//
+//	A value describing the ACL rules for the user, or nil if user doesn't exist.
+//
+// [valkey.io]: https://valkey.io/commands/acl-getuser/
+func (client *baseClient) AclGetUser(ctx context.Context, username string) (any, error) {
+	result, err := client.executeCommand(ctx, C.AclGetUser, []string{username})
+	if err != nil {
+		return nil, err
+	}
+	return handleInterfaceResponse(result)
+}
+
+// AclList returns a list of all ACL users and their rules in ACL configuration file format.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution.
+//
+// Return value:
+//
+//	An array of ACL rules for all users.
+//
+// [valkey.io]: https://valkey.io/commands/acl-list/
+func (client *baseClient) AclList(ctx context.Context) ([]string, error) {
+	result, err := client.executeCommand(ctx, C.AclList, []string{})
+	if err != nil {
+		return nil, err
+	}
+	return handleStringArrayResponse(result)
+}
+
+// AclLoad reloads ACL rules from the configured ACL configuration file.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution.
+//
+// Return value:
+//
+//	"OK" on success.
+//
+// [valkey.io]: https://valkey.io/commands/acl-load/
+func (client *baseClient) AclLoad(ctx context.Context) (string, error) {
+	result, err := client.executeCommand(ctx, C.AclLoad, []string{})
+	if err != nil {
+		return models.DefaultStringResponse, err
+	}
+	return handleOkResponse(result)
+}
+
+// AclLog returns the ACL security events log.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution.
+//
+// Return value:
+//
+//	An array of ACL security events.
+//
+// [valkey.io]: https://valkey.io/commands/acl-log/
+func (client *baseClient) AclLog(ctx context.Context) ([]any, error) {
+	result, err := client.executeCommand(ctx, C.AclLog, []string{})
+	if err != nil {
+		return nil, err
+	}
+	return handleAnyArrayOrNilResponse(result)
+}
+
+// AclLogWithCount returns the specified number of ACL security events from the log.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution.
+//	count - The number of entries to return.
+//
+// Return value:
+//
+//	An array of ACL security events.
+//
+// [valkey.io]: https://valkey.io/commands/acl-log/
+func (client *baseClient) AclLogWithCount(ctx context.Context, count int64) ([]any, error) {
+	result, err := client.executeCommand(ctx, C.AclLog, []string{utils.IntToString(count)})
+	if err != nil {
+		return nil, err
+	}
+	return handleAnyArrayOrNilResponse(result)
+}
+
+// AclLogReset resets the ACL log.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution.
+//
+// Return value:
+//
+//	"OK" on success.
+//
+// [valkey.io]: https://valkey.io/commands/acl-log/
+func (client *baseClient) AclLogReset(ctx context.Context) (string, error) {
+	result, err := client.executeCommand(ctx, C.AclLog, []string{"RESET"})
+	if err != nil {
+		return models.DefaultStringResponse, err
+	}
+	return handleOkResponse(result)
+}
+
+// AclSave saves the current ACL rules to the configured ACL configuration file.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution.
+//
+// Return value:
+//
+//	"OK" on success.
+//
+// [valkey.io]: https://valkey.io/commands/acl-save/
+func (client *baseClient) AclSave(ctx context.Context) (string, error) {
+	result, err := client.executeCommand(ctx, C.AclSave, []string{})
+	if err != nil {
+		return models.DefaultStringResponse, err
+	}
+	return handleOkResponse(result)
+}
+
+// AclSetUser creates or modifies an ACL user and its rules.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution.
+//	username - The username for the ACL user.
+//	rules - An array of ACL rules to apply to the user.
+//
+// Return value:
+//
+//	"OK" on success.
+//
+// [valkey.io]: https://valkey.io/commands/acl-setuser/
+func (client *baseClient) AclSetUser(ctx context.Context, username string, rules []string) (string, error) {
+	cmdArgs := append([]string{username}, rules...)
+	result, err := client.executeCommand(ctx, C.AclSetUser, cmdArgs)
+	if err != nil {
+		return models.DefaultStringResponse, err
+	}
+	return handleOkResponse(result)
+}
+
+// AclUsers returns a list of all ACL usernames.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution.
+//
+// Return value:
+//
+//	An array of ACL usernames.
+//
+// [valkey.io]: https://valkey.io/commands/acl-users/
+func (client *baseClient) AclUsers(ctx context.Context) ([]string, error) {
+	result, err := client.executeCommand(ctx, C.AclUsers, []string{})
+	if err != nil {
+		return nil, err
+	}
+	return handleStringArrayResponse(result)
+}
+
+// AclWhoAmI returns the username of the current connection.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution.
+//
+// Return value:
+//
+//	The username of the current connection.
+//
+// [valkey.io]: https://valkey.io/commands/acl-whoami/
+func (client *baseClient) AclWhoAmI(ctx context.Context) (string, error) {
+	result, err := client.executeCommand(ctx, C.AclWhoami, []string{})
+	if err != nil {
+		return models.DefaultStringResponse, err
+	}
+	return handleStringResponse(result)
+}
+
+// Reset resets the connection state.
+//
+// See [valkey.io] for details.
+//
+// Parameters:
+//
+//	ctx - The context for controlling the command execution.
+//
+// Return value:
+//
+//	Returns "RESET" on success.
+//
+// [valkey.io]: https://valkey.io/commands/reset/
+func (client *baseClient) Reset(ctx context.Context) (string, error) {
+	result, err := client.executeCommand(ctx, C.Reset, []string{})
+	if err != nil {
+		return models.DefaultStringResponse, err
+	}
+	return handleStringResponse(result)
 }

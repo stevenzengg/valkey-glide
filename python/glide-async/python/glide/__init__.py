@@ -4,14 +4,14 @@ import sys
 import types
 import warnings
 
-from glide.glide import (
-    ClusterScanCursor,
-    Script,
-    get_min_compressed_size,
-)
+from glide._ffi_wrappers import ClusterScanCursor, Script
 from glide_shared import (
+    ALL_CHANNELS,
+    ALL_PATTERNS,
+    ALL_SHARDED_CHANNELS,
     OK,
     TOK,
+    AddressResolver,
     AdvancedGlideClientConfiguration,
     AdvancedGlideClusterClientConfiguration,
     AggregationType,
@@ -34,6 +34,11 @@ from glide_shared import (
     BitOverflowControl,
     BitwiseOperation,
     ByAddressRoute,
+    CircuitBreakerError,
+    ClientCircuitBreakerConfiguration,
+    ClientPauseMode,
+    ClientSideCache,
+    ClientTrackingInfo,
     ClosingError,
     ClusterBatch,
     ClusterBatchOptions,
@@ -43,8 +48,10 @@ from glide_shared import (
     ConditionalChange,
     ConfigurationError,
     ConnectionError,
+    ConsistencyMode,
     DataType,
     DistanceMetricType,
+    EvictionPolicy,
     ExclusiveIdBound,
     ExecAbortError,
     ExpireOptions,
@@ -85,17 +92,25 @@ from glide_shared import (
     IamAuthConfig,
     IdBound,
     InfBound,
+    InfoScope,
     InfoSection,
     InsertPosition,
     JsonArrIndexOptions,
     JsonArrPopOptions,
     JsonGetOptions,
+    LatencyEntry,
+    LatencyEventInfo,
     LexBoundary,
     Limit,
     ListDirection,
     MaxId,
+    MemoryStats,
+    MemoryStatsDb,
+    MigrateOptions,
     MinId,
+    MonitorMsg,
     NodeAddress,
+    NodeDiscoveryMode,
     NumericField,
     ObjectType,
     OffsetOptions,
@@ -121,6 +136,7 @@ from glide_shared import (
     ScoreFilter,
     ServerCredentials,
     ServiceType,
+    ShardScope,
     SignedEncoding,
     SlotIdRoute,
     SlotKeyRoute,
@@ -162,18 +178,24 @@ from glide_shared import (
     VectorType,
     json_batch,
 )
+from glide_shared._glide_ffi import _GlideFFI as _FFI
 
 from .async_commands import (
-    ALL_CHANNELS,
-    ALL_PATTERNS,
-    ALL_SHARDED_CHANNELS,
     ft,
     glide_json,
 )
+from .client_pool import AsyncClientPool, PoolConfig
 from .glide_client import GlideClient, GlideClusterClient, TGlideClient
+from .isolated_scope import AsyncIsolatedScope
 from .logger import Level as LogLevel
 from .logger import Logger
+from .monitor_client import MonitorClient
 from .opentelemetry import OpenTelemetry
+
+
+def get_min_compressed_size() -> int:
+    return _FFI().lib.get_min_compressed_size()
+
 
 _glide_module = sys.modules[__name__]
 
@@ -230,6 +252,11 @@ __all__ = [
     "TGlideClient",
     "GlideClient",
     "GlideClusterClient",
+    # Pool
+    "AsyncClientPool",
+    "PoolConfig",
+    # Scope
+    "AsyncIsolatedScope",
     # Internal utilities
     "get_min_compressed_size",
     "Batch",
@@ -242,14 +269,17 @@ __all__ = [
     "BatchRetryStrategy",
     "ClusterBatchOptions",
     # Config
+    "AddressResolver",
     "AdvancedGlideClientConfiguration",
     "AdvancedGlideClusterClientConfiguration",
     "GlideClientConfiguration",
     "GlideClusterClientConfiguration",
     "BackoffStrategy",
+    "ClientCircuitBreakerConfiguration",
     "CompressionBackend",
     "CompressionConfiguration",
     "ReadFrom",
+    "NodeDiscoveryMode",
     "ServerCredentials",
     "ServiceType",
     "IamAuthConfig",
@@ -297,6 +327,7 @@ __all__ = [
     "UnsignedEncoding",
     "Script",
     "ScoreBoundary",
+    "ClientPauseMode",
     "ConditionalChange",
     "OnlyIfEqual",
     "ExpireOptions",
@@ -316,6 +347,11 @@ __all__ = [
     "InfBound",
     "InfoSection",
     "InsertPosition",
+    "LatencyEntry",
+    "LatencyEventInfo",
+    "MemoryStats",
+    "MemoryStatsDb",
+    "MigrateOptions",
     "LexBoundary",
     "Limit",
     "ListDirection",
@@ -346,6 +382,9 @@ __all__ = [
     "ALL_CHANNELS",
     "ALL_PATTERNS",
     "ALL_SHARDED_CHANNELS",
+    # Monitor
+    "MonitorClient",
+    "MonitorMsg",
     # Json
     "glide_json",
     "json_batch",
@@ -366,6 +405,7 @@ __all__ = [
     "SlotIdRoute",
     "TSingleNodeRoute",
     # Exceptions
+    "CircuitBreakerError",
     "ClosingError",
     "ConfigurationError",
     "ConnectionError",
@@ -392,6 +432,9 @@ __all__ = [
     "FtSearchLimit",
     "ReturnField",
     "FtSearchOptions",
+    "InfoScope",
+    "ShardScope",
+    "ConsistencyMode",
     "FtAggregateApply",
     "FtAggregateFilter",
     "FtAggregateClause",
@@ -403,4 +446,8 @@ __all__ = [
     "FtAggregateSortProperty",
     "FtProfileOptions",
     "QueryType",
+    # Cache,
+    "ClientSideCache",
+    "ClientTrackingInfo",
+    "EvictionPolicy",
 ]

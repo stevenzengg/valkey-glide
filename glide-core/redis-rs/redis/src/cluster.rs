@@ -696,7 +696,9 @@ where
                 let results = results
                     .into_iter()
                     .map(|result| {
-                        result.map(|(addr, val)| (Value::BulkString(addr.as_bytes().to_vec()), val))
+                        result.map(|(addr, val)| {
+                            (Value::BulkString(addr.as_bytes().to_vec().into()), val)
+                        })
                     })
                     .collect::<RedisResult<Vec<_>>>()?;
                 Ok(Value::Map(results))
@@ -1033,6 +1035,8 @@ pub(crate) fn get_connection_info(
             lib_name: cluster_params.lib_name,
             protocol: cluster_params.protocol,
             db: cluster_params.database_id,
+            cache: cluster_params.cache,
+            server_assisted_cache: cluster_params.server_assisted_cache,
         },
     })
 }

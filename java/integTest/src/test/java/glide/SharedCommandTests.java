@@ -2,10 +2,12 @@
 package glide;
 
 import static glide.TestConfiguration.SERVER_VERSION;
+import static glide.TestUtilities.assertClientTrackingInfo;
 import static glide.TestUtilities.assertDeepEquals;
 import static glide.TestUtilities.commonClientConfig;
 import static glide.TestUtilities.commonClusterClientConfig;
 import static glide.TestUtilities.isWindows;
+import static glide.TestUtilities.waitForSaveNotInProgress;
 import static glide.api.BaseClient.OK;
 import static glide.api.models.GlideString.gs;
 import static glide.api.models.commands.LInsertOptions.InsertPosition.AFTER;
@@ -19,6 +21,8 @@ import static glide.api.models.commands.SetOptions.ConditionalSet.ONLY_IF_EXISTS
 import static glide.api.models.commands.SetOptions.Expiry.Milliseconds;
 import static glide.api.models.commands.SortBaseOptions.OrderBy.ASC;
 import static glide.api.models.commands.SortBaseOptions.OrderBy.DESC;
+import static glide.utils.Java8Utils.createMap;
+import static glide.utils.Java8Utils.createSet;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -121,9 +125,11 @@ import glide.api.models.configuration.ProtocolVersion;
 import glide.api.models.configuration.RequestRoutingConfiguration;
 import glide.api.models.configuration.RequestRoutingConfiguration.SlotKeyRoute;
 import glide.api.models.exceptions.RequestException;
+import glide.utils.Java8Utils;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -131,6 +137,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -141,6 +148,7 @@ import lombok.SneakyThrows;
 import org.apache.commons.lang3.ArrayUtils;
 import org.apache.commons.lang3.tuple.Pair;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
@@ -161,19 +169,19 @@ public class SharedCommandTests {
     @BeforeAll
     @SneakyThrows
     public static void init() {
-        for (var protocol : ProtocolVersion.values()) {
-            var standaloneClient =
+        for (ProtocolVersion protocol : ProtocolVersion.values()) {
+            GlideClient standaloneClient =
                     GlideClient.createClient(
                                     commonClientConfig().requestTimeout(5000).protocol(protocol).build())
                             .get();
 
-            var clusterClient =
+            GlideClusterClient clusterClient =
                     GlideClusterClient.createClient(
                                     commonClusterClientConfig().requestTimeout(5000).protocol(protocol).build())
                             .get();
 
             clients.addAll(
-                    List.of(
+                    Arrays.asList(
                             Arguments.of(named("standalone " + protocol, standaloneClient)),
                             Arguments.of(named("cluster " + protocol, clusterClient))));
         }
@@ -183,9 +191,26 @@ public class SharedCommandTests {
     @SneakyThrows
     @SuppressWarnings("unchecked")
     public static void teardown() {
-        for (var client : clients) {
+        for (Arguments client : clients) {
             ((Named<BaseClient>) client.get()[0]).getPayload().close();
         }
+    }
+
+    @AfterEach
+    @SneakyThrows
+    @SuppressWarnings("unchecked")
+    public void cleanup() {
+        // Flush all databases in parallel to reduce teardown time
+        List<CompletableFuture<String>> futures = new ArrayList<>();
+        for (Arguments client : clients) {
+            BaseClient baseClient = ((Named<BaseClient>) client.get()[0]).getPayload();
+            if (baseClient instanceof GlideClient) {
+                futures.add(((GlideClient) baseClient).flushall());
+            } else if (baseClient instanceof GlideClusterClient) {
+                futures.add(((GlideClusterClient) baseClient).flushall());
+            }
+        }
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get();
     }
 
     @SneakyThrows
@@ -637,7 +662,7 @@ public class SharedCommandTests {
         String key3 = UUID.randomUUID().toString();
         String nonExisting = UUID.randomUUID().toString();
         String value = UUID.randomUUID().toString();
-        Map<String, String> keyValueMap = Map.of(key1, value, key2, value, key3, value);
+        Map<String, String> keyValueMap = createMap(key1, value, key2, value, key3, value);
 
         assertEquals(OK, client.mset(keyValueMap).get());
         assertArrayEquals(
@@ -655,7 +680,7 @@ public class SharedCommandTests {
         GlideString key3 = gs(UUID.randomUUID().toString());
         GlideString nonExisting = gs(UUID.randomUUID().toString());
         GlideString value = gs(UUID.randomUUID().toString());
-        Map<GlideString, GlideString> keyValueMap = Map.of(key1, value, key2, value, key3, value);
+        Map<GlideString, GlideString> keyValueMap = createMap(key1, value, key2, value, key3, value);
 
         assertEquals(OK, client.msetBinary(keyValueMap).get());
         assertArrayEquals(
@@ -672,12 +697,71 @@ public class SharedCommandTests {
         GlideString key2 = gs(UUID.randomUUID().toString());
         GlideString key3 = gs(UUID.randomUUID().toString());
         GlideString value = gs(UUID.randomUUID().toString());
-        Map<GlideString, GlideString> keyValueMap = Map.of(key1, value, key2, value, key3, value);
+        Map<GlideString, GlideString> keyValueMap = createMap(key1, value, key2, value, key3, value);
 
         assertEquals(OK, client.msetBinary(keyValueMap).get());
         assertArrayEquals(
                 new GlideString[] {value, value, value},
                 client.mget(new GlideString[] {key1, key2, key3}).get());
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void mget_with_large_binary_values_returns_null_for_missing_keys(BaseClient client) {
+        // Large binary data causes MGET to yield GlideString "nil" instead of null for missing
+        // key. This tests the DirectByteBuffer serialization path (>16KB).
+
+        // Create 16KB of data to trigger DirectByteBuffer path
+        byte[] largeData = new byte[16 * 1024];
+        java.util.Arrays.fill(largeData, (byte) 0xFF);
+
+        GlideString key1 = gs(UUID.randomUUID().toString());
+        GlideString missingKey = gs(UUID.randomUUID().toString());
+        GlideString key2 = gs(UUID.randomUUID().toString());
+        GlideString value1 = gs("value1");
+        GlideString largeValue = gs(largeData);
+
+        // Set only key1 and key2, leave missingKey unset
+        assertEquals(OK, client.set(key1, value1).get());
+        assertEquals(OK, client.set(key2, largeValue).get());
+
+        // Execute MGET with missing key in the middle
+        GlideString[] result = client.mget(new GlideString[] {key1, missingKey, key2}).get();
+
+        // Verify results
+        assertEquals(3, result.length);
+        assertEquals(value1, result[0]);
+        assertNull(result[1], "Missing key should return null, not GlideString('nil')");
+        assertArrayEquals(largeData, result[2].getBytes());
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void mget_string_with_large_values_returns_null_for_missing_keys(BaseClient client) {
+        // String version should also handle null correctly with large data
+
+        // Create 16KB string to trigger DirectByteBuffer path
+        String largeString = Java8Utils.repeat("x", 16 * 1024);
+
+        String key1 = UUID.randomUUID().toString();
+        String missingKey = UUID.randomUUID().toString();
+        String key2 = UUID.randomUUID().toString();
+        String value1 = "value1";
+
+        // Set only key1 and key2, leave missingKey unset
+        assertEquals(OK, client.set(key1, value1).get());
+        assertEquals(OK, client.set(key2, largeString).get());
+
+        // Execute MGET with missing key in the middle
+        String[] result = client.mget(new String[] {key1, missingKey, key2}).get();
+
+        // Verify results
+        assertEquals(3, result.length);
+        assertEquals(value1, result[0]);
+        assertNull(result[1], "Missing key should return null");
+        assertEquals(largeString, result[2]);
     }
 
     @SneakyThrows
@@ -990,7 +1074,7 @@ public class SharedCommandTests {
         String field1 = UUID.randomUUID().toString();
         String field2 = UUID.randomUUID().toString();
         String value = UUID.randomUUID().toString();
-        Map<String, String> fieldValueMap = Map.of(field1, value, field2, value);
+        Map<String, String> fieldValueMap = createMap(field1, value, field2, value);
 
         assertEquals(2, client.hset(key, fieldValueMap).get());
         assertEquals(value, client.hget(key, field1).get());
@@ -1009,7 +1093,7 @@ public class SharedCommandTests {
                 gs(new byte[] {(byte) 0xDD}).concat(gs(UUID.randomUUID().toString()));
         GlideString value = gs(nonUTF8Bytes);
         String stringField = "field";
-        Map<GlideString, GlideString> fieldValueMap = Map.of(gs(stringField), value);
+        Map<GlideString, GlideString> fieldValueMap = createMap(gs(stringField), value);
 
         // Testing keys and values using byte[] that cannot be converted to UTF-8 Strings.
         assertEquals(OK, client.set(key, value).get());
@@ -1041,7 +1125,7 @@ public class SharedCommandTests {
         GlideString key = gs(UUID.randomUUID().toString());
         GlideString nonUTF8Key = gs(new byte[] {(byte) 0xEF}).concat(gs(UUID.randomUUID().toString()));
         Map<GlideString, Double> membersScores =
-                Map.of(gs(nonUTF8Bytes), 1.0, gs("two"), 2.0, gs("three"), 3.0);
+                createMap(gs(nonUTF8Bytes), 1.0, gs("two"), 2.0, gs("three"), 3.0);
 
         // Testing map values using byte[] that cannot be converted to UTF-8 Strings.
         assertEquals(3, client.zadd(key, membersScores).get());
@@ -1085,7 +1169,7 @@ public class SharedCommandTests {
         GlideString streamId = client.xadd(nonUTF8Key, entry).get();
         // No error is thrown as GlideString will be returned when arguments are GlideStrings.
         Map<GlideString, GlideString[][]> expected =
-                Map.of(streamId, new GlideString[][] {{field, value1}, {field, value2}});
+                createMap(streamId, new GlideString[][] {{field, value1}, {field, value2}});
         assertDeepEquals(
                 expected, client.xrange(nonUTF8Key, InfRangeBound.MIN, InfRangeBound.MAX).get());
 
@@ -1126,16 +1210,15 @@ public class SharedCommandTests {
         // bytes.
         assertEquals(2, client.geoadd(nonUTF8Key, membersToCoordinates).get());
         // No error is thrown as GlideString will be returned when arguments are GlideStrings.
-        assertTrue(
-                Set.of(new GlideString[] {gs(nonUTF8Bytes), gs("Catania")})
-                        .containsAll(
-                                Set.of(
-                                        client
-                                                .geosearch(
-                                                        nonUTF8Key,
-                                                        new CoordOrigin(new GeospatialData(15, 37)),
-                                                        new GeoSearchShape(400, 400, GeoUnit.KILOMETERS))
-                                                .get())));
+        GlideString[] searchResult2 =
+                client
+                        .geosearch(
+                                nonUTF8Key,
+                                new CoordOrigin(new GeospatialData(15, 37)),
+                                new GeoSearchShape(400, 400, GeoUnit.KILOMETERS))
+                        .get();
+        Set<GlideString> expectedSet = new HashSet<>(Arrays.asList(gs(nonUTF8Bytes), gs("Catania")));
+        assertTrue(expectedSet.containsAll(new HashSet<>(Arrays.asList(searchResult2))));
 
         // Converting non UTF-8 bytes result to String returns a message.
         assertEquals(
@@ -1170,8 +1253,9 @@ public class SharedCommandTests {
         // Testing map of arrays using byte[] that cannot be converted to UTF-8 Strings returns bytes.
         assertEquals(2, client.lpush(nonUTF8Key, lpushArgs).get());
         // No error is thrown as GlideString will be returned when arguments are GlideStrings.
-        var popResult = client.lmpop(new GlideString[] {nonUTF8Key}, ListDirection.RIGHT).get();
-        assertDeepEquals(Map.of(nonUTF8Key, new GlideString[] {gs(nonUTF8Bytes)}), popResult);
+        Map<GlideString, GlideString[]> popResult =
+                client.lmpop(new GlideString[] {nonUTF8Key}, ListDirection.RIGHT).get();
+        assertDeepEquals(createMap(nonUTF8Key, new GlideString[] {gs(nonUTF8Bytes)}), popResult);
 
         // Converting non UTF-8 bytes result to String returns a message.
         assertEquals(
@@ -1186,7 +1270,7 @@ public class SharedCommandTests {
         GlideString field1 = gs(UUID.randomUUID().toString());
         GlideString field2 = gs(UUID.randomUUID().toString());
         GlideString value = gs(UUID.randomUUID().toString());
-        Map<GlideString, GlideString> fieldValueMap = Map.of(field1, value, field2, value);
+        Map<GlideString, GlideString> fieldValueMap = createMap(field1, value, field2, value);
 
         assertEquals(2, client.hset(key, fieldValueMap).get());
         assertEquals(value, client.hget(key, field1).get());
@@ -1241,7 +1325,7 @@ public class SharedCommandTests {
         String field2 = UUID.randomUUID().toString();
         String field3 = UUID.randomUUID().toString();
         String value = UUID.randomUUID().toString();
-        Map<String, String> fieldValueMap = Map.of(field1, value, field2, value, field3, value);
+        Map<String, String> fieldValueMap = createMap(field1, value, field2, value, field3, value);
 
         assertEquals(3, client.hset(key, fieldValueMap).get());
         assertEquals(2, client.hdel(key, new String[] {field1, field2}).get());
@@ -1260,7 +1344,7 @@ public class SharedCommandTests {
         GlideString field3 = gs(UUID.randomUUID().toString());
         GlideString value = gs(UUID.randomUUID().toString());
         Map<GlideString, GlideString> fieldValueMap =
-                Map.of(field1, value, field2, value, field3, value);
+                createMap(field1, value, field2, value, field3, value);
 
         assertEquals(3, client.hset(key, fieldValueMap).get());
         assertEquals(2, client.hdel(key, new GlideString[] {field1, field2}).get());
@@ -1277,7 +1361,7 @@ public class SharedCommandTests {
         String field1 = UUID.randomUUID().toString();
         String field2 = UUID.randomUUID().toString();
         String value = UUID.randomUUID().toString();
-        Map<String, String> fieldValueMap = Map.of(field1, value, field2, value);
+        Map<String, String> fieldValueMap = createMap(field1, value, field2, value);
 
         assertEquals(2, client.hset(key1, fieldValueMap).get());
         assertEquals(2, client.hlen(key1).get());
@@ -1301,7 +1385,7 @@ public class SharedCommandTests {
         GlideString field1 = gs(UUID.randomUUID().toString());
         GlideString field2 = gs(UUID.randomUUID().toString());
         GlideString value = gs(UUID.randomUUID().toString());
-        Map<GlideString, GlideString> fieldValueMap = Map.of(field1, value, field2, value);
+        Map<GlideString, GlideString> fieldValueMap = createMap(field1, value, field2, value);
 
         assertEquals(2, client.hset(key1, fieldValueMap).get());
         assertEquals(2, client.hlen(key1).get());
@@ -1324,7 +1408,7 @@ public class SharedCommandTests {
         String key2 = UUID.randomUUID().toString();
         String field1 = UUID.randomUUID().toString();
         String field2 = UUID.randomUUID().toString();
-        Map<String, String> fieldValueMap = Map.of(field1, "value1", field2, "value2");
+        Map<String, String> fieldValueMap = createMap(field1, "value1", field2, "value2");
 
         assertEquals(2, client.hset(key1, fieldValueMap).get());
 
@@ -1351,7 +1435,7 @@ public class SharedCommandTests {
         GlideString field1 = gs(UUID.randomUUID().toString());
         GlideString field2 = gs(UUID.randomUUID().toString());
         Map<GlideString, GlideString> fieldValueMap =
-                Map.of(field1, gs("value1"), field2, gs("value2"));
+                createMap(field1, gs("value1"), field2, gs("value2"));
 
         assertEquals(2, client.hset(key1, fieldValueMap).get());
 
@@ -1378,7 +1462,7 @@ public class SharedCommandTests {
         String field1 = UUID.randomUUID().toString();
         String field2 = UUID.randomUUID().toString();
         String value = UUID.randomUUID().toString();
-        Map<String, String> fieldValueMap = Map.of(field1, value, field2, value);
+        Map<String, String> fieldValueMap = createMap(field1, value, field2, value);
 
         assertEquals(2, client.hset(key, fieldValueMap).get());
         assertArrayEquals(
@@ -1398,7 +1482,7 @@ public class SharedCommandTests {
         GlideString field1 = gs(UUID.randomUUID().toString());
         GlideString field2 = gs(UUID.randomUUID().toString());
         GlideString value = gs(UUID.randomUUID().toString());
-        Map<GlideString, GlideString> fieldValueMap = Map.of(field1, value, field2, value);
+        Map<GlideString, GlideString> fieldValueMap = createMap(field1, value, field2, value);
 
         assertEquals(2, client.hset(key, fieldValueMap).get());
         assertArrayEquals(
@@ -2615,7 +2699,7 @@ public class SharedCommandTests {
         client.hsetex(key, fieldValueMap, setOptions).get();
 
         // Set one field without expiration using regular hset
-        client.hset(key, Map.of("field4", "value4")).get();
+        client.hset(key, createMap("field4", "value4")).get();
 
         // Test HTTL - get TTL for fields
         String[] fields = {"field1", "field2", "field3", "field4", "nonexistent"};
@@ -2768,12 +2852,12 @@ public class SharedCommandTests {
         client
                 .hsetex(
                         key,
-                        Map.of("field3", "value3"),
+                        createMap("field3", "value3"),
                         HSetExOptions.builder().expiry(ExpirySet.Milliseconds(30000L)).build())
                 .get();
 
         // Set field4 without expiration
-        client.hset(key, Map.of("field4", "value4")).get();
+        client.hset(key, createMap("field4", "value4")).get();
 
         // Test HPTTL - get TTL for fields in milliseconds
         String[] fields = {"field1", "field2", "field3", "field4", "nonexistent"};
@@ -2978,7 +3062,7 @@ public class SharedCommandTests {
         client.hsetex(key, fieldValueMap, setOptions).get();
 
         // Set one field without expiration using regular hset
-        client.hset(key, Map.of("field4", "value4")).get();
+        client.hset(key, createMap("field4", "value4")).get();
 
         // Test HEXPIRETIME - get expiration timestamps for fields
         String[] fields = {"field1", "field2", "field3", "field4", "nonexistent"};
@@ -3195,18 +3279,18 @@ public class SharedCommandTests {
         String key = "test_hpexpiretime_basic_" + UUID.randomUUID();
 
         // First set some fields with expiration using hsetex
-        Map<String, String> fieldValueMap = Map.of("field1", "value1", "field2", "value2");
+        Map<String, String> fieldValueMap = createMap("field1", "value1", "field2", "value2");
         HSetExOptions setOptions = HSetExOptions.builder().expiry(ExpirySet.Seconds(60L)).build();
         client.hsetex(key, fieldValueMap, setOptions).get();
 
         // Set field3 with millisecond expiration
-        Map<String, String> fieldValueMapMs = Map.of("field3", "value3");
+        Map<String, String> fieldValueMapMs = createMap("field3", "value3");
         HSetExOptions setOptionsMs =
                 HSetExOptions.builder().expiry(ExpirySet.Milliseconds(60000L)).build();
         client.hsetex(key, fieldValueMapMs, setOptionsMs).get();
 
         // Set field4 without expiration
-        client.hset(key, Map.of("field4", "value4")).get();
+        client.hset(key, createMap("field4", "value4")).get();
 
         // Test HPEXPIRETIME - get expiration timestamps for fields in milliseconds
         long currentTimeMs = System.currentTimeMillis();
@@ -3256,7 +3340,7 @@ public class SharedCommandTests {
         String key = "test_hpexpiretime_expired_" + UUID.randomUUID();
 
         // Set fields with very short expiration (1000 milliseconds)
-        Map<String, String> fieldValueMap = Map.of("field1", "value1", "field2", "value2");
+        Map<String, String> fieldValueMap = createMap("field1", "value1", "field2", "value2");
         HSetExOptions setOptions =
                 HSetExOptions.builder().expiry(ExpirySet.Milliseconds(1000L)).build();
         client.hsetex(key, fieldValueMap, setOptions).get();
@@ -3284,13 +3368,13 @@ public class SharedCommandTests {
         String key = "test_hpexpiretime_mixed_" + UUID.randomUUID();
 
         // Set some fields with expiration
-        Map<String, String> fieldValueMapWithExpiry = Map.of("field1", "value1", "field2", "value2");
+        Map<String, String> fieldValueMapWithExpiry = createMap("field1", "value1", "field2", "value2");
         HSetExOptions setOptions =
                 HSetExOptions.builder().expiry(ExpirySet.Milliseconds(60000L)).build();
         client.hsetex(key, fieldValueMapWithExpiry, setOptions).get();
 
         // Set some fields without expiration
-        Map<String, String> fieldValueMapNoExpiry = Map.of("field3", "value3", "field4", "value4");
+        Map<String, String> fieldValueMapNoExpiry = createMap("field3", "value3", "field4", "value4");
         client.hset(key, fieldValueMapNoExpiry).get();
 
         // Test HPEXPIRETIME on mixed fields
@@ -3321,7 +3405,7 @@ public class SharedCommandTests {
 
         // First set some fields with expiration using hsetex
         Map<GlideString, GlideString> fieldValueMap =
-                Map.of(gs("field1"), gs("value1"), gs("field2"), gs("value2"));
+                createMap(gs("field1"), gs("value1"), gs("field2"), gs("value2"));
         HSetExOptions setOptions =
                 HSetExOptions.builder().expiry(ExpirySet.Milliseconds(60000L)).build();
         client.hsetex(key, fieldValueMap, setOptions).get();
@@ -3354,7 +3438,7 @@ public class SharedCommandTests {
         String key = "test_hpexpiretime_batch_" + UUID.randomUUID();
 
         // First set some fields with expiration using hsetex
-        Map<String, String> fieldValueMap = Map.of("field1", "value1", "field2", "value2");
+        Map<String, String> fieldValueMap = createMap("field1", "value1", "field2", "value2");
         long expireAtMs = System.currentTimeMillis() + 60000; // 60 seconds from now
         HSetExOptions setOptions =
                 HSetExOptions.builder().expiry(ExpirySet.UnixMilliseconds(expireAtMs)).build();
@@ -3398,7 +3482,7 @@ public class SharedCommandTests {
         String key = UUID.randomUUID().toString();
         String field1 = UUID.randomUUID().toString();
         String field2 = UUID.randomUUID().toString();
-        Map<String, String> fieldValueMap = Map.of(field1, "value1", field2, "value1");
+        Map<String, String> fieldValueMap = createMap(field1, "value1", field2, "value1");
 
         assertEquals(2, client.hset(key, fieldValueMap).get());
         assertTrue(client.hexists(key, field1).get());
@@ -3414,7 +3498,7 @@ public class SharedCommandTests {
         GlideString field1 = gs(UUID.randomUUID().toString());
         GlideString field2 = gs(UUID.randomUUID().toString());
         Map<GlideString, GlideString> fieldValueMap =
-                Map.of(field1, gs("value1"), field2, gs("value1"));
+                createMap(field1, gs("value1"), field2, gs("value1"));
 
         assertEquals(2, client.hset(key, fieldValueMap).get());
         assertTrue(client.hexists(key, field1).get());
@@ -3430,11 +3514,11 @@ public class SharedCommandTests {
         String field1 = UUID.randomUUID().toString();
         String field2 = UUID.randomUUID().toString();
         String value = UUID.randomUUID().toString();
-        Map<String, String> fieldValueMap = Map.of(field1, value, field2, value);
+        Map<String, String> fieldValueMap = createMap(field1, value, field2, value);
 
         assertEquals(2, client.hset(key, fieldValueMap).get());
         assertEquals(fieldValueMap, client.hgetall(key).get());
-        assertEquals(Map.of(), client.hgetall("non_existing_key").get());
+        assertEquals(createMap(), client.hgetall("non_existing_key").get());
     }
 
     @SneakyThrows
@@ -3446,7 +3530,7 @@ public class SharedCommandTests {
         GlideString field2 = gs(UUID.randomUUID().toString());
         GlideString value = gs(UUID.randomUUID().toString());
         HashMap<GlideString, GlideString> fieldValueMap =
-                new HashMap<>(Map.of(field1, value, field2, value));
+                new HashMap<>(createMap(field1, value, field2, value));
 
         assertEquals(2, client.hset(key, fieldValueMap).get());
         Map<GlideString, GlideString> allItems = client.hgetall(key).get();
@@ -3460,7 +3544,7 @@ public class SharedCommandTests {
     public void hincrBy_hincrByFloat_commands_existing_key_existing_field(BaseClient client) {
         String key = UUID.randomUUID().toString();
         String field = UUID.randomUUID().toString();
-        Map<String, String> fieldValueMap = Map.of(field, "10");
+        Map<String, String> fieldValueMap = createMap(field, "10");
 
         assertEquals(1, client.hset(key, fieldValueMap).get());
 
@@ -3476,7 +3560,7 @@ public class SharedCommandTests {
         String key1 = UUID.randomUUID().toString();
         String key2 = UUID.randomUUID().toString();
         String field = UUID.randomUUID().toString();
-        Map<String, String> fieldValueMap = Map.of(field, "10");
+        Map<String, String> fieldValueMap = createMap(field, "10");
 
         assertEquals(1, client.hincrBy("non_existing_key_1", field, 1).get());
         assertEquals(1, client.hset(key1, fieldValueMap).get());
@@ -3493,7 +3577,7 @@ public class SharedCommandTests {
     public void hincrBy_hincrByFloat_type_error(BaseClient client) {
         String key = UUID.randomUUID().toString();
         String field = UUID.randomUUID().toString();
-        Map<String, String> fieldValueMap = Map.of(field, "foo");
+        Map<String, String> fieldValueMap = createMap(field, "foo");
 
         assertEquals(1, client.hset(key, fieldValueMap).get());
 
@@ -3513,7 +3597,7 @@ public class SharedCommandTests {
         String key1 = UUID.randomUUID().toString();
         String key2 = UUID.randomUUID().toString();
 
-        var data = new LinkedHashMap<String, String>();
+        LinkedHashMap<String, String> data = new LinkedHashMap<String, String>();
         data.put("f 1", "v 1");
         data.put("f 2", "v 2");
         assertEquals(2, client.hset(key1, data).get());
@@ -3535,7 +3619,7 @@ public class SharedCommandTests {
         GlideString key1 = gs(UUID.randomUUID().toString());
         GlideString key2 = gs(UUID.randomUUID().toString());
 
-        var data = new LinkedHashMap<GlideString, GlideString>();
+        LinkedHashMap<GlideString, GlideString> data = new LinkedHashMap<GlideString, GlideString>();
         data.put(gs("f 1"), gs("v 1"));
         data.put(gs("f 2"), gs("v 2"));
         assertEquals(2, client.hset(key1, data).get());
@@ -3557,7 +3641,7 @@ public class SharedCommandTests {
         String key1 = UUID.randomUUID().toString();
         String key2 = UUID.randomUUID().toString();
 
-        assertEquals(1, client.hset(key1, Map.of("field", "value")).get());
+        assertEquals(1, client.hset(key1, createMap("field", "value")).get());
         assertEquals(5L, client.hstrlen(key1, "field").get());
 
         // missing value
@@ -3585,16 +3669,16 @@ public class SharedCommandTests {
         assertEquals(0, client.hrandfieldWithCount(key1, 5).get().length);
         assertEquals(0, client.hrandfieldWithCountWithValues(key1, 5).get().length);
 
-        var data = Map.of("f 1", "v 1", "f 2", "v 2", "f 3", "v 3");
+        Map<String, String> data = createMap("f 1", "v 1", "f 2", "v 2", "f 3", "v 3");
         assertEquals(3, client.hset(key1, data).get());
 
         // random key
         assertTrue(data.containsKey(client.hrandfield(key1).get()));
 
         // WithCount - positive count
-        var keys = client.hrandfieldWithCount(key1, 5).get();
+        String[] keys = client.hrandfieldWithCount(key1, 5).get();
         assertEquals(data.keySet().size(), keys.length);
-        assertEquals(data.keySet(), Set.of(keys));
+        assertEquals(data.keySet(), new HashSet<>(Arrays.asList(keys)));
 
         // WithCount - negative count
         keys = client.hrandfieldWithCount(key1, -5).get();
@@ -3602,16 +3686,16 @@ public class SharedCommandTests {
         Arrays.stream(keys).forEach(key -> assertTrue(data.containsKey(key)));
 
         // WithCountWithValues - positive count
-        var keysWithValues = client.hrandfieldWithCountWithValues(key1, 5).get();
+        Object[][] keysWithValues = client.hrandfieldWithCountWithValues(key1, 5).get();
         assertEquals(data.keySet().size(), keysWithValues.length);
-        for (var pair : keysWithValues) {
+        for (Object[] pair : keysWithValues) {
             assertEquals(data.get(pair[0]), pair[1]);
         }
 
         // WithCountWithValues - negative count
         keysWithValues = client.hrandfieldWithCountWithValues(key1, -5).get();
         assertEquals(5, keysWithValues.length);
-        for (var pair : keysWithValues) {
+        for (Object[] pair : keysWithValues) {
             assertEquals(data.get(pair[0]), pair[1]);
         }
 
@@ -3644,16 +3728,17 @@ public class SharedCommandTests {
         assertEquals(0, client.hrandfieldWithCount(key1, 5).get().length);
         assertEquals(0, client.hrandfieldWithCountWithValues(key1, 5).get().length);
 
-        var data = Map.of(gs("f 1"), gs("v 1"), gs("f 2"), gs("v 2"), gs("f 3"), gs("v 3"));
+        Map<GlideString, GlideString> data =
+                createMap(gs("f 1"), gs("v 1"), gs("f 2"), gs("v 2"), gs("f 3"), gs("v 3"));
         assertEquals(3, client.hset(key1, data).get());
 
         // random key
         assertTrue(data.containsKey(client.hrandfield(key1).get()));
 
         // WithCount - positive count
-        var keys = client.hrandfieldWithCount(key1, 5).get();
+        GlideString[] keys = client.hrandfieldWithCount(key1, 5).get();
         assertEquals(data.keySet().size(), keys.length);
-        assertEquals(data.keySet(), Set.of(keys));
+        assertEquals(data.keySet(), new HashSet<>(Arrays.asList(keys)));
 
         // WithCount - negative count
         keys = client.hrandfieldWithCount(key1, -5).get();
@@ -3661,16 +3746,16 @@ public class SharedCommandTests {
         Arrays.stream(keys).forEach(key -> assertTrue(data.containsKey(key)));
 
         // WithCountWithValues - positive count
-        var keysWithValues = client.hrandfieldWithCountWithValues(key1, 5).get();
+        Object[][] keysWithValues = client.hrandfieldWithCountWithValues(key1, 5).get();
         assertEquals(data.keySet().size(), keysWithValues.length);
-        for (var pair : keysWithValues) {
+        for (Object[] pair : keysWithValues) {
             assertEquals(data.get(pair[0]), pair[1]);
         }
 
         // WithCountWithValues - negative count
         keysWithValues = client.hrandfieldWithCountWithValues(key1, -5).get();
         assertEquals(5, keysWithValues.length);
-        for (var pair : keysWithValues) {
+        for (Object[] pair : keysWithValues) {
             assertEquals(data.get(pair[0]), pair[1]);
         }
 
@@ -4167,10 +4252,10 @@ public class SharedCommandTests {
                 4, client.sadd(key, new String[] {"member1", "member2", "member3", "member4"}).get());
         assertEquals(1, client.srem(key, new String[] {"member3", "nonExistingMember"}).get());
 
-        Set<String> expectedMembers = Set.of("member1", "member2", "member4");
+        Set<String> expectedMembers = createSet("member1", "member2", "member4");
         assertEquals(expectedMembers, client.smembers(key).get());
 
-        Set<String> expectedMembersBin = Set.of("member1", "member2", "member4");
+        Set<String> expectedMembersBin = createSet("member1", "member2", "member4");
         assertEquals(expectedMembersBin, client.smembers(key).get());
 
         assertEquals(1, client.srem(key, new String[] {"member1"}).get());
@@ -4191,10 +4276,10 @@ public class SharedCommandTests {
         assertEquals(
                 1, client.srem(key, new GlideString[] {gs("member3"), gs("nonExistingMember")}).get());
 
-        Set<GlideString> expectedMembers = Set.of(gs("member1"), gs("member2"), gs("member4"));
+        Set<GlideString> expectedMembers = createSet(gs("member1"), gs("member2"), gs("member4"));
         assertEquals(expectedMembers, client.smembers(key).get());
 
-        Set<GlideString> expectedMembersBin = Set.of(gs("member1"), gs("member2"), gs("member4"));
+        Set<GlideString> expectedMembersBin = createSet(gs("member1"), gs("member2"), gs("member4"));
         assertEquals(expectedMembersBin, client.smembers(key).get());
 
         assertEquals(1, client.srem(key, new GlideString[] {gs("member1")}).get());
@@ -4207,7 +4292,7 @@ public class SharedCommandTests {
     public void srem_scard_smembers_non_existing_key(BaseClient client) {
         assertEquals(0, client.srem("nonExistingKey", new String[] {"member"}).get());
         assertEquals(0, client.scard("nonExistingKey").get());
-        assertEquals(Set.of(), client.smembers("nonExistingKey").get());
+        assertEquals(Collections.emptySet(), client.smembers("nonExistingKey").get());
     }
 
     @SneakyThrows
@@ -4245,31 +4330,31 @@ public class SharedCommandTests {
 
         // move an elem
         assertTrue(client.smove(setKey1, setKey2, "1").get());
-        assertEquals(Set.of("2", "3"), client.smembers(setKey1).get());
-        assertEquals(Set.of("1", "2", "3"), client.smembers(setKey2).get());
+        assertEquals(createSet("2", "3"), client.smembers(setKey1).get());
+        assertEquals(createSet("1", "2", "3"), client.smembers(setKey2).get());
 
         // move an elem which preset at destination
         assertTrue(client.smove(setKey2, setKey1, "2").get());
-        assertEquals(Set.of("2", "3"), client.smembers(setKey1).get());
-        assertEquals(Set.of("1", "3"), client.smembers(setKey2).get());
+        assertEquals(createSet("2", "3"), client.smembers(setKey1).get());
+        assertEquals(createSet("1", "3"), client.smembers(setKey2).get());
 
         // move from missing key
         assertFalse(client.smove(setKey3, setKey1, "4").get());
-        assertEquals(Set.of("2", "3"), client.smembers(setKey1).get());
+        assertEquals(createSet("2", "3"), client.smembers(setKey1).get());
 
         // move to a new set
         assertTrue(client.smove(setKey1, setKey3, "2").get());
-        assertEquals(Set.of("3"), client.smembers(setKey1).get());
-        assertEquals(Set.of("2"), client.smembers(setKey3).get());
+        assertEquals(Collections.singleton("3"), client.smembers(setKey1).get());
+        assertEquals(Collections.singleton("2"), client.smembers(setKey3).get());
 
         // move missing element
         assertFalse(client.smove(setKey1, setKey3, "42").get());
-        assertEquals(Set.of("3"), client.smembers(setKey1).get());
-        assertEquals(Set.of("2"), client.smembers(setKey3).get());
+        assertEquals(Collections.singleton("3"), client.smembers(setKey1).get());
+        assertEquals(Collections.singleton("2"), client.smembers(setKey3).get());
 
         // move missing element to missing key
         assertFalse(client.smove(setKey1, nonSetKey, "42").get());
-        assertEquals(Set.of("3"), client.smembers(setKey1).get());
+        assertEquals(Collections.singleton("3"), client.smembers(setKey1).get());
         assertEquals("none", client.type(nonSetKey).get());
 
         // Key exists, but it is not a set
@@ -4297,31 +4382,31 @@ public class SharedCommandTests {
 
         // move an elem
         assertTrue(client.smove(setKey1, setKey2, gs("1")).get());
-        assertEquals(Set.of(gs("2"), gs("3")), client.smembers(setKey1).get());
-        assertEquals(Set.of(gs("1"), gs("2"), gs("3")), client.smembers(setKey2).get());
+        assertEquals(createSet(gs("2"), gs("3")), client.smembers(setKey1).get());
+        assertEquals(createSet(gs("1"), gs("2"), gs("3")), client.smembers(setKey2).get());
 
         // move an elem which preset at destination
         assertTrue(client.smove(setKey2, setKey1, gs("2")).get());
-        assertEquals(Set.of(gs("2"), gs("3")), client.smembers(setKey1).get());
-        assertEquals(Set.of(gs("1"), gs("3")), client.smembers(setKey2).get());
+        assertEquals(createSet(gs("2"), gs("3")), client.smembers(setKey1).get());
+        assertEquals(createSet(gs("1"), gs("3")), client.smembers(setKey2).get());
 
         // move from missing key
         assertFalse(client.smove(setKey3, setKey1, gs("4")).get());
-        assertEquals(Set.of(gs("2"), gs("3")), client.smembers(setKey1).get());
+        assertEquals(createSet(gs("2"), gs("3")), client.smembers(setKey1).get());
 
         // move to a new set
         assertTrue(client.smove(setKey1, setKey3, gs("2")).get());
-        assertEquals(Set.of(gs("3")), client.smembers(setKey1).get());
-        assertEquals(Set.of(gs("2")), client.smembers(setKey3).get());
+        assertEquals(Collections.singleton(gs("3")), client.smembers(setKey1).get());
+        assertEquals(Collections.singleton(gs("2")), client.smembers(setKey3).get());
 
         // move missing element
         assertFalse(client.smove(setKey1, setKey3, gs("42")).get());
-        assertEquals(Set.of(gs("3")), client.smembers(setKey1).get());
-        assertEquals(Set.of(gs("2")), client.smembers(setKey3).get());
+        assertEquals(Collections.singleton(gs("3")), client.smembers(setKey1).get());
+        assertEquals(Collections.singleton(gs("2")), client.smembers(setKey3).get());
 
         // move missing element to missing key
         assertFalse(client.smove(setKey1, nonSetKey, gs("42")).get());
-        assertEquals(Set.of(gs("3")), client.smembers(setKey1).get());
+        assertEquals(Collections.singleton(gs("3")), client.smembers(setKey1).get());
         assertEquals("none", client.type(nonSetKey).get());
 
         // Key exists, but it is not a set
@@ -4386,7 +4471,7 @@ public class SharedCommandTests {
         assertEquals(OK, client.set(key3, "key3").get());
 
         // rename missing key
-        var executionException =
+        ExecutionException executionException =
                 assertThrows(ExecutionException.class, () -> client.renamenx(key1, key2).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
         assertTrue(executionException.getMessage().toLowerCase().contains("no such key"));
@@ -4413,7 +4498,7 @@ public class SharedCommandTests {
         assertEquals(OK, client.set(key3, gs("key3")).get());
 
         // rename missing key
-        var executionException =
+        ExecutionException executionException =
                 assertThrows(ExecutionException.class, () -> client.renamenx(key1, key2).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
         assertTrue(executionException.getMessage().toLowerCase().contains("no such key"));
@@ -4483,19 +4568,19 @@ public class SharedCommandTests {
 
         // create new
         assertEquals(1, client.sinterstore(key3, new String[] {key1, key2}).get());
-        assertEquals(Set.of("c"), client.smembers(key3).get());
+        assertEquals(Collections.singleton("c"), client.smembers(key3).get());
 
         // overwrite existing set
         assertEquals(1, client.sinterstore(key2, new String[] {key3, key2}).get());
-        assertEquals(Set.of("c"), client.smembers(key2).get());
+        assertEquals(Collections.singleton("c"), client.smembers(key2).get());
 
         // overwrite source
         assertEquals(0, client.sinterstore(key1, new String[] {key1, key4}).get());
-        assertEquals(Set.of(), client.smembers(key1).get());
+        assertEquals(Collections.emptySet(), client.smembers(key1).get());
 
         // overwrite source
         assertEquals(1, client.sinterstore(key2, new String[] {key2}).get());
-        assertEquals(Set.of("c"), client.smembers(key2).get());
+        assertEquals(Collections.singleton("c"), client.smembers(key2).get());
 
         // source key exists, but it is not a set
         assertEquals(OK, client.set(key5, "value").get());
@@ -4506,7 +4591,7 @@ public class SharedCommandTests {
 
         // overwrite destination - not a set
         assertEquals(0, client.sinterstore(key5, new String[] {key1, key2}).get());
-        assertEquals(Set.of(), client.smembers(key5).get());
+        assertEquals(Collections.emptySet(), client.smembers(key5).get());
 
         // wrong arguments
         executionException =
@@ -4530,19 +4615,19 @@ public class SharedCommandTests {
 
         // create new
         assertEquals(1, client.sinterstore(key3, new GlideString[] {key1, key2}).get());
-        assertEquals(Set.of(gs("c")), client.smembers(key3).get());
+        assertEquals(Collections.singleton(gs("c")), client.smembers(key3).get());
 
         // overwrite existing set
         assertEquals(1, client.sinterstore(key2, new GlideString[] {key3, key2}).get());
-        assertEquals(Set.of(gs("c")), client.smembers(key2).get());
+        assertEquals(Collections.singleton(gs("c")), client.smembers(key2).get());
 
         // overwrite source
         assertEquals(0, client.sinterstore(key1, new GlideString[] {key1, key4}).get());
-        assertEquals(Set.of(), client.smembers(key1).get());
+        assertEquals(Collections.emptySet(), client.smembers(key1).get());
 
         // overwrite source
         assertEquals(1, client.sinterstore(key2, new GlideString[] {key2}).get());
-        assertEquals(Set.of(gs("c")), client.smembers(key2).get());
+        assertEquals(Collections.singleton(gs("c")), client.smembers(key2).get());
 
         // source key exists, but it is not a set
         assertEquals(OK, client.set(key5, gs("value")).get());
@@ -4554,7 +4639,7 @@ public class SharedCommandTests {
 
         // overwrite destination - not a set
         assertEquals(0, client.sinterstore(key5, new GlideString[] {key1, key2}).get());
-        assertEquals(Set.of(), client.smembers(key5).get());
+        assertEquals(Collections.emptySet(), client.smembers(key5).get());
 
         // wrong arguments
         executionException =
@@ -4574,14 +4659,14 @@ public class SharedCommandTests {
         assertEquals(3, client.sadd(key1, new String[] {"a", "b", "c"}).get());
         assertEquals(3, client.sadd(key2, new String[] {"c", "d", "e"}).get());
 
-        assertEquals(Set.of("a", "b"), client.sdiff(new String[] {key1, key2}).get());
-        assertEquals(Set.of("d", "e"), client.sdiff(new String[] {key2, key1}).get());
+        assertEquals(createSet("a", "b"), client.sdiff(new String[] {key1, key2}).get());
+        assertEquals(createSet("d", "e"), client.sdiff(new String[] {key2, key1}).get());
 
         // second set is empty
-        assertEquals(Set.of("a", "b", "c"), client.sdiff(new String[] {key1, key3}).get());
+        assertEquals(createSet("a", "b", "c"), client.sdiff(new String[] {key1, key3}).get());
 
         // first set is empty
-        assertEquals(Set.of(), client.sdiff(new String[] {key3, key1}).get());
+        assertEquals(Collections.emptySet(), client.sdiff(new String[] {key3, key1}).get());
 
         // source key exists, but it is not a set
         assertEquals(OK, client.set(key3, "value").get());
@@ -4601,15 +4686,15 @@ public class SharedCommandTests {
         assertEquals(3, client.sadd(key1, new GlideString[] {gs("a"), gs("b"), gs("c")}).get());
         assertEquals(3, client.sadd(key2, new GlideString[] {gs("c"), gs("d"), gs("e")}).get());
 
-        assertEquals(Set.of(gs("a"), gs("b")), client.sdiff(new GlideString[] {key1, key2}).get());
-        assertEquals(Set.of(gs("d"), gs("e")), client.sdiff(new GlideString[] {key2, key1}).get());
+        assertEquals(createSet(gs("a"), gs("b")), client.sdiff(new GlideString[] {key1, key2}).get());
+        assertEquals(createSet(gs("d"), gs("e")), client.sdiff(new GlideString[] {key2, key1}).get());
 
         // second set is empty
         assertEquals(
-                Set.of(gs("a"), gs("b"), gs("c")), client.sdiff(new GlideString[] {key1, key3}).get());
+                createSet(gs("a"), gs("b"), gs("c")), client.sdiff(new GlideString[] {key1, key3}).get());
 
         // first set is empty
-        assertEquals(Set.of(), client.sdiff(new GlideString[] {key3, key1}).get());
+        assertEquals(Collections.emptySet(), client.sdiff(new GlideString[] {key3, key1}).get());
 
         // source key exists, but it is not a set
         assertEquals(OK, client.set(key3, gs("value")).get());
@@ -4671,6 +4756,37 @@ public class SharedCommandTests {
     @SneakyThrows
     @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
+    public void smismember_binary_with_large_response_preserves_boolean_array_values(
+            BaseClient client) {
+        GlideString key = gs(UUID.randomUUID().toString());
+        final int memberCount = 1900; // >16KB in DirectByteBuffer array fast-path
+
+        GlideString[] queryMembers = new GlideString[memberCount];
+        List<GlideString> existingMembers = new ArrayList<>();
+        for (int i = 0; i < memberCount; i++) {
+            GlideString member = gs("m-" + i);
+            queryMembers[i] = member;
+            if (i % 3 == 0) {
+                existingMembers.add(member);
+            }
+        }
+
+        assertEquals(
+                existingMembers.size(),
+                client.sadd(key, existingMembers.toArray(new GlideString[0])).get());
+
+        Boolean[] result = client.smismember(key, queryMembers).get();
+
+        assertEquals(memberCount, result.length);
+        for (int i = 0; i < memberCount; i++) {
+            assertNotNull(result[i], "SMISMEMBER should return booleans, never nil");
+            assertEquals(i % 3 == 0, result[i]);
+        }
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
     public void sdiffstore(BaseClient client) {
         String key1 = "{key}-1-" + UUID.randomUUID();
         String key2 = "{key}-2-" + UUID.randomUUID();
@@ -4684,23 +4800,23 @@ public class SharedCommandTests {
 
         // create new
         assertEquals(2, client.sdiffstore(key3, new String[] {key1, key2}).get());
-        assertEquals(Set.of("a", "b"), client.smembers(key3).get());
+        assertEquals(createSet("a", "b"), client.smembers(key3).get());
 
         // overwrite existing set
         assertEquals(2, client.sdiffstore(key2, new String[] {key3, key2}).get());
-        assertEquals(Set.of("a", "b"), client.smembers(key2).get());
+        assertEquals(createSet("a", "b"), client.smembers(key2).get());
 
         // overwrite source
         assertEquals(3, client.sdiffstore(key1, new String[] {key1, key4}).get());
-        assertEquals(Set.of("a", "b", "c"), client.smembers(key1).get());
+        assertEquals(createSet("a", "b", "c"), client.smembers(key1).get());
 
         // diff with empty set
         assertEquals(3, client.sdiffstore(key1, new String[] {key1, key5}).get());
-        assertEquals(Set.of("a", "b", "c"), client.smembers(key1).get());
+        assertEquals(createSet("a", "b", "c"), client.smembers(key1).get());
 
         // diff empty with non-empty set
         assertEquals(0, client.sdiffstore(key3, new String[] {key5, key1}).get());
-        assertEquals(Set.of(), client.smembers(key3).get());
+        assertEquals(Collections.emptySet(), client.smembers(key3).get());
 
         // source key exists, but it is not a set
         assertEquals(OK, client.set(key5, "value").get());
@@ -4711,7 +4827,7 @@ public class SharedCommandTests {
 
         // overwrite destination - not a set
         assertEquals(1, client.sdiffstore(key5, new String[] {key1, key2}).get());
-        assertEquals(Set.of("c"), client.smembers(key5).get());
+        assertEquals(Collections.singleton("c"), client.smembers(key5).get());
 
         // wrong arguments
         executionException =
@@ -4735,23 +4851,23 @@ public class SharedCommandTests {
 
         // create new
         assertEquals(2, client.sdiffstore(key3, new GlideString[] {key1, key2}).get());
-        assertEquals(Set.of(gs("a"), gs("b")), client.smembers(key3).get());
+        assertEquals(createSet(gs("a"), gs("b")), client.smembers(key3).get());
 
         // overwrite existing set
         assertEquals(2, client.sdiffstore(key2, new GlideString[] {key3, key2}).get());
-        assertEquals(Set.of(gs("a"), gs("b")), client.smembers(key2).get());
+        assertEquals(createSet(gs("a"), gs("b")), client.smembers(key2).get());
 
         // overwrite source
         assertEquals(3, client.sdiffstore(key1, new GlideString[] {key1, key4}).get());
-        assertEquals(Set.of(gs("a"), gs("b"), gs("c")), client.smembers(key1).get());
+        assertEquals(createSet(gs("a"), gs("b"), gs("c")), client.smembers(key1).get());
 
         // diff with empty set
         assertEquals(3, client.sdiffstore(key1, new GlideString[] {key1, key5}).get());
-        assertEquals(Set.of(gs("a"), gs("b"), gs("c")), client.smembers(key1).get());
+        assertEquals(createSet(gs("a"), gs("b"), gs("c")), client.smembers(key1).get());
 
         // diff empty with non-empty set
         assertEquals(0, client.sdiffstore(key3, new GlideString[] {key5, key1}).get());
-        assertEquals(Set.of(), client.smembers(key3).get());
+        assertEquals(Collections.emptySet(), client.smembers(key3).get());
 
         // source key exists, but it is not a set
         assertEquals(OK, client.set(key5, gs("value")).get());
@@ -4763,7 +4879,7 @@ public class SharedCommandTests {
 
         // overwrite destination - not a set
         assertEquals(1, client.sdiffstore(key5, new GlideString[] {key1, key2}).get());
-        assertEquals(Set.of(gs("c")), client.smembers(key5).get());
+        assertEquals(Collections.singleton(gs("c")), client.smembers(key5).get());
 
         // wrong arguments
         executionException =
@@ -4782,7 +4898,7 @@ public class SharedCommandTests {
 
         assertEquals(3, client.sadd(key1, new String[] {"a", "b", "c"}).get());
         assertEquals(3, client.sadd(key2, new String[] {"c", "d", "e"}).get());
-        assertEquals(Set.of("c"), client.sinter(new String[] {key1, key2}).get());
+        assertEquals(Collections.singleton("c"), client.sinter(new String[] {key1, key2}).get());
         assertEquals(0, client.sinter(new String[] {key1, key3}).get().size());
 
         // Key exists, but it is not a set
@@ -4802,7 +4918,8 @@ public class SharedCommandTests {
 
         assertEquals(3, client.sadd(key1, new GlideString[] {gs("a"), gs("b"), gs("c")}).get());
         assertEquals(3, client.sadd(key2, new GlideString[] {gs("c"), gs("d"), gs("e")}).get());
-        assertEquals(Set.of(gs("c")), client.sinter(new GlideString[] {key1, key2}).get());
+        assertEquals(
+                Collections.singleton(gs("c")), client.sinter(new GlideString[] {key1, key2}).get());
         assertEquals(0, client.sinter(new GlideString[] {key1, key3}).get().size());
 
         // Key exists, but it is not a set
@@ -4828,15 +4945,18 @@ public class SharedCommandTests {
 
         // create new
         assertEquals(5, client.sunionstore(key3, new String[] {key1, key2}).get());
-        assertEquals(Set.of("a", "b", "c", "d", "e"), client.smembers(key3).get());
+        assertEquals(
+                new HashSet<>(Arrays.asList("a", "b", "c", "d", "e")), client.smembers(key3).get());
 
         // overwrite existing set
         assertEquals(5, client.sunionstore(key2, new String[] {key3, key2}).get());
-        assertEquals(Set.of("a", "b", "c", "d", "e"), client.smembers(key2).get());
+        assertEquals(
+                new HashSet<>(Arrays.asList("a", "b", "c", "d", "e")), client.smembers(key2).get());
 
         // overwrite source
         assertEquals(6, client.sunionstore(key1, new String[] {key1, key4}).get());
-        assertEquals(Set.of("a", "b", "c", "e", "f", "g"), client.smembers(key1).get());
+        assertEquals(
+                new HashSet<>(Arrays.asList("a", "b", "c", "e", "f", "g")), client.smembers(key1).get());
 
         // source key exists, but it is not a set
         assertEquals(OK, client.set(key5, "value").get());
@@ -4847,7 +4967,9 @@ public class SharedCommandTests {
 
         // overwrite destination - not a set
         assertEquals(7, client.sunionstore(key5, new String[] {key1, key2}).get());
-        assertEquals(Set.of("a", "b", "c", "d", "e", "f", "g"), client.smembers(key5).get());
+        assertEquals(
+                new HashSet<>(Arrays.asList("a", "b", "c", "d", "e", "f", "g")),
+                client.smembers(key5).get());
 
         // wrong arguments
         executionException =
@@ -4871,16 +4993,21 @@ public class SharedCommandTests {
 
         // create new
         assertEquals(5, client.sunionstore(key3, new GlideString[] {key1, key2}).get());
-        assertEquals(Set.of(gs("a"), gs("b"), gs("c"), gs("d"), gs("e")), client.smembers(key3).get());
+        assertEquals(
+                new HashSet<>(Arrays.asList(gs("a"), gs("b"), gs("c"), gs("d"), gs("e"))),
+                client.smembers(key3).get());
 
         // overwrite existing set
         assertEquals(5, client.sunionstore(key2, new GlideString[] {key3, key2}).get());
-        assertEquals(Set.of(gs("a"), gs("b"), gs("c"), gs("d"), gs("e")), client.smembers(key2).get());
+        assertEquals(
+                new HashSet<>(Arrays.asList(gs("a"), gs("b"), gs("c"), gs("d"), gs("e"))),
+                client.smembers(key2).get());
 
         // overwrite source
         assertEquals(6, client.sunionstore(key1, new GlideString[] {key1, key4}).get());
         assertEquals(
-                Set.of(gs("a"), gs("b"), gs("c"), gs("e"), gs("f"), gs("g")), client.smembers(key1).get());
+                new HashSet<>(Arrays.asList(gs("a"), gs("b"), gs("c"), gs("e"), gs("f"), gs("g"))),
+                client.smembers(key1).get());
 
         // source key exists, but it is not a set
         assertEquals(OK, client.set(key5, gs("value")).get());
@@ -4893,7 +5020,7 @@ public class SharedCommandTests {
         // overwrite destination - not a set
         assertEquals(7, client.sunionstore(key5, new GlideString[] {key1, key2}).get());
         assertEquals(
-                Set.of(gs("a"), gs("b"), gs("c"), gs("d"), gs("e"), gs("f"), gs("g")),
+                new HashSet<>(Arrays.asList(gs("a"), gs("b"), gs("c"), gs("d"), gs("e"), gs("f"), gs("g"))),
                 client.smembers(key5).get());
 
         // wrong arguments
@@ -5422,7 +5549,7 @@ public class SharedCommandTests {
     @MethodSource("getClients")
     public void zadd_and_zaddIncr(BaseClient client) {
         String key = UUID.randomUUID().toString();
-        Map<String, Double> membersScores = Map.of("one", 1.0, "two", 2.0, "three", 3.0);
+        Map<String, Double> membersScores = createMap("one", 1.0, "two", 2.0, "three", 3.0);
 
         assertEquals(3, client.zadd(key, membersScores).get());
         assertEquals(3.0, client.zaddIncr(key, "one", 2.0).get());
@@ -5434,7 +5561,7 @@ public class SharedCommandTests {
     public void zadd_binary_and_zaddIncr_binary(BaseClient client) {
         GlideString key = gs(UUID.randomUUID().toString());
         Map<GlideString, Double> membersScores =
-                Map.of(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0);
+                createMap(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0);
 
         assertEquals(3, client.zadd(key, membersScores).get());
         assertEquals(3.0, client.zaddIncr(key, gs("one"), 2.0).get());
@@ -5445,7 +5572,7 @@ public class SharedCommandTests {
     @MethodSource("getClients")
     public void zadd_and_zaddIncr_wrong_type(BaseClient client) {
         assertEquals(OK, client.set("foo", "bar").get());
-        Map<String, Double> membersScores = Map.of("one", 1.0, "two", 2.0, "three", 3.0);
+        Map<String, Double> membersScores = createMap("one", 1.0, "two", 2.0, "three", 3.0);
 
         ExecutionException executionExceptionZadd =
                 assertThrows(ExecutionException.class, () -> client.zadd("foo", membersScores).get());
@@ -5462,7 +5589,7 @@ public class SharedCommandTests {
     public void zadd_binary_and_zaddIncr_binary_wrong_type(BaseClient client) {
         assertEquals(OK, client.set(gs("foo"), gs("bar")).get());
         Map<GlideString, Double> membersScores =
-                Map.of(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0);
+                createMap(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0);
 
         ExecutionException executionExceptionZadd =
                 assertThrows(ExecutionException.class, () -> client.zadd(gs("foo"), membersScores).get());
@@ -5479,7 +5606,7 @@ public class SharedCommandTests {
     @MethodSource("getClients")
     public void zadd_and_zaddIncr_with_NX_XX(BaseClient client) {
         String key = UUID.randomUUID().toString();
-        Map<String, Double> membersScores = Map.of("one", 1.0, "two", 2.0, "three", 3.0);
+        Map<String, Double> membersScores = createMap("one", 1.0, "two", 2.0, "three", 3.0);
 
         ZAddOptions onlyIfExistsOptions =
                 ZAddOptions.builder()
@@ -5502,7 +5629,7 @@ public class SharedCommandTests {
     public void zadd_binary_and_zaddIncr_binary_with_NX_XX(BaseClient client) {
         GlideString key = gs(UUID.randomUUID().toString());
         Map<GlideString, Double> membersScores =
-                Map.of(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0);
+                createMap(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0);
 
         ZAddOptions onlyIfExistsOptions =
                 ZAddOptions.builder()
@@ -5648,7 +5775,7 @@ public class SharedCommandTests {
     @MethodSource("getClients")
     public void zrem(BaseClient client) {
         String key = UUID.randomUUID().toString();
-        Map<String, Double> membersScores = Map.of("one", 1.0, "two", 2.0, "three", 3.0);
+        Map<String, Double> membersScores = createMap("one", 1.0, "two", 2.0, "three", 3.0);
         assertEquals(3, client.zadd(key, membersScores).get());
         assertEquals(1, client.zrem(key, new String[] {"one"}).get());
         assertEquals(2, client.zrem(key, new String[] {"one", "two", "three"}).get());
@@ -5667,7 +5794,7 @@ public class SharedCommandTests {
     @MethodSource("getClients")
     public void zcard(BaseClient client) {
         String key = UUID.randomUUID().toString();
-        Map<String, Double> membersScores = Map.of("one", 1.0, "two", 2.0, "three", 3.0);
+        Map<String, Double> membersScores = createMap("one", 1.0, "two", 2.0, "three", 3.0);
         assertEquals(3, client.zadd(key, membersScores).get());
         assertEquals(3, client.zcard(key).get());
         assertEquals(1, client.zrem(key, new String[] {"one"}).get());
@@ -5687,10 +5814,10 @@ public class SharedCommandTests {
     @MethodSource("getClients")
     public void zpopmin(BaseClient client) {
         String key = UUID.randomUUID().toString();
-        Map<String, Double> membersScores = Map.of("a", 1.0, "b", 2.0, "c", 3.0);
+        Map<String, Double> membersScores = createMap("a", 1.0, "b", 2.0, "c", 3.0);
         assertEquals(3, client.zadd(key, membersScores).get());
-        assertEquals(Map.of("a", 1.0), client.zpopmin(key).get());
-        assertEquals(Map.of("b", 2.0, "c", 3.0), client.zpopmin(key, 3).get());
+        assertEquals(createMap("a", 1.0), client.zpopmin(key).get());
+        assertEquals(createMap("b", 2.0, "c", 3.0), client.zpopmin(key, 3).get());
         assertTrue(client.zpopmin(key).get().isEmpty());
         assertTrue(client.zpopmin("non_existing_key").get().isEmpty());
 
@@ -5706,15 +5833,15 @@ public class SharedCommandTests {
     @MethodSource("getClients")
     public void zpopmin_binary(BaseClient client) {
         GlideString key = gs(UUID.randomUUID().toString());
-        Map<String, Double> membersScores = Map.of("a", 1.0, "b", 2.0, "c", 3.0);
+        Map<String, Double> membersScores = createMap("a", 1.0, "b", 2.0, "c", 3.0);
         assertEquals(
                 3,
                 client
                         .zadd(key.toString(), membersScores)
                         .get()); // TODO: use the binary version of this function call once the binary version
         // of zadd() is merged
-        assertEquals(Map.of(gs("a"), 1.0), client.zpopmin(key).get());
-        assertEquals(Map.of(gs("b"), 2.0, gs("c"), 3.0), client.zpopmin(key, 3).get());
+        assertEquals(createMap(gs("a"), 1.0), client.zpopmin(key).get());
+        assertEquals(createMap(gs("b"), 2.0, gs("c"), 3.0), client.zpopmin(key, 3).get());
         assertTrue(client.zpopmin(key).get().isEmpty());
         assertTrue(client.zpopmin(gs("non_existing_key")).get().isEmpty());
 
@@ -5733,8 +5860,8 @@ public class SharedCommandTests {
         String key2 = "{test}-2-" + UUID.randomUUID();
         String key3 = "{test}-3-" + UUID.randomUUID();
 
-        assertEquals(2, client.zadd(key1, Map.of("a", 1.0, "b", 1.5)).get());
-        assertEquals(1, client.zadd(key2, Map.of("c", 2.0)).get());
+        assertEquals(2, client.zadd(key1, createMap("a", 1.0, "b", 1.5)).get());
+        assertEquals(1, client.zadd(key2, createMap("c", 2.0)).get());
         assertArrayEquals(
                 new Object[] {key1, "a", 1.0}, client.bzpopmin(new String[] {key1, key2}, .5).get());
 
@@ -5767,13 +5894,13 @@ public class SharedCommandTests {
         assertEquals(
                 2,
                 client
-                        .zadd(key1.toString(), Map.of("a", 1.0, "b", 1.5))
+                        .zadd(key1.toString(), createMap("a", 1.0, "b", 1.5))
                         .get()); // TODO: use the binary version of this function call once the binary version
         // of zadd() is merged
         assertEquals(
                 1,
                 client
-                        .zadd(key2.toString(), Map.of("c", 2.0))
+                        .zadd(key2.toString(), createMap("c", 2.0))
                         .get()); // TODO: use the binary version of this function call once the binary version
         // of zadd() is merged
         assertArrayEquals(
@@ -5805,7 +5932,7 @@ public class SharedCommandTests {
     public void bzpopmin_timeout_check(BaseClient client) {
         String key = UUID.randomUUID().toString();
         // create new client with default request timeout (250 millis)
-        try (var testClient =
+        try (BaseClient testClient =
                 client instanceof GlideClient
                         ? GlideClient.createClient(commonClientConfig().build()).get()
                         : GlideClusterClient.createClient(commonClusterClientConfig().build()).get()) {
@@ -5827,7 +5954,7 @@ public class SharedCommandTests {
     public void bzpopmin_binary_timeout_check(BaseClient client) {
         GlideString key = gs(UUID.randomUUID().toString());
         // create new client with default request timeout (250 millis)
-        try (var testClient =
+        try (BaseClient testClient =
                 client instanceof GlideClient
                         ? GlideClient.createClient(commonClientConfig().build()).get()
                         : GlideClusterClient.createClient(commonClusterClientConfig().build()).get()) {
@@ -5848,10 +5975,10 @@ public class SharedCommandTests {
     @MethodSource("getClients")
     public void zpopmax(BaseClient client) {
         String key = UUID.randomUUID().toString();
-        Map<String, Double> membersScores = Map.of("a", 1.0, "b", 2.0, "c", 3.0);
+        Map<String, Double> membersScores = createMap("a", 1.0, "b", 2.0, "c", 3.0);
         assertEquals(3, client.zadd(key, membersScores).get());
-        assertEquals(Map.of("c", 3.0), client.zpopmax(key).get());
-        assertEquals(Map.of("b", 2.0, "a", 1.0), client.zpopmax(key, 3).get());
+        assertEquals(createMap("c", 3.0), client.zpopmax(key).get());
+        assertEquals(createMap("b", 2.0, "a", 1.0), client.zpopmax(key, 3).get());
         assertTrue(client.zpopmax(key).get().isEmpty());
         assertTrue(client.zpopmax("non_existing_key").get().isEmpty());
 
@@ -5867,15 +5994,15 @@ public class SharedCommandTests {
     @MethodSource("getClients")
     public void zpopmax_binary(BaseClient client) {
         GlideString key = gs(UUID.randomUUID().toString());
-        Map<String, Double> membersScores = Map.of("a", 1.0, "b", 2.0, "c", 3.0);
+        Map<String, Double> membersScores = createMap("a", 1.0, "b", 2.0, "c", 3.0);
         assertEquals(
                 3,
                 client
                         .zadd(key.toString(), membersScores)
                         .get()); // TODO: use the binary version of this function call once the binary version
         // of zadd() is merged
-        assertEquals(Map.of(gs("c"), 3.0), client.zpopmax(key).get());
-        assertEquals(Map.of(gs("b"), 2.0, gs("a"), 1.0), client.zpopmax(key, 3).get());
+        assertEquals(createMap(gs("c"), 3.0), client.zpopmax(key).get());
+        assertEquals(createMap(gs("b"), 2.0, gs("a"), 1.0), client.zpopmax(key, 3).get());
         assertTrue(client.zpopmax(key).get().isEmpty());
         assertTrue(client.zpopmax(gs("non_existing_key")).get().isEmpty());
 
@@ -5894,8 +6021,8 @@ public class SharedCommandTests {
         String key2 = "{test}-2-" + UUID.randomUUID();
         String key3 = "{test}-3-" + UUID.randomUUID();
 
-        assertEquals(2, client.zadd(key1, Map.of("a", 1.0, "b", 1.5)).get());
-        assertEquals(1, client.zadd(key2, Map.of("c", 2.0)).get());
+        assertEquals(2, client.zadd(key1, createMap("a", 1.0, "b", 1.5)).get());
+        assertEquals(1, client.zadd(key2, createMap("c", 2.0)).get());
         assertArrayEquals(
                 new Object[] {key1, "b", 1.5}, client.bzpopmax(new String[] {key1, key2}, .5).get());
 
@@ -5928,13 +6055,13 @@ public class SharedCommandTests {
         assertEquals(
                 2,
                 client
-                        .zadd(key1.toString(), Map.of("a", 1.0, "b", 1.5))
+                        .zadd(key1.toString(), createMap("a", 1.0, "b", 1.5))
                         .get()); // TODO: use the binary version of this function call once the binary version
         // of zadd() is merged
         assertEquals(
                 1,
                 client
-                        .zadd(key2.toString(), Map.of("c", 2.0))
+                        .zadd(key2.toString(), createMap("c", 2.0))
                         .get()); // TODO: use the binary version of this function call once the binary version
         // of zadd() is merged
         assertArrayEquals(
@@ -5966,7 +6093,7 @@ public class SharedCommandTests {
     public void bzpopmax_timeout_check(BaseClient client) {
         String key = UUID.randomUUID().toString();
         // create new client with default request timeout (250 millis)
-        try (var testClient =
+        try (BaseClient testClient =
                 client instanceof GlideClient
                         ? GlideClient.createClient(commonClientConfig().build()).get()
                         : GlideClusterClient.createClient(commonClusterClientConfig().build()).get()) {
@@ -5988,7 +6115,7 @@ public class SharedCommandTests {
     public void bzpopmax_binary_timeout_check(BaseClient client) {
         GlideString key = gs(UUID.randomUUID().toString());
         // create new client with default request timeout (250 millis)
-        try (var testClient =
+        try (BaseClient testClient =
                 client instanceof GlideClient
                         ? GlideClient.createClient(commonClientConfig().build()).get()
                         : GlideClusterClient.createClient(commonClusterClientConfig().build()).get()) {
@@ -6011,7 +6138,7 @@ public class SharedCommandTests {
         String key1 = UUID.randomUUID().toString();
         String key2 = UUID.randomUUID().toString();
 
-        Map<String, Double> membersScores = Map.of("one", 1.0, "two", 2.0, "three", 3.0);
+        Map<String, Double> membersScores = createMap("one", 1.0, "two", 2.0, "three", 3.0);
         assertEquals(3, client.zadd(key1, membersScores).get());
         assertEquals(1.0, client.zscore(key1, "one").get());
         assertNull(client.zscore(key1, "non_existing_member").get());
@@ -6030,7 +6157,7 @@ public class SharedCommandTests {
     public void zrevrank_binary(BaseClient client) {
         GlideString key = gs(UUID.randomUUID().toString());
         Map<GlideString, Double> membersScores =
-                Map.of(gs("one"), 1.5, gs("two"), 2.0, gs("three"), 3.0);
+                createMap(gs("one"), 1.5, gs("two"), 2.0, gs("three"), 3.0);
         assertEquals(3, client.zadd(key, membersScores).get());
         assertEquals(0, client.zrevrank(key, gs("three")).get());
 
@@ -6054,7 +6181,7 @@ public class SharedCommandTests {
     @MethodSource("getClients")
     public void zrank(BaseClient client) {
         String key = UUID.randomUUID().toString();
-        Map<String, Double> membersScores = Map.of("one", 1.5, "two", 2.0, "three", 3.0);
+        Map<String, Double> membersScores = createMap("one", 1.5, "two", 2.0, "three", 3.0);
         assertEquals(3, client.zadd(key, membersScores).get());
         assertEquals(0, client.zrank(key, "one").get());
 
@@ -6086,10 +6213,10 @@ public class SharedCommandTests {
         GlideString nonExistentKey = gs("{testKey}:4-" + UUID.randomUUID());
 
         Map<GlideString, Double> membersScores1 =
-                Map.of(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0);
-        Map<GlideString, Double> membersScores2 = Map.of(gs("two"), 2.0);
+                createMap(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0);
+        Map<GlideString, Double> membersScores2 = createMap(gs("two"), 2.0);
         Map<GlideString, Double> membersScores3 =
-                Map.of(gs("one"), 0.5, gs("two"), 2.0, gs("three"), 3.0, gs("four"), 4.0);
+                createMap(gs("one"), 0.5, gs("two"), 2.0, gs("three"), 3.0, gs("four"), 4.0);
 
         assertEquals(3, client.zadd(key1, membersScores1).get());
         assertEquals(1, client.zadd(key2, membersScores2).get());
@@ -6103,9 +6230,9 @@ public class SharedCommandTests {
                 new GlideString[] {}, client.zdiff(new GlideString[] {nonExistentKey, key3}).get());
 
         assertEquals(
-                Map.of(gs("one"), 1.0, gs("three"), 3.0),
+                createMap(gs("one"), 1.0, gs("three"), 3.0),
                 client.zdiffWithScores(new GlideString[] {key1, key2}).get());
-        assertEquals(Map.of(), client.zdiffWithScores(new GlideString[] {key1, key3}).get());
+        assertEquals(createMap(), client.zdiffWithScores(new GlideString[] {key1, key3}).get());
         assertTrue(client.zdiffWithScores(new GlideString[] {nonExistentKey, key3}).get().isEmpty());
 
         // Key exists, but it is not a set
@@ -6129,7 +6256,7 @@ public class SharedCommandTests {
     @MethodSource("getClients")
     public void zrevrank(BaseClient client) {
         String key = UUID.randomUUID().toString();
-        Map<String, Double> membersScores = Map.of("one", 1.5, "two", 2.0, "three", 3.0);
+        Map<String, Double> membersScores = createMap("one", 1.5, "two", 2.0, "three", 3.0);
         assertEquals(3, client.zadd(key, membersScores).get());
         assertEquals(0, client.zrevrank(key, "three").get());
 
@@ -6160,9 +6287,10 @@ public class SharedCommandTests {
         String key3 = "{testKey}:3-" + UUID.randomUUID();
         String nonExistentKey = "{testKey}:4-" + UUID.randomUUID();
 
-        Map<String, Double> membersScores1 = Map.of("one", 1.0, "two", 2.0, "three", 3.0);
-        Map<String, Double> membersScores2 = Map.of("two", 2.0);
-        Map<String, Double> membersScores3 = Map.of("one", 0.5, "two", 2.0, "three", 3.0, "four", 4.0);
+        Map<String, Double> membersScores1 = createMap("one", 1.0, "two", 2.0, "three", 3.0);
+        Map<String, Double> membersScores2 = createMap("two", 2.0);
+        Map<String, Double> membersScores3 =
+                createMap("one", 0.5, "two", 2.0, "three", 3.0, "four", 4.0);
 
         assertEquals(3, client.zadd(key1, membersScores1).get());
         assertEquals(1, client.zadd(key2, membersScores2).get());
@@ -6173,8 +6301,9 @@ public class SharedCommandTests {
         assertArrayEquals(new String[] {}, client.zdiff(new String[] {nonExistentKey, key3}).get());
 
         assertEquals(
-                Map.of("one", 1.0, "three", 3.0), client.zdiffWithScores(new String[] {key1, key2}).get());
-        assertEquals(Map.of(), client.zdiffWithScores(new String[] {key1, key3}).get());
+                createMap("one", 1.0, "three", 3.0),
+                client.zdiffWithScores(new String[] {key1, key2}).get());
+        assertEquals(createMap(), client.zdiffWithScores(new String[] {key1, key3}).get());
         assertTrue(client.zdiffWithScores(new String[] {nonExistentKey, key3}).get().isEmpty());
 
         // Key exists, but it is not a set
@@ -6199,7 +6328,7 @@ public class SharedCommandTests {
     public void zmscore(BaseClient client) {
         String key1 = UUID.randomUUID().toString();
         String key2 = UUID.randomUUID().toString();
-        Map<String, Double> membersScores = Map.of("one", 1.0, "two", 2.0, "three", 3.0);
+        Map<String, Double> membersScores = createMap("one", 1.0, "two", 2.0, "three", 3.0);
         assertEquals(3, client.zadd(key1, membersScores).get());
         assertArrayEquals(
                 new Double[] {1.0, 2.0, 3.0},
@@ -6228,6 +6357,39 @@ public class SharedCommandTests {
     @SneakyThrows
     @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
+    public void zmscore_binary_with_large_response_preserves_double_and_null_values(
+            BaseClient client) {
+        GlideString key = gs(UUID.randomUUID().toString());
+        final int memberCount = 2200; // >16KB in DirectByteBuffer array fast-path
+
+        GlideString[] members = new GlideString[memberCount];
+        Map<GlideString, Double> membersScores = new LinkedHashMap<>();
+        for (int i = 0; i < memberCount; i++) {
+            GlideString member = gs("member-" + i);
+            members[i] = member;
+            if (i % 4 == 0) {
+                membersScores.put(member, i + 0.5);
+            }
+        }
+
+        assertEquals(membersScores.size(), client.zadd(key, membersScores).get());
+
+        Double[] result = client.zmscore(key, members).get();
+
+        assertEquals(memberCount, result.length);
+        for (int i = 0; i < memberCount; i++) {
+            if (i % 4 == 0) {
+                assertNotNull(result[i], "Existing member score should not be nil");
+                assertEquals(i + 0.5, result[i]);
+            } else {
+                assertNull(result[i], "Missing member should stay null");
+            }
+        }
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
     public void zdiffstore(BaseClient client) {
         assumeTrue(
                 SERVER_VERSION.isGreaterThanOrEqualTo("6.2.0"), "This feature added in version 6.2.0");
@@ -6238,9 +6400,10 @@ public class SharedCommandTests {
         String key4 = "{testKey}:4-" + UUID.randomUUID();
         String key5 = "{testKey}:5-" + UUID.randomUUID();
 
-        Map<String, Double> membersScores1 = Map.of("one", 1.0, "two", 2.0, "three", 3.0);
-        Map<String, Double> membersScores2 = Map.of("two", 2.0);
-        Map<String, Double> membersScores3 = Map.of("one", 0.5, "two", 2.0, "three", 3.0, "four", 4.0);
+        Map<String, Double> membersScores1 = createMap("one", 1.0, "two", 2.0, "three", 3.0);
+        Map<String, Double> membersScores2 = createMap("two", 2.0);
+        Map<String, Double> membersScores3 =
+                createMap("one", 0.5, "two", 2.0, "three", 3.0, "four", 4.0);
 
         assertEquals(3, client.zadd(key1, membersScores1).get());
         assertEquals(1, client.zadd(key2, membersScores2).get());
@@ -6248,11 +6411,12 @@ public class SharedCommandTests {
 
         assertEquals(2, client.zdiffstore(key4, new String[] {key1, key2}).get());
         assertEquals(
-                Map.of("one", 1.0, "three", 3.0),
+                createMap("one", 1.0, "three", 3.0),
                 client.zrangeWithScores(key4, new RangeByIndex(0, -1)).get());
 
         assertEquals(1, client.zdiffstore(key4, new String[] {key3, key2, key1}).get());
-        assertEquals(Map.of("four", 4.0), client.zrangeWithScores(key4, new RangeByIndex(0, -1)).get());
+        assertEquals(
+                createMap("four", 4.0), client.zrangeWithScores(key4, new RangeByIndex(0, -1)).get());
 
         assertEquals(0, client.zdiffstore(key4, new String[] {key1, key3}).get());
         assertTrue(client.zrangeWithScores(key4, new RangeByIndex(0, -1)).get().isEmpty());
@@ -6277,7 +6441,7 @@ public class SharedCommandTests {
         GlideString key1 = gs(UUID.randomUUID().toString());
         GlideString key2 = gs(UUID.randomUUID().toString());
         Map<GlideString, Double> membersScores =
-                Map.of(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0);
+                createMap(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0);
         assertEquals(3, client.zadd(key1, membersScores).get());
 
         // In range negative to positive infinity.
@@ -6331,7 +6495,7 @@ public class SharedCommandTests {
     public void zcount(BaseClient client) {
         String key1 = UUID.randomUUID().toString();
         String key2 = UUID.randomUUID().toString();
-        Map<String, Double> membersScores = Map.of("one", 1.0, "two", 2.0, "three", 3.0);
+        Map<String, Double> membersScores = createMap("one", 1.0, "two", 2.0, "three", 3.0);
         assertEquals(3, client.zadd(key1, membersScores).get());
 
         // In range negative to positive infinity.
@@ -6371,21 +6535,21 @@ public class SharedCommandTests {
         GlideString key2 = gs(UUID.randomUUID().toString());
         RangeByIndex query = new RangeByIndex(0, -1);
         Map<GlideString, Double> membersScores =
-                Map.of(gs("a"), 1.0, gs("b"), 2.0, gs("c"), 3.0, gs("d"), 4.0);
+                createMap(gs("a"), 1.0, gs("b"), 2.0, gs("c"), 3.0, gs("d"), 4.0);
         assertEquals(4, client.zadd(key1, membersScores).get());
 
         assertEquals(
                 2, client.zremrangebylex(key1, new LexBoundary("a", false), new LexBoundary("c")).get());
-        assertEquals(Map.of(gs("a"), 1.0, gs("d"), 4.0), client.zrangeWithScores(key1, query).get());
+        assertEquals(createMap(gs("a"), 1.0, gs("d"), 4.0), client.zrangeWithScores(key1, query).get());
 
         assertEquals(
                 1, client.zremrangebylex(key1, new LexBoundary("d"), InfLexBound.POSITIVE_INFINITY).get());
-        assertEquals(Map.of(gs("a"), 1.0), client.zrangeWithScores(key1, query).get());
+        assertEquals(createMap(gs("a"), 1.0), client.zrangeWithScores(key1, query).get());
 
         // MinLex > MaxLex
         assertEquals(
                 0, client.zremrangebylex(key1, new LexBoundary("a"), InfLexBound.NEGATIVE_INFINITY).get());
-        assertEquals(Map.of(gs("a"), 1.0), client.zrangeWithScores(key1, query).get());
+        assertEquals(createMap(gs("a"), 1.0), client.zrangeWithScores(key1, query).get());
 
         // Non Existing Key
         assertEquals(
@@ -6410,16 +6574,17 @@ public class SharedCommandTests {
         String key1 = UUID.randomUUID().toString();
         String key2 = UUID.randomUUID().toString();
         RangeByIndex query = new RangeByIndex(0, -1);
-        Map<String, Double> membersScores = Map.of("one", 1.0, "two", 2.0, "three", 3.0);
+        Map<String, Double> membersScores = createMap("one", 1.0, "two", 2.0, "three", 3.0);
         assertEquals(3, client.zadd(key1, membersScores).get());
 
         // Incorrect range start > stop
         assertEquals(0, client.zremrangebyrank(key1, 2, 1).get());
         assertEquals(
-                Map.of("one", 1.0, "two", 2.0, "three", 3.0), client.zrangeWithScores(key1, query).get());
+                createMap("one", 1.0, "two", 2.0, "three", 3.0),
+                client.zrangeWithScores(key1, query).get());
 
         assertEquals(2, client.zremrangebyrank(key1, 0, 1).get());
-        assertEquals(Map.of("three", 3.0), client.zrangeWithScores(key1, query).get());
+        assertEquals(createMap("three", 3.0), client.zrangeWithScores(key1, query).get());
 
         assertEquals(1, client.zremrangebyrank(key1, 0, 10).get());
         assertTrue(client.zrangeWithScores(key1, query).get().isEmpty());
@@ -6441,21 +6606,21 @@ public class SharedCommandTests {
         String key1 = UUID.randomUUID().toString();
         String key2 = UUID.randomUUID().toString();
         RangeByIndex query = new RangeByIndex(0, -1);
-        Map<String, Double> membersScores = Map.of("a", 1.0, "b", 2.0, "c", 3.0, "d", 4.0);
+        Map<String, Double> membersScores = createMap("a", 1.0, "b", 2.0, "c", 3.0, "d", 4.0);
         assertEquals(4, client.zadd(key1, membersScores).get());
 
         assertEquals(
                 2, client.zremrangebylex(key1, new LexBoundary("a", false), new LexBoundary("c")).get());
-        assertEquals(Map.of("a", 1.0, "d", 4.0), client.zrangeWithScores(key1, query).get());
+        assertEquals(createMap("a", 1.0, "d", 4.0), client.zrangeWithScores(key1, query).get());
 
         assertEquals(
                 1, client.zremrangebylex(key1, new LexBoundary("d"), InfLexBound.POSITIVE_INFINITY).get());
-        assertEquals(Map.of("a", 1.0), client.zrangeWithScores(key1, query).get());
+        assertEquals(createMap("a", 1.0), client.zrangeWithScores(key1, query).get());
 
         // MinLex > MaxLex
         assertEquals(
                 0, client.zremrangebylex(key1, new LexBoundary("a"), InfLexBound.NEGATIVE_INFINITY).get());
-        assertEquals(Map.of("a", 1.0), client.zrangeWithScores(key1, query).get());
+        assertEquals(createMap("a", 1.0), client.zrangeWithScores(key1, query).get());
 
         // Non Existing Key
         assertEquals(
@@ -6481,7 +6646,7 @@ public class SharedCommandTests {
         GlideString key2 = gs(UUID.randomUUID().toString());
         RangeByIndex query = new RangeByIndex(0, -1);
         Map<GlideString, Double> membersScores =
-                Map.of(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0, gs("four"), 4.0);
+                createMap(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0, gs("four"), 4.0);
         assertEquals(4, client.zadd(key1, membersScores).get());
 
         // MinScore > MaxScore
@@ -6489,18 +6654,18 @@ public class SharedCommandTests {
                 0,
                 client.zremrangebyscore(key1, new ScoreBoundary(1), InfScoreBound.NEGATIVE_INFINITY).get());
         assertEquals(
-                Map.of(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0, gs("four"), 4.0),
+                createMap(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0, gs("four"), 4.0),
                 client.zrangeWithScores(key1, query).get());
 
         assertEquals(
                 2, client.zremrangebyscore(key1, new ScoreBoundary(1, false), new ScoreBoundary(3)).get());
         assertEquals(
-                Map.of(gs("one"), 1.0, gs("four"), 4.0), client.zrangeWithScores(key1, query).get());
+                createMap(gs("one"), 1.0, gs("four"), 4.0), client.zrangeWithScores(key1, query).get());
 
         assertEquals(
                 1,
                 client.zremrangebyscore(key1, new ScoreBoundary(4), InfScoreBound.POSITIVE_INFINITY).get());
-        assertEquals(Map.of(gs("one"), 1.0), client.zrangeWithScores(key1, query).get());
+        assertEquals(createMap(gs("one"), 1.0), client.zrangeWithScores(key1, query).get());
 
         // Non Existing Key
         assertEquals(
@@ -6526,7 +6691,8 @@ public class SharedCommandTests {
         String key1 = UUID.randomUUID().toString();
         String key2 = UUID.randomUUID().toString();
         RangeByIndex query = new RangeByIndex(0, -1);
-        Map<String, Double> membersScores = Map.of("one", 1.0, "two", 2.0, "three", 3.0, "four", 4.0);
+        Map<String, Double> membersScores =
+                createMap("one", 1.0, "two", 2.0, "three", 3.0, "four", 4.0);
         assertEquals(4, client.zadd(key1, membersScores).get());
 
         // MinScore > MaxScore
@@ -6534,17 +6700,17 @@ public class SharedCommandTests {
                 0,
                 client.zremrangebyscore(key1, new ScoreBoundary(1), InfScoreBound.NEGATIVE_INFINITY).get());
         assertEquals(
-                Map.of("one", 1.0, "two", 2.0, "three", 3.0, "four", 4.0),
+                createMap("one", 1.0, "two", 2.0, "three", 3.0, "four", 4.0),
                 client.zrangeWithScores(key1, query).get());
 
         assertEquals(
                 2, client.zremrangebyscore(key1, new ScoreBoundary(1, false), new ScoreBoundary(3)).get());
-        assertEquals(Map.of("one", 1.0, "four", 4.0), client.zrangeWithScores(key1, query).get());
+        assertEquals(createMap("one", 1.0, "four", 4.0), client.zrangeWithScores(key1, query).get());
 
         assertEquals(
                 1,
                 client.zremrangebyscore(key1, new ScoreBoundary(4), InfScoreBound.POSITIVE_INFINITY).get());
-        assertEquals(Map.of("one", 1.0), client.zrangeWithScores(key1, query).get());
+        assertEquals(createMap("one", 1.0), client.zrangeWithScores(key1, query).get());
 
         // Non Existing Key
         assertEquals(
@@ -6569,7 +6735,7 @@ public class SharedCommandTests {
     public void zlexcount_binary(BaseClient client) {
         GlideString key1 = gs(UUID.randomUUID().toString());
         GlideString key2 = gs(UUID.randomUUID().toString());
-        Map<GlideString, Double> membersScores = Map.of(gs("a"), 1.0, gs("b"), 2.0, gs("c"), 3.0);
+        Map<GlideString, Double> membersScores = createMap(gs("a"), 1.0, gs("b"), 2.0, gs("c"), 3.0);
         assertEquals(3, client.zadd(key1, membersScores).get());
 
         // In range negative to positive infinity.
@@ -6617,7 +6783,7 @@ public class SharedCommandTests {
     public void zlexcount(BaseClient client) {
         String key1 = UUID.randomUUID().toString();
         String key2 = UUID.randomUUID().toString();
-        Map<String, Double> membersScores = Map.of("a", 1.0, "b", 2.0, "c", 3.0);
+        Map<String, Double> membersScores = createMap("a", 1.0, "b", 2.0, "c", 3.0);
         assertEquals(3, client.zadd(key1, membersScores).get());
 
         // In range negative to positive infinity.
@@ -6665,28 +6831,28 @@ public class SharedCommandTests {
         GlideString destination = gs("{testKey}:" + UUID.randomUUID());
         GlideString source = gs("{testKey}:" + UUID.randomUUID());
         Map<GlideString, Double> membersScores =
-                Map.of(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0);
+                createMap(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0);
         assertEquals(3, client.zadd(source, membersScores).get());
 
         // Full range.
         assertEquals(3, client.zrangestore(destination, source, new RangeByIndex(0, -1)).get());
         assertEquals(
-                Map.of(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0),
+                createMap(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0),
                 client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Range from rank 0 to 1. In descending order of scores.
         assertEquals(2, client.zrangestore(destination, source, new RangeByIndex(0, 1), true).get());
         assertEquals(
-                Map.of(gs("three"), 3.0, gs("two"), 2.0),
+                createMap(gs("three"), 3.0, gs("two"), 2.0),
                 client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Incorrect range as start > stop.
         assertEquals(0, client.zrangestore(destination, source, new RangeByIndex(3, 1)).get());
-        assertEquals(Map.of(), client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
+        assertEquals(createMap(), client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Non-existing source.
         assertEquals(0, client.zrangestore(destination, key, new RangeByIndex(0, -1)).get());
-        assertEquals(Map.of(), client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
+        assertEquals(createMap(), client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Key exists, but it is not a set
         assertEquals(OK, client.set(key, gs("value")).get());
@@ -6704,28 +6870,28 @@ public class SharedCommandTests {
         String key = "{testKey}:" + UUID.randomUUID();
         String destination = "{testKey}:" + UUID.randomUUID();
         String source = "{testKey}:" + UUID.randomUUID();
-        Map<String, Double> membersScores = Map.of("one", 1.0, "two", 2.0, "three", 3.0);
+        Map<String, Double> membersScores = createMap("one", 1.0, "two", 2.0, "three", 3.0);
         assertEquals(3, client.zadd(source, membersScores).get());
 
         // Full range.
         assertEquals(3, client.zrangestore(destination, source, new RangeByIndex(0, -1)).get());
         assertEquals(
-                Map.of("one", 1.0, "two", 2.0, "three", 3.0),
+                createMap("one", 1.0, "two", 2.0, "three", 3.0),
                 client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Range from rank 0 to 1. In descending order of scores.
         assertEquals(2, client.zrangestore(destination, source, new RangeByIndex(0, 1), true).get());
         assertEquals(
-                Map.of("three", 3.0, "two", 2.0),
+                createMap("three", 3.0, "two", 2.0),
                 client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Incorrect range as start > stop.
         assertEquals(0, client.zrangestore(destination, source, new RangeByIndex(3, 1)).get());
-        assertEquals(Map.of(), client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
+        assertEquals(createMap(), client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Non-existing source.
         assertEquals(0, client.zrangestore(destination, key, new RangeByIndex(0, -1)).get());
-        assertEquals(Map.of(), client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
+        assertEquals(createMap(), client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Key exists, but it is not a set
         assertEquals(OK, client.set(key, "value").get());
@@ -6744,7 +6910,7 @@ public class SharedCommandTests {
         GlideString destination = gs("{testKey}:" + UUID.randomUUID());
         GlideString source = gs("{testKey}:" + UUID.randomUUID());
         Map<GlideString, Double> membersScores =
-                Map.of(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0);
+                createMap(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0);
         assertEquals(3, client.zadd(source, membersScores).get());
 
         // Range from negative infinity to 3 (exclusive).
@@ -6752,14 +6918,14 @@ public class SharedCommandTests {
                 new RangeByScore(InfScoreBound.NEGATIVE_INFINITY, new ScoreBoundary(3, false));
         assertEquals(2, client.zrangestore(destination, source, query).get());
         assertEquals(
-                Map.of(gs("one"), 1.0, gs("two"), 2.0),
+                createMap(gs("one"), 1.0, gs("two"), 2.0),
                 client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Range from 1 (inclusive) to positive infinity.
         query = new RangeByScore(new ScoreBoundary(1), InfScoreBound.POSITIVE_INFINITY);
         assertEquals(3, client.zrangestore(destination, source, query).get());
         assertEquals(
-                Map.of(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0),
+                createMap(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0),
                 client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Range from negative to positive infinity. Limited to ranks 1 to 2.
@@ -6770,7 +6936,7 @@ public class SharedCommandTests {
                         new RangeOptions.Limit(1, 2));
         assertEquals(2, client.zrangestore(destination, source, query).get());
         assertEquals(
-                Map.of(gs("two"), 2.0, gs("three"), 3.0),
+                createMap(gs("two"), 2.0, gs("three"), 3.0),
                 client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Range from positive to negative infinity with rev set to true. Limited to ranks 1 to 2.
@@ -6781,18 +6947,18 @@ public class SharedCommandTests {
                         new RangeOptions.Limit(1, 2));
         assertEquals(2, client.zrangestore(destination, source, query, true).get());
         assertEquals(
-                Map.of(gs("two"), 2.0, gs("one"), 1.0),
+                createMap(gs("two"), 2.0, gs("one"), 1.0),
                 client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Incorrect range as start > stop.
         query = new RangeByScore(new ScoreBoundary(3, false), InfScoreBound.NEGATIVE_INFINITY);
         assertEquals(0, client.zrangestore(destination, source, query).get());
-        assertEquals(Map.of(), client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
+        assertEquals(createMap(), client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Non-existent source.
         query = new RangeByScore(InfScoreBound.NEGATIVE_INFINITY, new ScoreBoundary(3, false));
         assertEquals(0, client.zrangestore(destination, key, query).get());
-        assertEquals(Map.of(), client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
+        assertEquals(createMap(), client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Key exists, but it is not a set
         assertEquals(OK, client.set(key, gs("value")).get());
@@ -6816,7 +6982,7 @@ public class SharedCommandTests {
         String key = "{testKey}:" + UUID.randomUUID();
         String destination = "{testKey}:" + UUID.randomUUID();
         String source = "{testKey}:" + UUID.randomUUID();
-        Map<String, Double> membersScores = Map.of("one", 1.0, "two", 2.0, "three", 3.0);
+        Map<String, Double> membersScores = createMap("one", 1.0, "two", 2.0, "three", 3.0);
         assertEquals(3, client.zadd(source, membersScores).get());
 
         // Range from negative infinity to 3 (exclusive).
@@ -6824,14 +6990,14 @@ public class SharedCommandTests {
                 new RangeByScore(InfScoreBound.NEGATIVE_INFINITY, new ScoreBoundary(3, false));
         assertEquals(2, client.zrangestore(destination, source, query).get());
         assertEquals(
-                Map.of("one", 1.0, "two", 2.0),
+                createMap("one", 1.0, "two", 2.0),
                 client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Range from 1 (inclusive) to positive infinity.
         query = new RangeByScore(new ScoreBoundary(1), InfScoreBound.POSITIVE_INFINITY);
         assertEquals(3, client.zrangestore(destination, source, query).get());
         assertEquals(
-                Map.of("one", 1.0, "two", 2.0, "three", 3.0),
+                createMap("one", 1.0, "two", 2.0, "three", 3.0),
                 client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Range from negative to positive infinity. Limited to ranks 1 to 2.
@@ -6842,7 +7008,7 @@ public class SharedCommandTests {
                         new RangeOptions.Limit(1, 2));
         assertEquals(2, client.zrangestore(destination, source, query).get());
         assertEquals(
-                Map.of("two", 2.0, "three", 3.0),
+                createMap("two", 2.0, "three", 3.0),
                 client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Range from positive to negative infinity with rev set to true. Limited to ranks 1 to 2.
@@ -6853,18 +7019,18 @@ public class SharedCommandTests {
                         new RangeOptions.Limit(1, 2));
         assertEquals(2, client.zrangestore(destination, source, query, true).get());
         assertEquals(
-                Map.of("two", 2.0, "one", 1.0),
+                createMap("two", 2.0, "one", 1.0),
                 client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Incorrect range as start > stop.
         query = new RangeByScore(new ScoreBoundary(3, false), InfScoreBound.NEGATIVE_INFINITY);
         assertEquals(0, client.zrangestore(destination, source, query).get());
-        assertEquals(Map.of(), client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
+        assertEquals(createMap(), client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Non-existent source.
         query = new RangeByScore(InfScoreBound.NEGATIVE_INFINITY, new ScoreBoundary(3, false));
         assertEquals(0, client.zrangestore(destination, key, query).get());
-        assertEquals(Map.of(), client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
+        assertEquals(createMap(), client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Key exists, but it is not a set
         assertEquals(OK, client.set(key, "value").get());
@@ -6888,21 +7054,21 @@ public class SharedCommandTests {
         GlideString key = gs("{testKey}:" + UUID.randomUUID());
         GlideString destination = gs("{testKey}:" + UUID.randomUUID());
         GlideString source = gs("{testKey}:" + UUID.randomUUID());
-        Map<GlideString, Double> membersScores = Map.of(gs("a"), 1.0, gs("b"), 2.0, gs("c"), 3.0);
+        Map<GlideString, Double> membersScores = createMap(gs("a"), 1.0, gs("b"), 2.0, gs("c"), 3.0);
         assertEquals(3, client.zadd(source, membersScores).get());
 
         // Range from negative infinity to "c" (exclusive).
         RangeByLex query = new RangeByLex(InfLexBound.NEGATIVE_INFINITY, new LexBoundary("c", false));
         assertEquals(2, client.zrangestore(destination, source, query).get());
         assertEquals(
-                Map.of(gs("a"), 1.0, gs("b"), 2.0),
+                createMap(gs("a"), 1.0, gs("b"), 2.0),
                 client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Range from "a" (inclusive) to positive infinity.
         query = new RangeByLex(new LexBoundary("a"), InfLexBound.POSITIVE_INFINITY);
         assertEquals(3, client.zrangestore(destination, source, query).get());
         assertEquals(
-                Map.of(gs("a"), 1.0, gs("b"), 2.0, gs("c"), 3.0),
+                createMap(gs("a"), 1.0, gs("b"), 2.0, gs("c"), 3.0),
                 client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Range from negative to positive infinity. Limited to ranks 1 to 2.
@@ -6913,7 +7079,7 @@ public class SharedCommandTests {
                         new RangeOptions.Limit(1, 2));
         assertEquals(2, client.zrangestore(destination, source, query).get());
         assertEquals(
-                Map.of(gs("b"), 2.0, gs("c"), 3.0),
+                createMap(gs("b"), 2.0, gs("c"), 3.0),
                 client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Range from positive to negative infinity with rev set to true. Limited to ranks 1 to 2.
@@ -6924,13 +7090,13 @@ public class SharedCommandTests {
                         new RangeOptions.Limit(1, 2));
         assertEquals(2, client.zrangestore(destination, source, query, true).get());
         assertEquals(
-                Map.of(gs("b"), 2.0, gs("a"), 1.0),
+                createMap(gs("b"), 2.0, gs("a"), 1.0),
                 client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Non-existent source.
         query = new RangeByLex(InfLexBound.NEGATIVE_INFINITY, new LexBoundary("c", false));
         assertEquals(0, client.zrangestore(destination, key, query).get());
-        assertEquals(Map.of(), client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
+        assertEquals(createMap(), client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Key exists, but it is not a set
         assertEquals(OK, client.set(key, gs("value")).get());
@@ -6954,21 +7120,21 @@ public class SharedCommandTests {
         String key = "{testKey}:" + UUID.randomUUID();
         String destination = "{testKey}:" + UUID.randomUUID();
         String source = "{testKey}:" + UUID.randomUUID();
-        Map<String, Double> membersScores = Map.of("a", 1.0, "b", 2.0, "c", 3.0);
+        Map<String, Double> membersScores = createMap("a", 1.0, "b", 2.0, "c", 3.0);
         assertEquals(3, client.zadd(source, membersScores).get());
 
         // Range from negative infinity to "c" (exclusive).
         RangeByLex query = new RangeByLex(InfLexBound.NEGATIVE_INFINITY, new LexBoundary("c", false));
         assertEquals(2, client.zrangestore(destination, source, query).get());
         assertEquals(
-                Map.of("a", 1.0, "b", 2.0),
+                createMap("a", 1.0, "b", 2.0),
                 client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Range from "a" (inclusive) to positive infinity.
         query = new RangeByLex(new LexBoundary("a"), InfLexBound.POSITIVE_INFINITY);
         assertEquals(3, client.zrangestore(destination, source, query).get());
         assertEquals(
-                Map.of("a", 1.0, "b", 2.0, "c", 3.0),
+                createMap("a", 1.0, "b", 2.0, "c", 3.0),
                 client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Range from negative to positive infinity. Limited to ranks 1 to 2.
@@ -6979,7 +7145,7 @@ public class SharedCommandTests {
                         new RangeOptions.Limit(1, 2));
         assertEquals(2, client.zrangestore(destination, source, query).get());
         assertEquals(
-                Map.of("b", 2.0, "c", 3.0),
+                createMap("b", 2.0, "c", 3.0),
                 client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Range from positive to negative infinity with rev set to true. Limited to ranks 1 to 2.
@@ -6990,13 +7156,13 @@ public class SharedCommandTests {
                         new RangeOptions.Limit(1, 2));
         assertEquals(2, client.zrangestore(destination, source, query, true).get());
         assertEquals(
-                Map.of("b", 2.0, "a", 1.0),
+                createMap("b", 2.0, "a", 1.0),
                 client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Non-existent source.
         query = new RangeByLex(InfLexBound.NEGATIVE_INFINITY, new LexBoundary("c", false));
         assertEquals(0, client.zrangestore(destination, key, query).get());
-        assertEquals(Map.of(), client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
+        assertEquals(createMap(), client.zrangeWithScores(destination, new RangeByIndex(0, -1)).get());
 
         // Key exists, but it is not a set
         assertEquals(OK, client.set(key, "value").get());
@@ -7022,42 +7188,48 @@ public class SharedCommandTests {
         String key3 = "{testKey}:3-" + UUID.randomUUID();
         String key4 = "{testKey}:4-" + UUID.randomUUID();
         RangeByIndex query = new RangeByIndex(0, -1);
-        Map<String, Double> membersScores1 = Map.of("one", 1.0, "two", 2.0);
-        Map<String, Double> membersScores2 = Map.of("two", 2.5, "three", 3.0);
+        Map<String, Double> membersScores1 = createMap("one", 1.0, "two", 2.0);
+        Map<String, Double> membersScores2 = createMap("two", 2.5, "three", 3.0);
 
         assertEquals(2, client.zadd(key1, membersScores1).get());
         assertEquals(2, client.zadd(key2, membersScores2).get());
 
         assertEquals(3, client.zunionstore(key3, new KeyArray(new String[] {key1, key2})).get());
         assertEquals(
-                Map.of("one", 1.0, "two", 4.5, "three", 3.0), client.zrangeWithScores(key3, query).get());
+                createMap("one", 1.0, "two", 4.5, "three", 3.0),
+                client.zrangeWithScores(key3, query).get());
 
         // Union results are aggregated by the max score of elements
         assertEquals(
                 3, client.zunionstore(key3, new KeyArray(new String[] {key1, key2}), Aggregate.MAX).get());
         assertEquals(
-                Map.of("one", 1.0, "two", 2.5, "three", 3.0), client.zrangeWithScores(key3, query).get());
+                createMap("one", 1.0, "two", 2.5, "three", 3.0),
+                client.zrangeWithScores(key3, query).get());
 
         // Union results are aggregated by the min score of elements
         assertEquals(
                 3, client.zunionstore(key3, new KeyArray(new String[] {key1, key2}), Aggregate.MIN).get());
         assertEquals(
-                Map.of("one", 1.0, "two", 2.0, "three", 3.0), client.zrangeWithScores(key3, query).get());
+                createMap("one", 1.0, "two", 2.0, "three", 3.0),
+                client.zrangeWithScores(key3, query).get());
 
         // Union results are aggregated by the sum of the scores of elements
         assertEquals(
                 3, client.zunionstore(key3, new KeyArray(new String[] {key1, key2}), Aggregate.SUM).get());
         assertEquals(
-                Map.of("one", 1.0, "two", 4.5, "three", 3.0), client.zrangeWithScores(key3, query).get());
+                createMap("one", 1.0, "two", 4.5, "three", 3.0),
+                client.zrangeWithScores(key3, query).get());
 
         // Scores are multiplied by 2.0 for key1 and key2 during aggregation.
         assertEquals(
                 3,
                 client
-                        .zunionstore(key3, new WeightedKeys(List.of(Pair.of(key1, 2.0), Pair.of(key2, 2.0))))
+                        .zunionstore(
+                                key3, new WeightedKeys(Arrays.asList(Pair.of(key1, 2.0), Pair.of(key2, 2.0))))
                         .get());
         assertEquals(
-                Map.of("one", 2.0, "two", 9.0, "three", 6.0), client.zrangeWithScores(key3, query).get());
+                createMap("one", 2.0, "two", 9.0, "three", 6.0),
+                client.zrangeWithScores(key3, query).get());
 
         // Union results are aggregated by the maximum score, with scores for key1 multiplied by 1.0 and
         // for key2 by 2.0.
@@ -7066,11 +7238,12 @@ public class SharedCommandTests {
                 client
                         .zunionstore(
                                 key3,
-                                new WeightedKeys(List.of(Pair.of(key1, 1.0), Pair.of(key2, 2.0))),
+                                new WeightedKeys(Arrays.asList(Pair.of(key1, 1.0), Pair.of(key2, 2.0))),
                                 Aggregate.MAX)
                         .get());
         assertEquals(
-                Map.of("one", 1.0, "two", 5.0, "three", 6.0), client.zrangeWithScores(key3, query).get());
+                createMap("one", 1.0, "two", 5.0, "three", 6.0),
+                client.zrangeWithScores(key3, query).get());
 
         // Key exists, but it is not a set
         assertEquals(OK, client.set(key4, "value").get());
@@ -7090,8 +7263,8 @@ public class SharedCommandTests {
         GlideString key3 = gs("{testKey}:3-" + UUID.randomUUID());
         GlideString key4 = gs("{testKey}:4-" + UUID.randomUUID());
         RangeByIndex query = new RangeByIndex(0, -1);
-        Map<String, Double> membersScores1 = Map.of("one", 1.0, "two", 2.0);
-        Map<String, Double> membersScores2 = Map.of("two", 2.5, "three", 3.0);
+        Map<String, Double> membersScores1 = createMap("one", 1.0, "two", 2.0);
+        Map<String, Double> membersScores2 = createMap("two", 2.5, "three", 3.0);
 
         assertEquals(
                 2,
@@ -7109,7 +7282,7 @@ public class SharedCommandTests {
         assertEquals(
                 3, client.zunionstore(key3, new KeyArrayBinary(new GlideString[] {key1, key2})).get());
         assertEquals(
-                Map.of("one", 1.0, "two", 4.5, "three", 3.0),
+                createMap("one", 1.0, "two", 4.5, "three", 3.0),
                 client
                         .zrangeWithScores(key3.toString(), query)
                         .get()); // TODO: use the binary version of this function call once the binary version
@@ -7122,7 +7295,7 @@ public class SharedCommandTests {
                         .zunionstore(key3, new KeyArrayBinary(new GlideString[] {key1, key2}), Aggregate.MAX)
                         .get());
         assertEquals(
-                Map.of("one", 1.0, "two", 2.5, "three", 3.0),
+                createMap("one", 1.0, "two", 2.5, "three", 3.0),
                 client
                         .zrangeWithScores(key3.toString(), query)
                         .get()); // TODO: use the binary version of this function call once the binary version
@@ -7135,7 +7308,7 @@ public class SharedCommandTests {
                         .zunionstore(key3, new KeyArrayBinary(new GlideString[] {key1, key2}), Aggregate.MIN)
                         .get());
         assertEquals(
-                Map.of("one", 1.0, "two", 2.0, "three", 3.0),
+                createMap("one", 1.0, "two", 2.0, "three", 3.0),
                 client
                         .zrangeWithScores(key3.toString(), query)
                         .get()); // TODO: use the binary version of this function call once the binary version
@@ -7148,7 +7321,7 @@ public class SharedCommandTests {
                         .zunionstore(key3, new KeyArrayBinary(new GlideString[] {key1, key2}), Aggregate.SUM)
                         .get());
         assertEquals(
-                Map.of("one", 1.0, "two", 4.5, "three", 3.0),
+                createMap("one", 1.0, "two", 4.5, "three", 3.0),
                 client
                         .zrangeWithScores(key3.toString(), query)
                         .get()); // TODO: use the binary version of this function call once the binary version
@@ -7159,10 +7332,10 @@ public class SharedCommandTests {
                 3,
                 client
                         .zunionstore(
-                                key3, new WeightedKeysBinary(List.of(Pair.of(key1, 2.0), Pair.of(key2, 2.0))))
+                                key3, new WeightedKeysBinary(Arrays.asList(Pair.of(key1, 2.0), Pair.of(key2, 2.0))))
                         .get());
         assertEquals(
-                Map.of("one", 2.0, "two", 9.0, "three", 6.0),
+                createMap("one", 2.0, "two", 9.0, "three", 6.0),
                 client
                         .zrangeWithScores(key3.toString(), query)
                         .get()); // TODO: use the binary version of this function call once the binary version
@@ -7175,11 +7348,11 @@ public class SharedCommandTests {
                 client
                         .zunionstore(
                                 key3,
-                                new WeightedKeysBinary(List.of(Pair.of(key1, 1.0), Pair.of(key2, 2.0))),
+                                new WeightedKeysBinary(Arrays.asList(Pair.of(key1, 1.0), Pair.of(key2, 2.0))),
                                 Aggregate.MAX)
                         .get());
         assertEquals(
-                Map.of("one", 1.0, "two", 5.0, "three", 6.0),
+                createMap("one", 1.0, "two", 5.0, "three", 6.0),
                 client
                         .zrangeWithScores(key3.toString(), query)
                         .get()); // TODO: use the binary version of this function call once the binary version
@@ -7205,8 +7378,8 @@ public class SharedCommandTests {
         String key1 = "{testKey}:1-" + UUID.randomUUID();
         String key2 = "{testKey}:2-" + UUID.randomUUID();
         String key3 = "{testKey}:3-" + UUID.randomUUID();
-        Map<String, Double> membersScores1 = Map.of("one", 1.0, "two", 2.0);
-        Map<String, Double> membersScores2 = Map.of("two", 3.5, "three", 3.0);
+        Map<String, Double> membersScores1 = createMap("one", 1.0, "two", 2.0);
+        Map<String, Double> membersScores2 = createMap("two", 3.5, "three", 3.0);
 
         assertEquals(2, client.zadd(key1, membersScores1).get());
         assertEquals(2, client.zadd(key2, membersScores2).get());
@@ -7216,45 +7389,47 @@ public class SharedCommandTests {
                 new String[] {"one", "three", "two"},
                 client.zunion(new KeyArray(new String[] {key1, key2})).get());
         assertEquals(
-                Map.of("one", 1.0, "three", 3.0, "two", 5.5),
+                createMap("one", 1.0, "three", 3.0, "two", 5.5),
                 client.zunionWithScores(new KeyArray(new String[] {key1, key2})).get());
 
         // Union results are aggregated by the max score of elements
         assertEquals(
-                Map.of("one", 1.0, "three", 3.0, "two", 3.5),
+                createMap("one", 1.0, "three", 3.0, "two", 3.5),
                 client.zunionWithScores(new KeyArray(new String[] {key1, key2}), Aggregate.MAX).get());
 
         // Union results are aggregated by the min score of elements
         assertEquals(
-                Map.of("one", 1.0, "two", 2.0, "three", 3.0),
+                createMap("one", 1.0, "two", 2.0, "three", 3.0),
                 client.zunionWithScores(new KeyArray(new String[] {key1, key2}), Aggregate.MIN).get());
 
         // Union results are aggregated by the sum of the scores of elements
         assertEquals(
-                Map.of("one", 1.0, "three", 3.0, "two", 5.5),
+                createMap("one", 1.0, "three", 3.0, "two", 5.5),
                 client.zunionWithScores(new KeyArray(new String[] {key1, key2}), Aggregate.SUM).get());
 
         // Scores are multiplied by 2.0 for key1 and key2 during aggregation.
         assertEquals(
-                Map.of("one", 2.0, "three", 6.0, "two", 11.0),
+                createMap("one", 2.0, "three", 6.0, "two", 11.0),
                 client
-                        .zunionWithScores(new WeightedKeys(List.of(Pair.of(key1, 2.0), Pair.of(key2, 2.0))))
+                        .zunionWithScores(
+                                new WeightedKeys(Arrays.asList(Pair.of(key1, 2.0), Pair.of(key2, 2.0))))
                         .get());
 
         // Union results are aggregated by the minimum score, with scores for key1 multiplied by 1.0 and
         // for key2 by -2.0.
         assertEquals(
-                Map.of("two", -7.0, "three", -6.0, "one", 1.0),
+                createMap("two", -7.0, "three", -6.0, "one", 1.0),
                 client
                         .zunionWithScores(
-                                new WeightedKeys(List.of(Pair.of(key1, 1.0), Pair.of(key2, -2.0))), Aggregate.MIN)
+                                new WeightedKeys(Arrays.asList(Pair.of(key1, 1.0), Pair.of(key2, -2.0))),
+                                Aggregate.MIN)
                         .get());
 
         // Non Existing Key
         assertArrayEquals(
                 new String[] {"one", "two"}, client.zunion(new KeyArray(new String[] {key1, key3})).get());
         assertEquals(
-                Map.of("one", 1.0, "two", 2.0),
+                createMap("one", 1.0, "two", 2.0),
                 client.zunionWithScores(new KeyArray(new String[] {key1, key3})).get());
 
         // Key exists, but it is not a set
@@ -7276,8 +7451,8 @@ public class SharedCommandTests {
         GlideString key1 = gs("{testKey}:1-" + UUID.randomUUID());
         GlideString key2 = gs("{testKey}:2-" + UUID.randomUUID());
         GlideString key3 = gs("{testKey}:3-" + UUID.randomUUID());
-        Map<String, Double> membersScores1 = Map.of("one", 1.0, "two", 2.0);
-        Map<String, Double> membersScores2 = Map.of("two", 3.5, "three", 3.0);
+        Map<String, Double> membersScores1 = createMap("one", 1.0, "two", 2.0);
+        Map<String, Double> membersScores2 = createMap("two", 3.5, "three", 3.0);
 
         assertEquals(
                 2,
@@ -7297,45 +7472,45 @@ public class SharedCommandTests {
                 new GlideString[] {gs("one"), gs("three"), gs("two")},
                 client.zunion(new KeyArrayBinary(new GlideString[] {key1, key2})).get());
         assertEquals(
-                Map.of(gs("one"), 1.0, gs("three"), 3.0, gs("two"), 5.5),
+                createMap(gs("one"), 1.0, gs("three"), 3.0, gs("two"), 5.5),
                 client.zunionWithScores(new KeyArrayBinary(new GlideString[] {key1, key2})).get());
 
         // Union results are aggregated by the max score of elements
         assertEquals(
-                Map.of(gs("one"), 1.0, gs("three"), 3.0, gs("two"), 3.5),
+                createMap(gs("one"), 1.0, gs("three"), 3.0, gs("two"), 3.5),
                 client
                         .zunionWithScores(new KeyArrayBinary(new GlideString[] {key1, key2}), Aggregate.MAX)
                         .get());
 
         // Union results are aggregated by the min score of elements
         assertEquals(
-                Map.of(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0),
+                createMap(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0),
                 client
                         .zunionWithScores(new KeyArrayBinary(new GlideString[] {key1, key2}), Aggregate.MIN)
                         .get());
 
         // Union results are aggregated by the sum of the scores of elements
         assertEquals(
-                Map.of(gs("one"), 1.0, gs("three"), 3.0, gs("two"), 5.5),
+                createMap(gs("one"), 1.0, gs("three"), 3.0, gs("two"), 5.5),
                 client
                         .zunionWithScores(new KeyArrayBinary(new GlideString[] {key1, key2}), Aggregate.SUM)
                         .get());
 
         // Scores are multiplied by 2.0 for key1 and key2 during aggregation.
         assertEquals(
-                Map.of(gs("one"), 2.0, gs("three"), 6.0, gs("two"), 11.0),
+                createMap(gs("one"), 2.0, gs("three"), 6.0, gs("two"), 11.0),
                 client
                         .zunionWithScores(
-                                new WeightedKeysBinary(List.of(Pair.of(key1, 2.0), Pair.of(key2, 2.0))))
+                                new WeightedKeysBinary(Arrays.asList(Pair.of(key1, 2.0), Pair.of(key2, 2.0))))
                         .get());
 
         // Union results are aggregated by the minimum score, with scores for key1 multiplied by 1.0 and
         // for key2 by -2.0.
         assertEquals(
-                Map.of(gs("two"), -7.0, gs("three"), -6.0, gs("one"), 1.0),
+                createMap(gs("two"), -7.0, gs("three"), -6.0, gs("one"), 1.0),
                 client
                         .zunionWithScores(
-                                new WeightedKeysBinary(List.of(Pair.of(key1, 1.0), Pair.of(key2, -2.0))),
+                                new WeightedKeysBinary(Arrays.asList(Pair.of(key1, 1.0), Pair.of(key2, -2.0))),
                                 Aggregate.MIN)
                         .get());
 
@@ -7344,7 +7519,7 @@ public class SharedCommandTests {
                 new GlideString[] {gs("one"), gs("two")},
                 client.zunion(new KeyArrayBinary(new GlideString[] {key1, key3})).get());
         assertEquals(
-                Map.of(gs("one"), 1.0, gs("two"), 2.0),
+                createMap(gs("one"), 1.0, gs("two"), 2.0),
                 client.zunionWithScores(new KeyArrayBinary(new GlideString[] {key1, key3})).get());
 
         // Key exists, but it is not a set
@@ -7365,9 +7540,9 @@ public class SharedCommandTests {
         GlideString key3 = gs("{testKey}:3-" + UUID.randomUUID());
         GlideString key4 = gs("{testKey}:4-" + UUID.randomUUID());
         RangeByIndex query = new RangeByIndex(0, -1);
-        Map<GlideString, Double> membersScores1 = Map.of(gs("one"), 1.0, gs("two"), 2.0);
+        Map<GlideString, Double> membersScores1 = createMap(gs("one"), 1.0, gs("two"), 2.0);
         Map<GlideString, Double> membersScores2 =
-                Map.of(gs("one"), 1.5, gs("two"), 2.5, gs("three"), 3.5);
+                createMap(gs("one"), 1.5, gs("two"), 2.5, gs("three"), 3.5);
 
         assertEquals(2, client.zadd(key1, membersScores1).get());
         assertEquals(3, client.zadd(key2, membersScores2).get());
@@ -7375,7 +7550,7 @@ public class SharedCommandTests {
         assertEquals(
                 2, client.zinterstore(key3, new KeyArrayBinary(new GlideString[] {key1, key2})).get());
         assertEquals(
-                Map.of(gs("one"), 2.5, gs("two"), 4.5), client.zrangeWithScores(key3, query).get());
+                createMap(gs("one"), 2.5, gs("two"), 4.5), client.zrangeWithScores(key3, query).get());
 
         // Intersection results are aggregated by the max score of elements
         assertEquals(
@@ -7384,7 +7559,7 @@ public class SharedCommandTests {
                         .zinterstore(key3, new KeyArrayBinary(new GlideString[] {key1, key2}), Aggregate.MAX)
                         .get());
         assertEquals(
-                Map.of(gs("one"), 1.5, gs("two"), 2.5), client.zrangeWithScores(key3, query).get());
+                createMap(gs("one"), 1.5, gs("two"), 2.5), client.zrangeWithScores(key3, query).get());
 
         // Intersection results are aggregated by the min score of elements
         assertEquals(
@@ -7393,7 +7568,7 @@ public class SharedCommandTests {
                         .zinterstore(key3, new KeyArrayBinary(new GlideString[] {key1, key2}), Aggregate.MIN)
                         .get());
         assertEquals(
-                Map.of(gs("one"), 1.0, gs("two"), 2.0), client.zrangeWithScores(key3, query).get());
+                createMap(gs("one"), 1.0, gs("two"), 2.0), client.zrangeWithScores(key3, query).get());
 
         // Intersection results are aggregated by the sum of the scores of elements
         assertEquals(
@@ -7402,17 +7577,17 @@ public class SharedCommandTests {
                         .zinterstore(key3, new KeyArrayBinary(new GlideString[] {key1, key2}), Aggregate.SUM)
                         .get());
         assertEquals(
-                Map.of(gs("one"), 2.5, gs("two"), 4.5), client.zrangeWithScores(key3, query).get());
+                createMap(gs("one"), 2.5, gs("two"), 4.5), client.zrangeWithScores(key3, query).get());
 
         // Scores are multiplied by 2.0 for key1 and key2 during aggregation.
         assertEquals(
                 2,
                 client
                         .zinterstore(
-                                key3, new WeightedKeysBinary(List.of(Pair.of(key1, 2.0), Pair.of(key2, 2.0))))
+                                key3, new WeightedKeysBinary(Arrays.asList(Pair.of(key1, 2.0), Pair.of(key2, 2.0))))
                         .get());
         assertEquals(
-                Map.of(gs("one"), 5.0, gs("two"), 9.0), client.zrangeWithScores(key3, query).get());
+                createMap(gs("one"), 5.0, gs("two"), 9.0), client.zrangeWithScores(key3, query).get());
 
         // Intersection results are aggregated by the minimum score, with scores for key1 multiplied by
         // 1.0 and for key2 by -2.0.
@@ -7421,11 +7596,11 @@ public class SharedCommandTests {
                 client
                         .zinterstore(
                                 key3,
-                                new WeightedKeysBinary(List.of(Pair.of(key1, 1.0), Pair.of(key2, -2.0))),
+                                new WeightedKeysBinary(Arrays.asList(Pair.of(key1, 1.0), Pair.of(key2, -2.0))),
                                 Aggregate.MIN)
                         .get());
         assertEquals(
-                Map.of(gs("two"), -5.0, gs("one"), -3.0), client.zrangeWithScores(key3, query).get());
+                createMap(gs("two"), -5.0, gs("one"), -3.0), client.zrangeWithScores(key3, query).get());
 
         // Key exists, but it is not a set
         assertEquals(OK, client.set(key4, gs("value")).get());
@@ -7447,8 +7622,8 @@ public class SharedCommandTests {
         String key1 = "{testKey}:1-" + UUID.randomUUID();
         String key2 = "{testKey}:2-" + UUID.randomUUID();
         String key3 = "{testKey}:3-" + UUID.randomUUID();
-        Map<String, Double> membersScores1 = Map.of("one", 1.0, "two", 2.0);
-        Map<String, Double> membersScores2 = Map.of("two", 3.5, "three", 3.0);
+        Map<String, Double> membersScores1 = createMap("one", 1.0, "two", 2.0);
+        Map<String, Double> membersScores2 = createMap("two", 3.5, "three", 3.0);
 
         assertEquals(2, client.zadd(key1, membersScores1).get());
         assertEquals(2, client.zadd(key2, membersScores2).get());
@@ -7457,37 +7632,40 @@ public class SharedCommandTests {
         assertArrayEquals(
                 new String[] {"two"}, client.zinter(new KeyArray(new String[] {key1, key2})).get());
         assertEquals(
-                Map.of("two", 5.5), client.zinterWithScores(new KeyArray(new String[] {key1, key2})).get());
+                createMap("two", 5.5),
+                client.zinterWithScores(new KeyArray(new String[] {key1, key2})).get());
 
         // Intersection results are aggregated by the max score of elements
         assertEquals(
-                Map.of("two", 3.5),
+                createMap("two", 3.5),
                 client.zinterWithScores(new KeyArray(new String[] {key1, key2}), Aggregate.MAX).get());
 
         // Intersection results are aggregated by the min score of elements
         assertEquals(
-                Map.of("two", 2.0),
+                createMap("two", 2.0),
                 client.zinterWithScores(new KeyArray(new String[] {key1, key2}), Aggregate.MIN).get());
 
         // Intersection results are aggregated by the sum of the scores of elements
         assertEquals(
-                Map.of("two", 5.5),
+                createMap("two", 5.5),
                 client.zinterWithScores(new KeyArray(new String[] {key1, key2}), Aggregate.SUM).get());
 
         // Scores are multiplied by 2.0 for key1 and key2 during aggregation.
         assertEquals(
-                Map.of("two", 11.0),
+                createMap("two", 11.0),
                 client
-                        .zinterWithScores(new WeightedKeys(List.of(Pair.of(key1, 2.0), Pair.of(key2, 2.0))))
+                        .zinterWithScores(
+                                new WeightedKeys(Arrays.asList(Pair.of(key1, 2.0), Pair.of(key2, 2.0))))
                         .get());
 
         // Intersection results are aggregated by the minimum score,
         // with scores for key1 multiplied by 1.0 and for key2 by -2.0.
         assertEquals(
-                Map.of("two", -7.0),
+                createMap("two", -7.0),
                 client
                         .zinterWithScores(
-                                new WeightedKeys(List.of(Pair.of(key1, 1.0), Pair.of(key2, -2.0))), Aggregate.MIN)
+                                new WeightedKeys(Arrays.asList(Pair.of(key1, 1.0), Pair.of(key2, -2.0))),
+                                Aggregate.MIN)
                         .get());
 
         // Non-existing Key - empty intersection
@@ -7502,7 +7680,7 @@ public class SharedCommandTests {
         executionException =
                 assertThrows(
                         ExecutionException.class,
-                        () -> client.zinterWithScores(new WeightedKeys(List.of())).get());
+                        () -> client.zinterWithScores(new WeightedKeys(Arrays.asList())).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
 
         // Key exists, but it is not a set
@@ -7523,8 +7701,8 @@ public class SharedCommandTests {
         GlideString key1 = gs("{testKey}:1-" + UUID.randomUUID());
         GlideString key2 = gs("{testKey}:2-" + UUID.randomUUID());
         GlideString key3 = gs("{testKey}:3-" + UUID.randomUUID());
-        Map<GlideString, Double> membersScores1 = Map.of(gs("one"), 1.0, gs("two"), 2.0);
-        Map<GlideString, Double> membersScores2 = Map.of(gs("two"), 3.5, gs("three"), 3.0);
+        Map<GlideString, Double> membersScores1 = createMap(gs("one"), 1.0, gs("two"), 2.0);
+        Map<GlideString, Double> membersScores2 = createMap(gs("two"), 3.5, gs("three"), 3.0);
 
         assertEquals(2, client.zadd(key1, membersScores1).get());
         assertEquals(2, client.zadd(key2, membersScores2).get());
@@ -7534,45 +7712,45 @@ public class SharedCommandTests {
                 new GlideString[] {gs("two")},
                 client.zinter(new KeyArrayBinary(new GlideString[] {key1, key2})).get());
         assertEquals(
-                Map.of(gs("two"), 5.5),
+                createMap(gs("two"), 5.5),
                 client.zinterWithScores(new KeyArrayBinary(new GlideString[] {key1, key2})).get());
 
         // Intersection results are aggregated by the max score of elements
         assertEquals(
-                Map.of(gs("two"), 3.5),
+                createMap(gs("two"), 3.5),
                 client
                         .zinterWithScores(new KeyArrayBinary(new GlideString[] {key1, key2}), Aggregate.MAX)
                         .get());
 
         // Intersection results are aggregated by the min score of elements
         assertEquals(
-                Map.of(gs("two"), 2.0),
+                createMap(gs("two"), 2.0),
                 client
                         .zinterWithScores(new KeyArrayBinary(new GlideString[] {key1, key2}), Aggregate.MIN)
                         .get());
 
         // Intersection results are aggregated by the sum of the scores of elements
         assertEquals(
-                Map.of(gs("two"), 5.5),
+                createMap(gs("two"), 5.5),
                 client
                         .zinterWithScores(new KeyArrayBinary(new GlideString[] {key1, key2}), Aggregate.SUM)
                         .get());
 
         // Scores are multiplied by 2.0 for key1 and key2 during aggregation.
         assertEquals(
-                Map.of(gs("two"), 11.0),
+                createMap(gs("two"), 11.0),
                 client
                         .zinterWithScores(
-                                new WeightedKeysBinary(List.of(Pair.of(key1, 2.0), Pair.of(key2, 2.0))))
+                                new WeightedKeysBinary(Arrays.asList(Pair.of(key1, 2.0), Pair.of(key2, 2.0))))
                         .get());
 
         // Intersection results are aggregated by the minimum score,
         // with scores for key1 multiplied by 1.0 and for key2 by -2.0.
         assertEquals(
-                Map.of(gs("two"), -7.0),
+                createMap(gs("two"), -7.0),
                 client
                         .zinterWithScores(
-                                new WeightedKeysBinary(List.of(Pair.of(key1, 1.0), Pair.of(key2, -2.0))),
+                                new WeightedKeysBinary(Arrays.asList(Pair.of(key1, 1.0), Pair.of(key2, -2.0))),
                                 Aggregate.MIN)
                         .get());
 
@@ -7591,7 +7769,7 @@ public class SharedCommandTests {
         executionException =
                 assertThrows(
                         ExecutionException.class,
-                        () -> client.zinterWithScores(new WeightedKeysBinary(List.of())).get());
+                        () -> client.zinterWithScores(new WeightedKeysBinary(Arrays.asList())).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
 
         // Key exists, but it is not a set
@@ -7612,8 +7790,8 @@ public class SharedCommandTests {
         String key2 = "{zintercard}-" + UUID.randomUUID();
         String key3 = "{zintercard}-" + UUID.randomUUID();
 
-        assertEquals(3, client.zadd(key1, Map.of("a", 1.0, "b", 2.0, "c", 3.0)).get());
-        assertEquals(3, client.zadd(key2, Map.of("b", 1.0, "c", 2.0, "d", 3.0)).get());
+        assertEquals(3, client.zadd(key1, createMap("a", 1.0, "b", 2.0, "c", 3.0)).get());
+        assertEquals(3, client.zadd(key2, createMap("b", 1.0, "c", 2.0, "d", 3.0)).get());
 
         assertEquals(2L, client.zintercard(new String[] {key1, key2}).get());
         assertEquals(0, client.zintercard(new String[] {key1, key3}).get());
@@ -7646,37 +7824,38 @@ public class SharedCommandTests {
         String key3 = "{testKey}:3-" + UUID.randomUUID();
         String key4 = "{testKey}:4-" + UUID.randomUUID();
         RangeByIndex query = new RangeByIndex(0, -1);
-        Map<String, Double> membersScores1 = Map.of("one", 1.0, "two", 2.0);
-        Map<String, Double> membersScores2 = Map.of("one", 1.5, "two", 2.5, "three", 3.5);
+        Map<String, Double> membersScores1 = createMap("one", 1.0, "two", 2.0);
+        Map<String, Double> membersScores2 = createMap("one", 1.5, "two", 2.5, "three", 3.5);
 
         assertEquals(2, client.zadd(key1, membersScores1).get());
         assertEquals(3, client.zadd(key2, membersScores2).get());
 
         assertEquals(2, client.zinterstore(key3, new KeyArray(new String[] {key1, key2})).get());
-        assertEquals(Map.of("one", 2.5, "two", 4.5), client.zrangeWithScores(key3, query).get());
+        assertEquals(createMap("one", 2.5, "two", 4.5), client.zrangeWithScores(key3, query).get());
 
         // Intersection results are aggregated by the max score of elements
         assertEquals(
                 2, client.zinterstore(key3, new KeyArray(new String[] {key1, key2}), Aggregate.MAX).get());
-        assertEquals(Map.of("one", 1.5, "two", 2.5), client.zrangeWithScores(key3, query).get());
+        assertEquals(createMap("one", 1.5, "two", 2.5), client.zrangeWithScores(key3, query).get());
 
         // Intersection results are aggregated by the min score of elements
         assertEquals(
                 2, client.zinterstore(key3, new KeyArray(new String[] {key1, key2}), Aggregate.MIN).get());
-        assertEquals(Map.of("one", 1.0, "two", 2.0), client.zrangeWithScores(key3, query).get());
+        assertEquals(createMap("one", 1.0, "two", 2.0), client.zrangeWithScores(key3, query).get());
 
         // Intersection results are aggregated by the sum of the scores of elements
         assertEquals(
                 2, client.zinterstore(key3, new KeyArray(new String[] {key1, key2}), Aggregate.SUM).get());
-        assertEquals(Map.of("one", 2.5, "two", 4.5), client.zrangeWithScores(key3, query).get());
+        assertEquals(createMap("one", 2.5, "two", 4.5), client.zrangeWithScores(key3, query).get());
 
         // Scores are multiplied by 2.0 for key1 and key2 during aggregation.
         assertEquals(
                 2,
                 client
-                        .zinterstore(key3, new WeightedKeys(List.of(Pair.of(key1, 2.0), Pair.of(key2, 2.0))))
+                        .zinterstore(
+                                key3, new WeightedKeys(Arrays.asList(Pair.of(key1, 2.0), Pair.of(key2, 2.0))))
                         .get());
-        assertEquals(Map.of("one", 5.0, "two", 9.0), client.zrangeWithScores(key3, query).get());
+        assertEquals(createMap("one", 5.0, "two", 9.0), client.zrangeWithScores(key3, query).get());
 
         // Intersection results are aggregated by the minimum score, with scores for key1 multiplied by
         // 1.0 and for key2 by -2.0.
@@ -7685,10 +7864,10 @@ public class SharedCommandTests {
                 client
                         .zinterstore(
                                 key3,
-                                new WeightedKeys(List.of(Pair.of(key1, 1.0), Pair.of(key2, -2.0))),
+                                new WeightedKeys(Arrays.asList(Pair.of(key1, 1.0), Pair.of(key2, -2.0))),
                                 Aggregate.MIN)
                         .get());
-        assertEquals(Map.of("two", -5.0, "one", -3.0), client.zrangeWithScores(key3, query).get());
+        assertEquals(createMap("two", -5.0, "one", -3.0), client.zrangeWithScores(key3, query).get());
 
         // Key exists, but it is not a set
         assertEquals(OK, client.set(key4, "value").get());
@@ -7708,14 +7887,14 @@ public class SharedCommandTests {
         String key2 = "{zmpop}-2-" + UUID.randomUUID();
         String key3 = "{zmpop}-3-" + UUID.randomUUID();
 
-        assertEquals(2, client.zadd(key1, Map.of("a1", 1., "b1", 2.)).get());
-        assertEquals(2, client.zadd(key2, Map.of("a2", .1, "b2", .2)).get());
+        assertEquals(2, client.zadd(key1, createMap("a1", 1., "b1", 2.)).get());
+        assertEquals(2, client.zadd(key2, createMap("a2", .1, "b2", .2)).get());
 
         assertEquals(
-                Map.of(key1, Map.of("b1", 2.)), client.zmpop(new String[] {key1, key2}, MAX).get());
+                createMap(key1, createMap("b1", 2.)), client.zmpop(new String[] {key1, key2}, MAX).get());
 
         assertEquals(
-                Map.of(key2, Map.of("b2", .2, "a2", .1)),
+                createMap(key2, createMap("b2", .2, "a2", .1)),
                 client.zmpop(new String[] {key2, key1}, MAX, 10).get());
 
         // nothing popped out
@@ -7742,7 +7921,7 @@ public class SharedCommandTests {
         assertInstanceOf(RequestException.class, executionException.getCause());
 
         // check that order of entries in the response is preserved
-        var entries = new LinkedHashMap<String, Double>();
+        LinkedHashMap<String, Double> entries = new LinkedHashMap<String, Double>();
         for (int i = 0; i < 10; i++) {
             // a => 1., b => 2. etc
             entries.put("" + ('a' + i), (double) i);
@@ -7760,14 +7939,14 @@ public class SharedCommandTests {
         GlideString key2 = gs("{zmpop}-2-" + UUID.randomUUID());
         GlideString key3 = gs("{zmpop}-3-" + UUID.randomUUID());
 
-        assertEquals(2, client.zadd(key1, Map.of(gs("a1"), 1., gs("b1"), 2.)).get());
-        assertEquals(2, client.zadd(key2, Map.of(gs("a2"), .1, gs("b2"), .2)).get());
+        assertEquals(2, client.zadd(key1, createMap(gs("a1"), 1., gs("b1"), 2.)).get());
+        assertEquals(2, client.zadd(key2, createMap(gs("a2"), .1, gs("b2"), .2)).get());
 
         assertEquals(
-                Map.of(key1, Map.of(gs("b1"), 2.)),
+                createMap(key1, createMap(gs("b1"), 2.)),
                 client.zmpop(new GlideString[] {key1, key2}, MAX).get());
         assertEquals(
-                Map.of(key2, Map.of(gs("b2"), .2, gs("a2"), .1)),
+                createMap(key2, createMap(gs("b2"), .2, gs("a2"), .1)),
                 client.zmpop(new GlideString[] {key2, key1}, MAX, 10).get());
 
         // nothing popped out
@@ -7795,7 +7974,7 @@ public class SharedCommandTests {
         assertInstanceOf(RequestException.class, executionException.getCause());
 
         // check that order of entries in the response is preserved
-        var entries_gs = new LinkedHashMap<GlideString, Double>();
+        LinkedHashMap<GlideString, Double> entries_gs = new LinkedHashMap<GlideString, Double>();
         for (int i = 0; i < 10; i++) {
             // a => 1., b => 2. etc
             entries_gs.put(gs("" + ('a' + i)), (double) i);
@@ -7814,13 +7993,14 @@ public class SharedCommandTests {
         String key2 = "{bzmpop}-2-" + UUID.randomUUID();
         String key3 = "{bzmpop}-3-" + UUID.randomUUID();
 
-        assertEquals(2, client.zadd(key1, Map.of("a1", 1., "b1", 2.)).get());
-        assertEquals(2, client.zadd(key2, Map.of("a2", .1, "b2", .2)).get());
+        assertEquals(2, client.zadd(key1, createMap("a1", 1., "b1", 2.)).get());
+        assertEquals(2, client.zadd(key2, createMap("a2", .1, "b2", .2)).get());
 
         assertEquals(
-                Map.of(key1, Map.of("b1", 2.)), client.bzmpop(new String[] {key1, key2}, MAX, 0.1).get());
+                createMap(key1, createMap("b1", 2.)),
+                client.bzmpop(new String[] {key1, key2}, MAX, 0.1).get());
         assertEquals(
-                Map.of(key2, Map.of("b2", .2, "a2", .1)),
+                createMap(key2, createMap("b2", .2, "a2", .1)),
                 client.bzmpop(new String[] {key2, key1}, MAX, 0.1, 10).get());
 
         // nothing popped out
@@ -7845,7 +8025,7 @@ public class SharedCommandTests {
         assertInstanceOf(RequestException.class, executionException.getCause());
 
         // check that order of entries in the response is preserved
-        var entries = new LinkedHashMap<String, Double>();
+        LinkedHashMap<String, Double> entries = new LinkedHashMap<String, Double>();
         for (int i = 0; i < 10; i++) {
             // a => 1., b => 2. etc
             entries.put("" + ('a' + i), (double) i);
@@ -7864,14 +8044,14 @@ public class SharedCommandTests {
         GlideString key2 = gs("{bzmpop}-2-" + UUID.randomUUID());
         GlideString key3 = gs("{bzmpop}-3-" + UUID.randomUUID());
 
-        assertEquals(2, client.zadd(key1, Map.of(gs("a1"), 1., gs("b1"), 2.)).get());
-        assertEquals(2, client.zadd(key2, Map.of(gs("a2"), .1, gs("b2"), .2)).get());
+        assertEquals(2, client.zadd(key1, createMap(gs("a1"), 1., gs("b1"), 2.)).get());
+        assertEquals(2, client.zadd(key2, createMap(gs("a2"), .1, gs("b2"), .2)).get());
 
         assertEquals(
-                Map.of(key1, Map.of(gs("b1"), 2.)),
+                createMap(key1, createMap(gs("b1"), 2.)),
                 client.bzmpop(new GlideString[] {key1, key2}, MAX, 0.1).get());
         assertEquals(
-                Map.of(key2, Map.of(gs("b2"), .2, gs("a2"), .1)),
+                createMap(key2, createMap(gs("b2"), .2, gs("a2"), .1)),
                 client.bzmpop(new GlideString[] {key2, key1}, MAX, 0.1, 10).get());
 
         // nothing popped out
@@ -7898,7 +8078,7 @@ public class SharedCommandTests {
         assertInstanceOf(RequestException.class, executionException.getCause());
 
         // check that order of entries in the response is preserved
-        var entries_gs = new LinkedHashMap<GlideString, Double>();
+        LinkedHashMap<GlideString, Double> entries_gs = new LinkedHashMap<GlideString, Double>();
         for (int i = 0; i < 10; i++) {
             // a => 1., b => 2. etc
             entries_gs.put(gs("" + ('a' + i)), (double) i);
@@ -7916,7 +8096,7 @@ public class SharedCommandTests {
         assumeTrue(SERVER_VERSION.isGreaterThanOrEqualTo("7.0.0"), "This feature added in version 7");
         String key = UUID.randomUUID().toString();
         // create new client with default request timeout (250 millis)
-        try (var testClient =
+        try (BaseClient testClient =
                 client instanceof GlideClient
                         ? GlideClient.createClient(commonClientConfig().build()).get()
                         : GlideClusterClient.createClient(commonClusterClientConfig().build()).get()) {
@@ -7940,7 +8120,7 @@ public class SharedCommandTests {
         assumeTrue(SERVER_VERSION.isGreaterThanOrEqualTo("7.0.0"), "This feature added in version 7");
         GlideString key = gs(UUID.randomUUID().toString());
         // create new client with default request timeout (250 millis)
-        try (var testClient =
+        try (BaseClient testClient =
                 client instanceof GlideClient
                         ? GlideClient.createClient(commonClientConfig().build()).get()
                         : GlideClusterClient.createClient(commonClusterClientConfig().build()).get()) {
@@ -8075,7 +8255,7 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key,
-                                Map.of(field1, "foo0", field2, "bar0"),
+                                createMap(field1, "foo0", field2, "bar0"),
                                 StreamAddOptions.builder().makeStream(Boolean.FALSE).build())
                         .get());
 
@@ -8085,11 +8265,11 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key,
-                                Map.of(field1, "foo1", field2, "bar1"),
+                                createMap(field1, "foo1", field2, "bar1"),
                                 StreamAddOptions.builder().id(timestamp1).build())
                         .get());
 
-        assertNotNull(client.xadd(key, Map.of(field1, "foo2", field2, "bar2")).get());
+        assertNotNull(client.xadd(key, createMap(field1, "foo2", field2, "bar2")).get());
         assertEquals(2L, client.xlen(key).get());
 
         // this will trim the first entry.
@@ -8097,7 +8277,7 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key,
-                                Map.of(field1, "foo3", field2, "bar3"),
+                                createMap(field1, "foo3", field2, "bar3"),
                                 StreamAddOptions.builder().trim(new MaxLen(true, 2L)).build())
                         .get();
         assertNotNull(id);
@@ -8108,7 +8288,7 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key,
-                                Map.of(field1, "foo4", field2, "bar4"),
+                                createMap(field1, "foo4", field2, "bar4"),
                                 StreamAddOptions.builder().trim(new MinId(true, id)).build())
                         .get());
         assertEquals(2L, client.xlen(key).get());
@@ -8143,7 +8323,7 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key,
-                                Map.of(field1, gs("foo0"), field2, gs("bar0")),
+                                createMap(field1, gs("foo0"), field2, gs("bar0")),
                                 StreamAddOptionsBinary.builder().makeStream(Boolean.FALSE).build())
                         .get());
 
@@ -8153,11 +8333,11 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key,
-                                Map.of(field1, gs("foo1"), field2, gs("bar1")),
+                                createMap(field1, gs("foo1"), field2, gs("bar1")),
                                 StreamAddOptionsBinary.builder().id(timestamp1).build())
                         .get());
 
-        assertNotNull(client.xadd(key, Map.of(field1, gs("foo2"), field2, gs("bar2"))).get());
+        assertNotNull(client.xadd(key, createMap(field1, gs("foo2"), field2, gs("bar2"))).get());
         assertEquals(2L, client.xlen(key).get());
 
         // this will trim the first entry.
@@ -8165,7 +8345,7 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key,
-                                Map.of(field1, gs("foo3"), field2, gs("bar3")),
+                                createMap(field1, gs("foo3"), field2, gs("bar3")),
                                 StreamAddOptionsBinary.builder().trim(new MaxLen(true, 2L)).build())
                         .get();
         assertNotNull(id);
@@ -8176,7 +8356,7 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key,
-                                Map.of(field1, gs("foo4"), field2, gs("bar4")),
+                                createMap(field1, gs("foo4"), field2, gs("bar4")),
                                 StreamAddOptionsBinary.builder().trim(new MinId(true, id)).build())
                         .get());
         assertEquals(2L, client.xlen(key).get());
@@ -8218,20 +8398,23 @@ public class SharedCommandTests {
 
         String timestamp_2_1 =
                 client
-                        .xadd(key2, Map.of(field2, field2 + "1"), StreamAddOptions.builder().id("2-1").build())
+                        .xadd(
+                                key2, createMap(field2, field2 + "1"), StreamAddOptions.builder().id("2-1").build())
                         .get();
         assertNotNull(timestamp_2_1);
 
         // setup second entries in streams key1 and key2
         String timestamp_1_2 =
                 client
-                        .xadd(key1, Map.of(field1, field1 + "2"), StreamAddOptions.builder().id("1-2").build())
+                        .xadd(
+                                key1, createMap(field1, field1 + "2"), StreamAddOptions.builder().id("1-2").build())
                         .get();
         assertNotNull(timestamp_1_2);
 
         String timestamp_2_2 =
                 client
-                        .xadd(key2, Map.of(field2, field2 + "2"), StreamAddOptions.builder().id("2-2").build())
+                        .xadd(
+                                key2, createMap(field2, field2 + "2"), StreamAddOptions.builder().id("2-2").build())
                         .get();
         assertNotNull(timestamp_2_2);
 
@@ -8245,12 +8428,13 @@ public class SharedCommandTests {
 
         String timestamp_2_3 =
                 client
-                        .xadd(key2, Map.of(field2, field2 + "3"), StreamAddOptions.builder().id("2-3").build())
+                        .xadd(
+                                key2, createMap(field2, field2 + "3"), StreamAddOptions.builder().id("2-3").build())
                         .get();
         assertNotNull(timestamp_2_3);
 
         Map<String, Map<String, String[][]>> result =
-                client.xread(Map.of(key1, timestamp_1_1, key2, timestamp_2_1)).get();
+                client.xread(createMap(key1, timestamp_1_1, key2, timestamp_2_1)).get();
 
         // check key1
         Map<String, String[][]> expected_key1 = new LinkedHashMap<>();
@@ -8294,7 +8478,7 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key2,
-                                Map.of(field2, gs(field2 + "1")),
+                                createMap(field2, gs(field2 + "1")),
                                 StreamAddOptionsBinary.builder().id(gs("2-1")).build())
                         .get();
         assertNotNull(timestamp_2_1);
@@ -8304,7 +8488,7 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key1,
-                                Map.of(field1, gs(field1 + "2")),
+                                createMap(field1, gs(field1 + "2")),
                                 StreamAddOptionsBinary.builder().id(gs("1-2")).build())
                         .get();
         assertNotNull(timestamp_1_2);
@@ -8313,7 +8497,7 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key2,
-                                Map.of(field2, gs(field2 + "2")),
+                                createMap(field2, gs(field2 + "2")),
                                 StreamAddOptionsBinary.builder().id(gs("2-2")).build())
                         .get();
         assertNotNull(timestamp_2_2);
@@ -8332,13 +8516,13 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key2,
-                                Map.of(field2, gs(field2 + "3")),
+                                createMap(field2, gs(field2 + "3")),
                                 StreamAddOptionsBinary.builder().id(gs("2-3")).build())
                         .get();
         assertNotNull(timestamp_2_3);
 
         Map<GlideString, Map<GlideString, GlideString[][]>> result =
-                client.xreadBinary(Map.of(key1, timestamp_1_1, key2, timestamp_2_1)).get();
+                client.xreadBinary(createMap(key1, timestamp_1_1, key2, timestamp_2_1)).get();
 
         // check key1
         Map<GlideString, GlideString[][]> expected_key1 = new LinkedHashMap<>();
@@ -8378,16 +8562,16 @@ public class SharedCommandTests {
         ExecutionException executionException =
                 assertThrows(
                         ExecutionException.class,
-                        () -> client.xread(Map.of(nonStreamKey, timestamp_1_1, key1, timestamp_1_1)).get());
+                        () -> client.xread(createMap(nonStreamKey, timestamp_1_1, key1, timestamp_1_1)).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
 
         executionException =
                 assertThrows(
                         ExecutionException.class,
-                        () -> client.xread(Map.of(key1, timestamp_1_1, nonStreamKey, timestamp_1_1)).get());
+                        () -> client.xread(createMap(key1, timestamp_1_1, nonStreamKey, timestamp_1_1)).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
 
-        try (var testClient =
+        try (BaseClient testClient =
                 client instanceof GlideClient
                         ? GlideClient.createClient(commonClientConfig().build()).get()
                         : GlideClusterClient.createClient(commonClusterClientConfig().build()).get()) {
@@ -8397,7 +8581,7 @@ public class SharedCommandTests {
             assertNull(
                     testClient
                             .xread(
-                                    Map.of(key1, timestamp_1_1),
+                                    createMap(key1, timestamp_1_1),
                                     StreamReadOptions.builder().block(oneSecondInMS).build())
                             .get());
 
@@ -8407,7 +8591,8 @@ public class SharedCommandTests {
                     TimeoutException.class, // <- future timeout, not command timeout
                     () ->
                             testClient
-                                    .xread(Map.of(key1, timestamp_1_1), StreamReadOptions.builder().block(0L).build())
+                                    .xread(
+                                            createMap(key1, timestamp_1_1), StreamReadOptions.builder().block(0L).build())
                                     .get(3, TimeUnit.SECONDS));
         }
     }
@@ -8435,17 +8620,21 @@ public class SharedCommandTests {
                 assertThrows(
                         ExecutionException.class,
                         () ->
-                                client.xreadBinary(Map.of(nonStreamKey, timestamp_1_1, key1, timestamp_1_1)).get());
+                                client
+                                        .xreadBinary(createMap(nonStreamKey, timestamp_1_1, key1, timestamp_1_1))
+                                        .get());
         assertInstanceOf(RequestException.class, executionException.getCause());
 
         executionException =
                 assertThrows(
                         ExecutionException.class,
                         () ->
-                                client.xreadBinary(Map.of(key1, timestamp_1_1, nonStreamKey, timestamp_1_1)).get());
+                                client
+                                        .xreadBinary(createMap(key1, timestamp_1_1, nonStreamKey, timestamp_1_1))
+                                        .get());
         assertInstanceOf(RequestException.class, executionException.getCause());
 
-        try (var testClient =
+        try (BaseClient testClient =
                 client instanceof GlideClient
                         ? GlideClient.createClient(commonClientConfig().build()).get()
                         : GlideClusterClient.createClient(commonClusterClientConfig().build()).get()) {
@@ -8455,7 +8644,7 @@ public class SharedCommandTests {
             assertNull(
                     testClient
                             .xreadBinary(
-                                    Map.of(key1, timestamp_1_1),
+                                    createMap(key1, timestamp_1_1),
                                     StreamReadOptions.builder().block(oneSecondInMS).build())
                             .get());
 
@@ -8466,7 +8655,7 @@ public class SharedCommandTests {
                     () ->
                             testClient
                                     .xreadBinary(
-                                            Map.of(key1, timestamp_1_1), StreamReadOptions.builder().block(0L).build())
+                                            createMap(key1, timestamp_1_1), StreamReadOptions.builder().block(0L).build())
                                     .get(3, TimeUnit.SECONDS));
         }
     }
@@ -8487,7 +8676,7 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key,
-                                Map.of("f1", "foo1", "f2", "bar2"),
+                                createMap("f1", "foo1", "f2", "bar2"),
                                 StreamAddOptions.builder().id(streamId1).build())
                         .get());
         assertEquals(
@@ -8495,7 +8684,7 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key,
-                                Map.of("f1", "foo1", "f2", "bar2"),
+                                createMap("f1", "foo1", "f2", "bar2"),
                                 StreamAddOptions.builder().id(streamId2).build())
                         .get());
         assertEquals(2L, client.xlen(key).get());
@@ -8529,7 +8718,7 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key,
-                                Map.of("f1", "foo1", "f2", "bar2"),
+                                createMap("f1", "foo1", "f2", "bar2"),
                                 StreamAddOptions.builder().id(streamId1).build())
                         .get());
         assertEquals(
@@ -8537,7 +8726,7 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key,
-                                Map.of("f1", "foo1", "f2", "bar2"),
+                                createMap("f1", "foo1", "f2", "bar2"),
                                 StreamAddOptions.builder().id(streamId2).build())
                         .get());
         assertEquals(2L, client.xlen(key).get());
@@ -8570,7 +8759,7 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key,
-                                Map.of("f3", "foo3", "f4", "bar3"),
+                                createMap("f3", "foo3", "f4", "bar3"),
                                 StreamAddOptions.builder().id(streamId3).build())
                         .get());
 
@@ -8684,7 +8873,7 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key,
-                                Map.of(gs("f1"), gs("foo1"), gs("f2"), gs("bar2")),
+                                createMap(gs("f1"), gs("foo1"), gs("f2"), gs("bar2")),
                                 StreamAddOptionsBinary.builder().id(gs(streamId1)).build())
                         .get());
         assertEquals(
@@ -8692,7 +8881,7 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key,
-                                Map.of(gs("f1"), gs("foo1"), gs("f2"), gs("bar2")),
+                                createMap(gs("f1"), gs("foo1"), gs("f2"), gs("bar2")),
                                 StreamAddOptionsBinary.builder().id(gs(streamId2)).build())
                         .get());
         assertEquals(2L, client.xlen(key).get());
@@ -8726,7 +8915,7 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key,
-                                Map.of(gs("f3"), gs("foo3"), gs("f4"), gs("bar3")),
+                                createMap(gs("f3"), gs("foo3"), gs("f4"), gs("bar3")),
                                 StreamAddOptionsBinary.builder().id(gs(streamId3)).build())
                         .get());
 
@@ -8981,25 +9170,26 @@ public class SharedCommandTests {
         assertEquals(
                 streamId1_1,
                 client
-                        .xadd(key, Map.of("f3", "v3"), StreamAddOptions.builder().id(streamId1_1).build())
+                        .xadd(key, createMap("f3", "v3"), StreamAddOptions.builder().id(streamId1_1).build())
                         .get());
         assertEquals(
                 streamId1_2,
                 client
-                        .xadd(key, Map.of("f4", "v4"), StreamAddOptions.builder().id(streamId1_2).build())
+                        .xadd(key, createMap("f4", "v4"), StreamAddOptions.builder().id(streamId1_2).build())
                         .get());
         assertEquals(OK, client.xgroupCreate(key, groupName1, streamId0_0).get());
 
         Map<String, Map<String, String[][]>> result =
                 client
                         .xreadgroup(
-                                Map.of(key, ">"),
+                                createMap(key, ">"),
                                 groupName1,
                                 consumer1,
                                 StreamReadGroupOptions.builder().count(1L).build())
                         .get();
         assertDeepEquals(
-                Map.of(key, Map.of(streamId1_0, new String[][] {{"f1", "v1"}, {"f2", "v2"}})), result);
+                createMap(key, createMap(streamId1_0, new String[][] {{"f1", "v1"}, {"f2", "v2"}})),
+                result);
 
         // Sleep to ensure the idle time value and inactive time value returned by xinfo_consumers is >0
         Thread.sleep(2000);
@@ -9029,11 +9219,11 @@ public class SharedCommandTests {
 
         // Create consumer2 and read the rest of the entries with it
         assertTrue(client.xgroupCreateConsumer(key, groupName1, consumer2).get());
-        result = client.xreadgroup(Map.of(key, ">"), groupName1, consumer2).get();
+        result = client.xreadgroup(createMap(key, ">"), groupName1, consumer2).get();
         assertDeepEquals(
-                Map.of(
+                createMap(
                         key,
-                        Map.of(
+                        createMap(
                                 streamId1_1, new String[][] {{"f3", "v3"}},
                                 streamId1_2, new String[][] {{"f4", "v4"}})),
                 result);
@@ -9047,7 +9237,7 @@ public class SharedCommandTests {
         assertEquals(
                 streamId1_3,
                 client
-                        .xadd(key, Map.of("f5", "v5"), StreamAddOptions.builder().id(streamId1_3).build())
+                        .xadd(key, createMap("f5", "v5"), StreamAddOptions.builder().id(streamId1_3).build())
                         .get());
 
         Map<String, Object>[] groups = client.xinfoGroups(key).get();
@@ -9143,7 +9333,7 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key,
-                                Map.of("f1", "v1", "f2", "v2"),
+                                createMap("f1", "v1", "f2", "v2"),
                                 StreamAddOptions.builder().id(streamId1_0).build())
                         .get());
 
@@ -9206,17 +9396,18 @@ public class SharedCommandTests {
         assertEquals(0L, client.xgroupDelConsumer(key, groupName, "not_a_consumer").get());
 
         // Add two stream entries
-        String streamid_1 = client.xadd(key, Map.of("field1", "value1")).get();
+        String streamid_1 = client.xadd(key, createMap("field1", "value1")).get();
         assertNotNull(streamid_1);
-        String streamid_2 = client.xadd(key, Map.of("field2", "value2")).get();
+        String streamid_2 = client.xadd(key, createMap("field2", "value2")).get();
         assertNotNull(streamid_2);
 
         // read the entire stream for the consumer and mark messages as pending
-        var result_1 = client.xreadgroup(Map.of(key, ">"), groupName, consumerName).get();
+        Map<String, Map<String, String[][]>> result_1 =
+                client.xreadgroup(createMap(key, ">"), groupName, consumerName).get();
         assertDeepEquals(
-                Map.of(
+                createMap(
                         key,
-                        Map.of(
+                        createMap(
                                 streamid_1, new String[][] {{"field1", "value1"}},
                                 streamid_2, new String[][] {{"field2", "value2"}})),
                 result_1);
@@ -9225,12 +9416,13 @@ public class SharedCommandTests {
         assertEquals(1L, client.xdel(key, new String[] {streamid_1}).get());
 
         // now xreadgroup returns one empty stream and one non-empty stream
-        var result_2 = client.xreadgroup(Map.of(key, "0"), groupName, consumerName).get();
+        Map<String, Map<String, String[][]>> result_2 =
+                client.xreadgroup(createMap(key, "0"), groupName, consumerName).get();
         assertEquals(2, result_2.get(key).size());
         assertNull(result_2.get(key).get(streamid_1));
         assertArrayEquals(new String[][] {{"field2", "value2"}}, result_2.get(key).get(streamid_2));
 
-        String streamid_3 = client.xadd(key, Map.of("field3", "value3")).get();
+        String streamid_3 = client.xadd(key, createMap("field3", "value3")).get();
         assertNotNull(streamid_3);
 
         // xack that streamid_1, and streamid_2 was received
@@ -9243,7 +9435,8 @@ public class SharedCommandTests {
         assertEquals(0L, client.xack(key, groupName, new String[] {streamid_1, streamid_2}).get());
 
         // Consume the last message with the previously deleted consumer (creates the consumer anew)
-        var result_3 = client.xreadgroup(Map.of(key, ">"), groupName, consumerName).get();
+        Map<String, Map<String, String[][]>> result_3 =
+                client.xreadgroup(createMap(key, ">"), groupName, consumerName).get();
         assertEquals(1, result_3.get(key).size());
 
         // wrong group, so xack streamid_3 returns 0
@@ -9301,17 +9494,18 @@ public class SharedCommandTests {
         assertEquals(0L, client.xgroupDelConsumer(key, groupName, gs("not_a_consumer")).get());
 
         // Add two stream entries
-        GlideString streamid_1 = client.xadd(key, Map.of(gs("field1"), gs("value1"))).get();
+        GlideString streamid_1 = client.xadd(key, createMap(gs("field1"), gs("value1"))).get();
         assertNotNull(streamid_1);
-        GlideString streamid_2 = client.xadd(key, Map.of(gs("field2"), gs("value2"))).get();
+        GlideString streamid_2 = client.xadd(key, createMap(gs("field2"), gs("value2"))).get();
         assertNotNull(streamid_2);
 
         // read the entire stream for the consumer and mark messages as pending
-        var result_1 = client.xreadgroup(Map.of(key, gs(">")), groupName, consumerName).get();
+        Map<GlideString, Map<GlideString, GlideString[][]>> result_1 =
+                client.xreadgroup(createMap(key, gs(">")), groupName, consumerName).get();
         assertDeepEquals(
-                Map.of(
+                createMap(
                         key,
-                        Map.of(
+                        createMap(
                                 streamid_1, new GlideString[][] {{gs("field1"), gs("value1")}},
                                 streamid_2, new GlideString[][] {{gs("field2"), gs("value2")}})),
                 result_1);
@@ -9320,13 +9514,14 @@ public class SharedCommandTests {
         assertEquals(1L, client.xdel(key, new GlideString[] {streamid_1}).get());
 
         // now xreadgroup returns one empty stream and one non-empty stream
-        var result_2 = client.xreadgroup(Map.of(key, gs("0")), groupName, consumerName).get();
+        Map<GlideString, Map<GlideString, GlideString[][]>> result_2 =
+                client.xreadgroup(createMap(key, gs("0")), groupName, consumerName).get();
         assertEquals(2, result_2.get(key).size());
         assertNull(result_2.get(key).get(streamid_1));
         assertArrayEquals(
                 new GlideString[][] {{gs("field2"), gs("value2")}}, result_2.get(key).get(streamid_2));
 
-        GlideString streamid_3 = client.xadd(key, Map.of(gs("field3"), gs("value3"))).get();
+        GlideString streamid_3 = client.xadd(key, createMap(gs("field3"), gs("value3"))).get();
         assertNotNull(streamid_3);
 
         // xack that streamid_1, and streamid_2 was received
@@ -9339,7 +9534,8 @@ public class SharedCommandTests {
         assertEquals(0L, client.xack(key, groupName, new GlideString[] {streamid_1, streamid_2}).get());
 
         // Consume the last message with the previously deleted consumer (creates the consumer anew)
-        var result_3 = client.xreadgroup(Map.of(key, gs(">")), groupName, consumerName).get();
+        Map<GlideString, Map<GlideString, GlideString[][]>> result_3 =
+                client.xreadgroup(createMap(key, gs(">")), groupName, consumerName).get();
         assertEquals(1, result_3.get(key).size());
 
         // wrong group, so xack streamid_3 returns 0
@@ -9382,26 +9578,27 @@ public class SharedCommandTests {
         assertEquals(
                 streamId1_0,
                 client
-                        .xadd(key, Map.of("f0", "v0"), StreamAddOptions.builder().id(streamId1_0).build())
+                        .xadd(key, createMap("f0", "v0"), StreamAddOptions.builder().id(streamId1_0).build())
                         .get());
         assertEquals(
                 streamId1_1,
                 client
-                        .xadd(key, Map.of("f1", "v1"), StreamAddOptions.builder().id(streamId1_1).build())
+                        .xadd(key, createMap("f1", "v1"), StreamAddOptions.builder().id(streamId1_1).build())
                         .get());
         assertEquals(
                 streamId1_2,
                 client
-                        .xadd(key, Map.of("f2", "v2"), StreamAddOptions.builder().id(streamId1_2).build())
+                        .xadd(key, createMap("f2", "v2"), StreamAddOptions.builder().id(streamId1_2).build())
                         .get());
 
         assertEquals(OK, client.xgroupCreate(key, groupName, streamId0).get());
 
-        var result = client.xreadgroup(Map.of(key, ">"), groupName, consumerName).get();
+        Map<String, Map<String, String[][]>> result =
+                client.xreadgroup(createMap(key, ">"), groupName, consumerName).get();
         assertDeepEquals(
-                Map.of(
+                createMap(
                         key,
-                        Map.of(
+                        createMap(
                                 streamId1_0, new String[][] {{"f0", "v0"}},
                                 streamId1_1, new String[][] {{"f1", "v1"}},
                                 streamId1_2, new String[][] {{"f2", "v2"}})),
@@ -9409,7 +9606,7 @@ public class SharedCommandTests {
 
         // Sanity check: xreadgroup should not return more entries since they're all already in the
         // Pending Entries List.
-        assertNull(client.xreadgroup(Map.of(key, ">"), groupName, consumerName).get());
+        assertNull(client.xreadgroup(createMap(key, ">"), groupName, consumerName).get());
 
         // Reset the last delivered ID for the consumer group to "1-1".
         // ENTRIESREAD is only supported in Valkey version 7.0.0 and higher.
@@ -9420,8 +9617,8 @@ public class SharedCommandTests {
         }
 
         // xreadgroup should only return entry 1-2 since we reset the last delivered ID to 1-1.
-        result = client.xreadgroup(Map.of(key, ">"), groupName, consumerName).get();
-        assertDeepEquals(Map.of(key, Map.of(streamId1_2, new String[][] {{"f2", "v2"}})), result);
+        result = client.xreadgroup(createMap(key, ">"), groupName, consumerName).get();
+        assertDeepEquals(createMap(key, createMap(streamId1_2, new String[][] {{"f2", "v2"}})), result);
 
         // An error is raised if XGROUP SETID is called with a non-existing key.
         ExecutionException executionException =
@@ -9455,7 +9652,7 @@ public class SharedCommandTests {
     public void zrandmemberBinaryWithCountWithScores(BaseClient client) {
         GlideString key1 = gs(UUID.randomUUID().toString());
         GlideString key2 = gs(UUID.randomUUID().toString());
-        Map<GlideString, Double> membersScores = Map.of(gs("one"), 1.0, gs("two"), 2.0);
+        Map<GlideString, Double> membersScores = createMap(gs("one"), 1.0, gs("two"), 2.0);
         assertEquals(2, client.zadd(key1, membersScores).get());
 
         // Unique values are expected as count is positive
@@ -9510,7 +9707,7 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key,
-                                Map.of(gs("f0"), gs("v0")),
+                                createMap(gs("f0"), gs("v0")),
                                 StreamAddOptionsBinary.builder().id(streamId1_0).build())
                         .get());
         assertEquals(
@@ -9518,7 +9715,7 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key,
-                                Map.of(gs("f1"), gs("v1")),
+                                createMap(gs("f1"), gs("v1")),
                                 StreamAddOptionsBinary.builder().id(streamId1_1).build())
                         .get());
         assertEquals(
@@ -9526,17 +9723,18 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key,
-                                Map.of(gs("f2"), gs("v2")),
+                                createMap(gs("f2"), gs("v2")),
                                 StreamAddOptionsBinary.builder().id(streamId1_2).build())
                         .get());
 
         assertEquals(OK, client.xgroupCreate(key, groupName, streamId0).get());
 
-        var result = client.xreadgroup(Map.of(key, gs(">")), groupName, consumerName).get();
+        Map<GlideString, Map<GlideString, GlideString[][]>> result =
+                client.xreadgroup(createMap(key, gs(">")), groupName, consumerName).get();
         assertDeepEquals(
-                Map.of(
+                createMap(
                         key,
-                        Map.of(
+                        createMap(
                                 streamId1_0, new GlideString[][] {{gs("f0"), gs("v0")}},
                                 streamId1_1, new GlideString[][] {{gs("f1"), gs("v1")}},
                                 streamId1_2, new GlideString[][] {{gs("f2"), gs("v2")}})),
@@ -9544,7 +9742,7 @@ public class SharedCommandTests {
 
         // Sanity check: xreadgroup should not return more entries since they're all already in the
         // Pending Entries List.
-        assertNull(client.xreadgroup(Map.of(key, gs(">")), groupName, consumerName).get());
+        assertNull(client.xreadgroup(createMap(key, gs(">")), groupName, consumerName).get());
 
         // Reset the last delivered ID for the consumer group to "1-1".
         // ENTRIESREAD is only supported in Valkey version 7.0.0 and higher.
@@ -9555,9 +9753,9 @@ public class SharedCommandTests {
         }
 
         // xreadgroup should only return entry 1-2 since we reset the last delivered ID to 1-1.
-        result = client.xreadgroup(Map.of(key, gs(">")), groupName, consumerName).get();
+        result = client.xreadgroup(createMap(key, gs(">")), groupName, consumerName).get();
         assertDeepEquals(
-                Map.of(key, Map.of(streamId1_2, new GlideString[][] {{gs("f2"), gs("v2")}})), result);
+                createMap(key, createMap(streamId1_2, new GlideString[][] {{gs("f2"), gs("v2")}})), result);
 
         // An error is raised if XGROUP SETID is called with a non-existing key.
         ExecutionException executionException =
@@ -9591,7 +9789,7 @@ public class SharedCommandTests {
     public void zrandmemberBinaryWithCount(BaseClient client) {
         GlideString key1 = gs(UUID.randomUUID().toString());
         GlideString key2 = gs(UUID.randomUUID().toString());
-        Map<GlideString, Double> membersScores = Map.of(gs("one"), 1.0, gs("two"), 2.0);
+        Map<GlideString, Double> membersScores = createMap(gs("one"), 1.0, gs("two"), 2.0);
         assertEquals(2, client.zadd(key1, membersScores).get());
 
         // Unique values are expected as count is positive
@@ -9627,7 +9825,7 @@ public class SharedCommandTests {
 
         // setup first entries in streams key1 and key2
         String timestamp_1_1 =
-                client.xadd(key, Map.of("f1", "v1"), StreamAddOptions.builder().id("1-1").build()).get();
+                client.xadd(key, createMap("f1", "v1"), StreamAddOptions.builder().id("1-1").build()).get();
         assertNotNull(timestamp_1_1);
 
         // create group and consumer for the group
@@ -9647,7 +9845,7 @@ public class SharedCommandTests {
                         () ->
                                 client
                                         .xreadgroup(
-                                                Map.of(nonStreamKey, timestamp_1_1, key, timestamp_1_1),
+                                                createMap(nonStreamKey, timestamp_1_1, key, timestamp_1_1),
                                                 groupName,
                                                 consumerName)
                                         .get());
@@ -9660,7 +9858,7 @@ public class SharedCommandTests {
                         () ->
                                 client
                                         .xreadgroup(
-                                                Map.of(key, timestamp_1_1, nonStreamKey, timestamp_1_1),
+                                                createMap(key, timestamp_1_1, nonStreamKey, timestamp_1_1),
                                                 groupName,
                                                 consumerName)
                                         .get());
@@ -9670,17 +9868,20 @@ public class SharedCommandTests {
         executionException =
                 assertThrows(
                         ExecutionException.class,
-                        () -> client.xreadgroup(Map.of(key, timestamp_1_1), "not_a_group", consumerName).get());
+                        () ->
+                                client
+                                        .xreadgroup(createMap(key, timestamp_1_1), "not_a_group", consumerName)
+                                        .get());
         assertInstanceOf(RequestException.class, executionException.getCause());
         assertTrue(executionException.getMessage().contains("NOGROUP"));
 
         // consumer doesn't exist and will be created
-        var emptyResult =
-                client.xreadgroup(Map.of(key, timestamp_1_1), groupName, "non_existing_consumer").get();
+        Map<String, Map<String, String[][]>> emptyResult =
+                client.xreadgroup(createMap(key, timestamp_1_1), groupName, "non_existing_consumer").get();
         // no available pending messages
         assertEquals(0, emptyResult.get(key).size());
 
-        try (var testClient =
+        try (BaseClient testClient =
                 client instanceof GlideClient
                         ? GlideClient.createClient(commonClientConfig().build()).get()
                         : GlideClusterClient.createClient(commonClusterClientConfig().build()).get()) {
@@ -9705,13 +9906,13 @@ public class SharedCommandTests {
                             .get());
             assertTrue(
                     testClient.xgroupCreateConsumer(timeoutKey, timeoutGroupName, timeoutConsumerName).get());
-            String streamid_1 = testClient.xadd(timeoutKey, Map.of("field1", "value1")).get();
+            String streamid_1 = testClient.xadd(timeoutKey, createMap("field1", "value1")).get();
             assertNotNull(streamid_1);
 
             // read the entire stream for the consumer and mark messages as pending
-            var result_1 =
+            Map<String, Map<String, String[][]>> result_1 =
                     testClient
-                            .xreadgroup(Map.of(timeoutKey, ">"), timeoutGroupName, timeoutConsumerName)
+                            .xreadgroup(createMap(timeoutKey, ">"), timeoutGroupName, timeoutConsumerName)
                             .get();
             // returns a null result on the key
             assertNull(result_1.get(key));
@@ -9722,7 +9923,7 @@ public class SharedCommandTests {
             assertNull(
                     testClient
                             .xreadgroup(
-                                    Map.of(timeoutKey, ">"),
+                                    createMap(timeoutKey, ">"),
                                     timeoutGroupName,
                                     timeoutConsumerName,
                                     StreamReadGroupOptions.builder().block(oneSecondInMS).build())
@@ -9735,7 +9936,7 @@ public class SharedCommandTests {
                     () ->
                             testClient
                                     .xreadgroup(
-                                            Map.of(timeoutKey, ">"),
+                                            createMap(timeoutKey, ">"),
                                             timeoutGroupName,
                                             timeoutConsumerName,
                                             StreamReadGroupOptions.builder().block(0L).build())
@@ -9758,7 +9959,7 @@ public class SharedCommandTests {
                 client
                         .xadd(
                                 key,
-                                Map.of(gs("f1"), gs("v1")),
+                                createMap(gs("f1"), gs("v1")),
                                 StreamAddOptionsBinary.builder().id(gs("1-1")).build())
                         .get();
         assertNotNull(timestamp_1_1);
@@ -9780,7 +9981,7 @@ public class SharedCommandTests {
                         () ->
                                 client
                                         .xreadgroup(
-                                                Map.of(nonStreamKey, timestamp_1_1, key, timestamp_1_1),
+                                                createMap(nonStreamKey, timestamp_1_1, key, timestamp_1_1),
                                                 groupName,
                                                 consumerName)
                                         .get());
@@ -9793,7 +9994,7 @@ public class SharedCommandTests {
                         () ->
                                 client
                                         .xreadgroup(
-                                                Map.of(key, timestamp_1_1, nonStreamKey, timestamp_1_1),
+                                                createMap(key, timestamp_1_1, nonStreamKey, timestamp_1_1),
                                                 groupName,
                                                 consumerName)
                                         .get());
@@ -9805,18 +10006,20 @@ public class SharedCommandTests {
                         ExecutionException.class,
                         () ->
                                 client
-                                        .xreadgroup(Map.of(key, timestamp_1_1), gs("not_a_group"), consumerName)
+                                        .xreadgroup(createMap(key, timestamp_1_1), gs("not_a_group"), consumerName)
                                         .get());
         assertInstanceOf(RequestException.class, executionException.getCause());
         assertTrue(executionException.getMessage().contains("NOGROUP"));
 
         // consumer doesn't exist and will be created
-        var emptyResult =
-                client.xreadgroup(Map.of(key, timestamp_1_1), groupName, gs("non_existing_consumer")).get();
+        Map<GlideString, Map<GlideString, GlideString[][]>> emptyResult =
+                client
+                        .xreadgroup(createMap(key, timestamp_1_1), groupName, gs("non_existing_consumer"))
+                        .get();
         // no available pending messages
         assertEquals(0, emptyResult.get(key).size());
 
-        try (var testClient =
+        try (BaseClient testClient =
                 client instanceof GlideClient
                         ? GlideClient.createClient(commonClientConfig().build()).get()
                         : GlideClusterClient.createClient(commonClusterClientConfig().build()).get()) {
@@ -9842,13 +10045,13 @@ public class SharedCommandTests {
             assertTrue(
                     testClient.xgroupCreateConsumer(timeoutKey, timeoutGroupName, timeoutConsumerName).get());
             GlideString streamid_1 =
-                    testClient.xadd(timeoutKey, Map.of(gs("field1"), gs("value1"))).get();
+                    testClient.xadd(timeoutKey, createMap(gs("field1"), gs("value1"))).get();
             assertNotNull(streamid_1);
 
             // read the entire stream for the consumer and mark messages as pending
-            var result_1 =
+            Map<GlideString, Map<GlideString, GlideString[][]>> result_1 =
                     testClient
-                            .xreadgroup(Map.of(timeoutKey, gs(">")), timeoutGroupName, timeoutConsumerName)
+                            .xreadgroup(createMap(timeoutKey, gs(">")), timeoutGroupName, timeoutConsumerName)
                             .get();
             // returns a null result on the key
             assertNull(result_1.get(key));
@@ -9859,7 +10062,7 @@ public class SharedCommandTests {
             assertNull(
                     testClient
                             .xreadgroup(
-                                    Map.of(timeoutKey, gs(">")),
+                                    createMap(timeoutKey, gs(">")),
                                     timeoutGroupName,
                                     timeoutConsumerName,
                                     StreamReadGroupOptions.builder().block(oneSecondInMS).build())
@@ -9872,7 +10075,7 @@ public class SharedCommandTests {
                     () ->
                             testClient
                                     .xreadgroup(
-                                            Map.of(timeoutKey, gs(">")),
+                                            createMap(timeoutKey, gs(">")),
                                             timeoutGroupName,
                                             timeoutConsumerName,
                                             StreamReadGroupOptions.builder().block(0L).build())
@@ -9892,7 +10095,7 @@ public class SharedCommandTests {
 
         // setup first entries in streams key1 and key2
         String timestamp_1_1 =
-                client.xadd(key, Map.of("f1", "v1"), StreamAddOptions.builder().id("1-1").build()).get();
+                client.xadd(key, createMap("f1", "v1"), StreamAddOptions.builder().id("1-1").build()).get();
         assertNotNull(timestamp_1_1);
 
         // create group and consumer for the group
@@ -9925,7 +10128,7 @@ public class SharedCommandTests {
     public void zrandmember_binary(BaseClient client) {
         GlideString key1 = gs(UUID.randomUUID().toString());
         GlideString key2 = gs(UUID.randomUUID().toString());
-        Map<GlideString, Double> membersScores = Map.of(gs("one"), 1.0, gs("two"), 2.0);
+        Map<GlideString, Double> membersScores = createMap(gs("one"), 1.0, gs("two"), 2.0);
         assertEquals(2, client.zadd(key1, membersScores).get());
 
         GlideString randMember = client.zrandmember(key1).get();
@@ -9961,35 +10164,37 @@ public class SharedCommandTests {
         assertTrue(client.xgroupCreateConsumer(key, groupName, consumer2).get());
 
         // Add two stream entries for consumer 1
-        String streamid_1 = client.xadd(key, Map.of("field1", "value1")).get();
+        String streamid_1 = client.xadd(key, createMap("field1", "value1")).get();
         assertNotNull(streamid_1);
-        String streamid_2 = client.xadd(key, Map.of("field2", "value2")).get();
+        String streamid_2 = client.xadd(key, createMap("field2", "value2")).get();
         assertNotNull(streamid_2);
 
         // read the entire stream for the consumer and mark messages as pending
-        var result_1 = client.xreadgroup(Map.of(key, ">"), groupName, consumer1).get();
+        Map<String, Map<String, String[][]>> result_1 =
+                client.xreadgroup(createMap(key, ">"), groupName, consumer1).get();
         assertDeepEquals(
-                Map.of(
+                createMap(
                         key,
-                        Map.of(
+                        createMap(
                                 streamid_1, new String[][] {{"field1", "value1"}},
                                 streamid_2, new String[][] {{"field2", "value2"}})),
                 result_1);
 
         // Add three stream entries for consumer 2
-        String streamid_3 = client.xadd(key, Map.of("field3", "value3")).get();
+        String streamid_3 = client.xadd(key, createMap("field3", "value3")).get();
         assertNotNull(streamid_3);
-        String streamid_4 = client.xadd(key, Map.of("field4", "value4")).get();
+        String streamid_4 = client.xadd(key, createMap("field4", "value4")).get();
         assertNotNull(streamid_4);
-        String streamid_5 = client.xadd(key, Map.of("field5", "value5")).get();
+        String streamid_5 = client.xadd(key, createMap("field5", "value5")).get();
         assertNotNull(streamid_5);
 
         // read the entire stream for the consumer and mark messages as pending
-        var result_2 = client.xreadgroup(Map.of(key, ">"), groupName, consumer2).get();
+        Map<String, Map<String, String[][]>> result_2 =
+                client.xreadgroup(createMap(key, ">"), groupName, consumer2).get();
         assertDeepEquals(
-                Map.of(
+                createMap(
                         key,
-                        Map.of(
+                        createMap(
                                 streamid_3, new String[][] {{"field3", "value3"}},
                                 streamid_4, new String[][] {{"field4", "value4"}},
                                 streamid_5, new String[][] {{"field5", "value5"}})),
@@ -10034,28 +10239,28 @@ public class SharedCommandTests {
         assertTrue((Long) pending_results_extended[4][2] >= 0L);
 
         // use claim to claim stream 3 and 5 for consumer 1
-        var claimResults =
+        Map<String, String[][]> claimResults =
                 client.xclaim(key, groupName, consumer1, 0L, new String[] {streamid_3, streamid_5}).get();
         assertDeepEquals(
-                Map.of(
+                createMap(
                         streamid_3,
                         new String[][] {{"field3", "value3"}},
                         streamid_5,
                         new String[][] {{"field5", "value5"}}),
                 claimResults);
 
-        var claimResultsJustId =
+        String[] claimResultsJustId =
                 client
                         .xclaimJustId(key, groupName, consumer1, 0L, new String[] {streamid_3, streamid_5})
                         .get();
         assertArrayEquals(new String[] {streamid_3, streamid_5}, claimResultsJustId);
 
         // add one more stream
-        String streamid_6 = client.xadd(key, Map.of("field6", "value6")).get();
+        String streamid_6 = client.xadd(key, createMap("field6", "value6")).get();
         assertNotNull(streamid_6);
 
         // using force, we can xclaim the message without reading it
-        var claimForceResults =
+        Map<String, String[][]> claimForceResults =
                 client
                         .xclaim(
                                 key,
@@ -10065,7 +10270,8 @@ public class SharedCommandTests {
                                 new String[] {streamid_6},
                                 StreamClaimOptions.builder().force().retryCount(99L).build())
                         .get();
-        assertDeepEquals(Map.of(streamid_6, new String[][] {{"field6", "value6"}}), claimForceResults);
+        assertDeepEquals(
+                createMap(streamid_6, new String[][] {{"field6", "value6"}}), claimForceResults);
 
         Object[][] forcePendingResults =
                 client.xpending(key, groupName, IdBound.of(streamid_6), IdBound.of(streamid_6), 1L).get();
@@ -10137,35 +10343,37 @@ public class SharedCommandTests {
         assertTrue(client.xgroupCreateConsumer(key, groupName, consumer2).get());
 
         // Add two stream entries for consumer 1
-        GlideString streamid_1 = client.xadd(key, Map.of(gs("field1"), gs("value1"))).get();
+        GlideString streamid_1 = client.xadd(key, createMap(gs("field1"), gs("value1"))).get();
         assertNotNull(streamid_1);
-        GlideString streamid_2 = client.xadd(key, Map.of(gs("field2"), gs("value2"))).get();
+        GlideString streamid_2 = client.xadd(key, createMap(gs("field2"), gs("value2"))).get();
         assertNotNull(streamid_2);
 
         // read the entire stream for the consumer and mark messages as pending
-        var result_1 = client.xreadgroup(Map.of(key, gs(">")), groupName, consumer1).get();
+        Map<GlideString, Map<GlideString, GlideString[][]>> result_1 =
+                client.xreadgroup(createMap(key, gs(">")), groupName, consumer1).get();
         assertDeepEquals(
-                Map.of(
+                createMap(
                         key,
-                        Map.of(
+                        createMap(
                                 streamid_1, new GlideString[][] {{gs("field1"), gs("value1")}},
                                 streamid_2, new GlideString[][] {{gs("field2"), gs("value2")}})),
                 result_1);
 
         // Add three stream entries for consumer 2
-        GlideString streamid_3 = client.xadd(key, Map.of(gs("field3"), gs("value3"))).get();
+        GlideString streamid_3 = client.xadd(key, createMap(gs("field3"), gs("value3"))).get();
         assertNotNull(streamid_3);
-        GlideString streamid_4 = client.xadd(key, Map.of(gs("field4"), gs("value4"))).get();
+        GlideString streamid_4 = client.xadd(key, createMap(gs("field4"), gs("value4"))).get();
         assertNotNull(streamid_4);
-        GlideString streamid_5 = client.xadd(key, Map.of(gs("field5"), gs("value5"))).get();
+        GlideString streamid_5 = client.xadd(key, createMap(gs("field5"), gs("value5"))).get();
         assertNotNull(streamid_5);
 
         // read the entire stream for the consumer and mark messages as pending
-        var result_2 = client.xreadgroup(Map.of(key, gs(">")), groupName, consumer2).get();
+        Map<GlideString, Map<GlideString, GlideString[][]>> result_2 =
+                client.xreadgroup(createMap(key, gs(">")), groupName, consumer2).get();
         assertDeepEquals(
-                Map.of(
+                createMap(
                         key,
-                        Map.of(
+                        createMap(
                                 streamid_3, new GlideString[][] {{gs("field3"), gs("value3")}},
                                 streamid_4, new GlideString[][] {{gs("field4"), gs("value4")}},
                                 streamid_5, new GlideString[][] {{gs("field5"), gs("value5")}})),
@@ -10213,7 +10421,7 @@ public class SharedCommandTests {
         assertTrue((Long) pending_results_extended[4][2] >= 0L);
 
         // use claim to claim stream 3 and 5 for consumer 1
-        var claimResults =
+        Map<GlideString, GlideString[][]> claimResults =
                 client
                         .xclaim(key, groupName, consumer1, 0L, new GlideString[] {streamid_3, streamid_5})
                         .get();
@@ -10223,25 +10431,25 @@ public class SharedCommandTests {
         assertNotNull(claimResults.get(streamid_5));
         assertNotNull(claimResults.get(streamid_3));
         assertDeepEquals(
-                Map.of(
+                createMap(
                         streamid_3,
                         new GlideString[][] {{gs("field3"), gs("value3")}},
                         streamid_5,
                         new GlideString[][] {{gs("field5"), gs("value5")}}),
                 claimResults);
 
-        var claimResultsJustId =
+        GlideString[] claimResultsJustId =
                 client
                         .xclaimJustId(key, groupName, consumer1, 0L, new GlideString[] {streamid_3, streamid_5})
                         .get();
         assertArrayEquals(new GlideString[] {streamid_3, streamid_5}, claimResultsJustId);
 
         // add one more stream
-        GlideString streamid_6 = client.xadd(key, Map.of(gs("field6"), gs("value6"))).get();
+        GlideString streamid_6 = client.xadd(key, createMap(gs("field6"), gs("value6"))).get();
         assertNotNull(streamid_6);
 
         // using force, we can xclaim the message without reading it
-        var claimForceResults =
+        Map<GlideString, GlideString[][]> claimForceResults =
                 client
                         .xclaim(
                                 key,
@@ -10251,8 +10459,9 @@ public class SharedCommandTests {
                                 new GlideString[] {streamid_6},
                                 StreamClaimOptions.builder().force().retryCount(99L).build())
                         .get();
-        assertDeepEquals(
-                Map.of(streamid_6, new GlideString[][] {{gs("field6"), gs("value6")}}), claimForceResults);
+        Map<GlideString, GlideString[][]> expectedClaimForce =
+                createMap(streamid_6, new GlideString[][] {{gs("field6"), gs("value6")}});
+        assertDeepEquals(expectedClaimForce, claimForceResults);
 
         Object[][] forcePendingResults =
                 client.xpending(key, groupName, IdBound.of(streamid_6), IdBound.of(streamid_6), 1L).get();
@@ -10283,6 +10492,11 @@ public class SharedCommandTests {
         assertEquals(1, pending_results_extended.length);
         assertEquals(streamid_1, pending_results_extended[0][0]);
         assertEquals(consumer1, pending_results_extended[0][1]);
+
+        // Small delay to ensure all XCLAIM and XACK operations are fully processed
+        // This addresses a race condition in standalone RESP2 mode where the final
+        // XPENDING call might not see all expected pending messages immediately
+        Thread.sleep(5);
 
         pending_results_extended =
                 client
@@ -10319,25 +10533,26 @@ public class SharedCommandTests {
         assertTrue(client.xgroupCreateConsumer(key, groupName, consumer1).get());
 
         // Add two stream entries for consumer 1
-        String streamid_1 = client.xadd(key, Map.of("field1", "value1")).get();
+        String streamid_1 = client.xadd(key, createMap("field1", "value1")).get();
         assertNotNull(streamid_1);
-        String streamid_2 = client.xadd(key, Map.of("field2", "value2")).get();
+        String streamid_2 = client.xadd(key, createMap("field2", "value2")).get();
         assertNotNull(streamid_2);
 
         // no pending messages yet...
-        var pending_results_summary = client.xpending(key, groupName).get();
+        Object[] pending_results_summary = client.xpending(key, groupName).get();
         assertArrayEquals(new Object[] {0L, null, null, null}, pending_results_summary);
 
-        var pending_results_extended =
+        Object[][] pending_results_extended =
                 client.xpending(key, groupName, InfRangeBound.MAX, InfRangeBound.MIN, 10L).get();
         assertEquals(0, pending_results_extended.length);
 
         // read the entire stream for the consumer and mark messages as pending
-        var result_1 = client.xreadgroup(Map.of(key, ">"), groupName, consumer1).get();
+        Map<String, Map<String, String[][]>> result_1 =
+                client.xreadgroup(createMap(key, ">"), groupName, consumer1).get();
         assertDeepEquals(
-                Map.of(
+                createMap(
                         key,
-                        Map.of(
+                        createMap(
                                 streamid_1, new String[][] {{"field1", "value1"}},
                                 streamid_2, new String[][] {{"field2", "value2"}})),
                 result_1);
@@ -10478,25 +10693,26 @@ public class SharedCommandTests {
         assertTrue(client.xgroupCreateConsumer(key, groupName, consumer1).get());
 
         // Add two stream entries for consumer 1
-        GlideString streamid_1 = client.xadd(key, Map.of(gs("field1"), gs("value1"))).get();
+        GlideString streamid_1 = client.xadd(key, createMap(gs("field1"), gs("value1"))).get();
         assertNotNull(streamid_1);
-        GlideString streamid_2 = client.xadd(key, Map.of(gs("field2"), gs("value2"))).get();
+        GlideString streamid_2 = client.xadd(key, createMap(gs("field2"), gs("value2"))).get();
         assertNotNull(streamid_2);
 
         // no pending messages yet...
-        var pending_results_summary = client.xpending(key, groupName).get();
+        Object[] pending_results_summary = client.xpending(key, groupName).get();
         assertArrayEquals(new Object[] {0L, null, null, null}, pending_results_summary);
 
-        var pending_results_extended =
+        Object[][] pending_results_extended =
                 client.xpending(key, groupName, InfRangeBound.MAX, InfRangeBound.MIN, 10L).get();
         assertEquals(0, pending_results_extended.length);
 
         // read the entire stream for the consumer and mark messages as pending
-        var result_1 = client.xreadgroup(Map.of(key, gs(">")), groupName, consumer1).get();
+        Map<GlideString, Map<GlideString, GlideString[][]>> result_1 =
+                client.xreadgroup(createMap(key, gs(">")), groupName, consumer1).get();
         assertDeepEquals(
-                Map.of(
+                createMap(
                         key,
-                        Map.of(
+                        createMap(
                                 streamid_1, new GlideString[][] {{gs("field1"), gs("value1")}},
                                 streamid_2, new GlideString[][] {{gs("field2"), gs("value2")}})),
                 result_1);
@@ -10638,9 +10854,9 @@ public class SharedCommandTests {
         assertTrue(client.xgroupCreateConsumer(key, groupName, consumer1).get());
 
         // Add stream entry and mark as pending:
-        String streamid_1 = client.xadd(key, Map.of("field1", "value1")).get();
+        String streamid_1 = client.xadd(key, createMap("field1", "value1")).get();
         assertNotNull(streamid_1);
-        assertNotNull(client.xreadgroup(Map.of(key, ">"), groupName, consumer1).get());
+        assertNotNull(client.xreadgroup(createMap(key, ">"), groupName, consumer1).get());
 
         // claim with invalid stream entry IDs
         ExecutionException executionException =
@@ -10651,7 +10867,7 @@ public class SharedCommandTests {
         assertInstanceOf(RequestException.class, executionException.getCause());
 
         // claim with empty stream entry IDs returns no results
-        var emptyClaim = client.xclaimJustId(key, groupName, consumer1, 1L, new String[0]).get();
+        String[] emptyClaim = client.xclaimJustId(key, groupName, consumer1, 1L, new String[0]).get();
         assertEquals(0L, emptyClaim.length);
 
         // non-existent key throws a RequestError (NOGROUP)
@@ -10665,7 +10881,7 @@ public class SharedCommandTests {
         assertInstanceOf(RequestException.class, executionException.getCause());
         assertTrue(executionException.getMessage().contains("NOGROUP"));
 
-        final var claimOptions = StreamClaimOptions.builder().idle(1L).build();
+        final StreamClaimOptions claimOptions = StreamClaimOptions.builder().idle(1L).build();
         executionException =
                 assertThrows(
                         ExecutionException.class,
@@ -10781,9 +10997,9 @@ public class SharedCommandTests {
         assertTrue(client.xgroupCreateConsumer(key, groupName, consumer1).get());
 
         // Add stream entry and mark as pending:
-        GlideString streamid_1 = client.xadd(key, Map.of(gs("field1"), gs("value1"))).get();
+        GlideString streamid_1 = client.xadd(key, createMap(gs("field1"), gs("value1"))).get();
         assertNotNull(streamid_1);
-        assertNotNull(client.xreadgroup(Map.of(key, gs(">")), groupName, consumer1).get());
+        assertNotNull(client.xreadgroup(createMap(key, gs(">")), groupName, consumer1).get());
 
         // claim with invalid stream entry IDs
         ExecutionException executionException =
@@ -10796,7 +11012,8 @@ public class SharedCommandTests {
         assertInstanceOf(RequestException.class, executionException.getCause());
 
         // claim with empty stream entry IDs returns no results
-        var emptyClaim = client.xclaimJustId(key, groupName, consumer1, 1L, new GlideString[0]).get();
+        GlideString[] emptyClaim =
+                client.xclaimJustId(key, groupName, consumer1, 1L, new GlideString[0]).get();
         assertEquals(0L, emptyClaim.length);
 
         // non-existent key throws a RequestError (NOGROUP)
@@ -10810,7 +11027,7 @@ public class SharedCommandTests {
         assertInstanceOf(RequestException.class, executionException.getCause());
         assertTrue(executionException.getMessage().contains("NOGROUP"));
 
-        final var claimOptions = StreamClaimOptions.builder().idle(1L).build();
+        final StreamClaimOptions claimOptions = StreamClaimOptions.builder().idle(1L).build();
         executionException =
                 assertThrows(
                         ExecutionException.class,
@@ -10921,13 +11138,13 @@ public class SharedCommandTests {
         String consumer2 = UUID.randomUUID().toString();
 
         // Add 4 stream entries for consumer
-        String streamid_0 = client.xadd(key, Map.of("f1", "v1" /*, "f2", "v2"*/)).get();
+        String streamid_0 = client.xadd(key, createMap("f1", "v1" /*, "f2", "v2"*/)).get();
         assertNotNull(streamid_0);
-        String streamid_1 = client.xadd(key, Map.of("field1", "value1")).get();
+        String streamid_1 = client.xadd(key, createMap("field1", "value1")).get();
         assertNotNull(streamid_1);
-        String streamid_2 = client.xadd(key, Map.of("field2", "value2")).get();
+        String streamid_2 = client.xadd(key, createMap("field2", "value2")).get();
         assertNotNull(streamid_2);
-        String streamid_3 = client.xadd(key, Map.of("field3", "value3")).get();
+        String streamid_3 = client.xadd(key, createMap("field3", "value3")).get();
         assertNotNull(streamid_3);
 
         // create group and consumer for the group
@@ -10939,11 +11156,12 @@ public class SharedCommandTests {
                         .get());
 
         // read the entire stream for the consumer and mark messages as pending
-        var xreadgroup_result = client.xreadgroup(Map.of(key, ">"), groupName, consumer).get();
+        Map<String, Map<String, String[][]>> xreadgroup_result =
+                client.xreadgroup(createMap(key, ">"), groupName, consumer).get();
         assertDeepEquals(
-                Map.of(
+                createMap(
                         key,
-                        Map.of(
+                        createMap(
                                 streamid_0, new String[][] {{"f1", "v1"} /*, {"f2", "v2"}*/},
                                 streamid_1, new String[][] {{"field1", "value1"}},
                                 streamid_2, new String[][] {{"field2", "value2"}},
@@ -10954,7 +11172,8 @@ public class SharedCommandTests {
                 client.xautoclaim(key, groupName, consumer, 0L, zeroStreamId, 1L).get();
         assertEquals(streamid_1, xautoclaimResult1[0]);
         assertDeepEquals(
-                Map.of(streamid_0, new String[][] {{"f1", "v1"} /*, {"f2", "v2"}*/}), xautoclaimResult1[1]);
+                createMap(streamid_0, new String[][] {{"f1", "v1"} /*, {"f2", "v2"}*/}),
+                xautoclaimResult1[1]);
 
         // if using Valkey 7.0.0 or above, responses also include a list of entry IDs that were removed
         // from the Pending
@@ -10973,7 +11192,7 @@ public class SharedCommandTests {
                 gs(zeroStreamId),
                 xautoclaimResult2[0]); // "0-0" is returned to indicate the entire stream was scanned.
         assertDeepEquals(
-                Map.of(
+                createMap(
                         gs(streamid_1), new GlideString[][] {{gs("field1"), gs("value1")}},
                         gs(streamid_3), new GlideString[][] {{gs("field3"), gs("value3")}}),
                 xautoclaimResult2[1]);
@@ -11016,7 +11235,7 @@ public class SharedCommandTests {
     public void zrandmember(BaseClient client) {
         String key1 = UUID.randomUUID().toString();
         String key2 = UUID.randomUUID().toString();
-        Map<String, Double> membersScores = Map.of("one", 1.0, "two", 2.0);
+        Map<String, Double> membersScores = createMap("one", 1.0, "two", 2.0);
         assertEquals(2, client.zadd(key1, membersScores).get());
 
         String randMember = client.zrandmember(key1).get();
@@ -11036,7 +11255,7 @@ public class SharedCommandTests {
     public void zrandmemberWithCount(BaseClient client) {
         String key1 = UUID.randomUUID().toString();
         String key2 = UUID.randomUUID().toString();
-        Map<String, Double> membersScores = Map.of("one", 1.0, "two", 2.0);
+        Map<String, Double> membersScores = createMap("one", 1.0, "two", 2.0);
         assertEquals(2, client.zadd(key1, membersScores).get());
 
         // Unique values are expected as count is positive
@@ -11066,7 +11285,7 @@ public class SharedCommandTests {
     public void zrandmemberWithCountWithScores(BaseClient client) {
         String key1 = UUID.randomUUID().toString();
         String key2 = UUID.randomUUID().toString();
-        Map<String, Double> membersScores = Map.of("one", 1.0, "two", 2.0);
+        Map<String, Double> membersScores = createMap("one", 1.0, "two", 2.0);
         assertEquals(2, client.zadd(key1, membersScores).get());
 
         // Unique values are expected as count is positive
@@ -11140,10 +11359,10 @@ public class SharedCommandTests {
 
         assertEquals(OK, client.set(stringKey, "value").get());
         assertEquals(1, client.lpush(listKey, new String[] {"value"}).get());
-        assertEquals(1, client.hset(hashKey, Map.of("1", "2")).get());
+        assertEquals(1, client.hset(hashKey, createMap("1", "2")).get());
         assertEquals(1, client.sadd(setKey, new String[] {"value"}).get());
-        assertEquals(1, client.zadd(zsetKey, Map.of("1", 2d)).get());
-        assertNotNull(client.xadd(streamKey, Map.of("field", "value")));
+        assertEquals(1, client.zadd(zsetKey, createMap("1", 2d)).get());
+        assertNotNull(client.xadd(streamKey, createMap("field", "value")));
 
         assertTrue("none".equalsIgnoreCase(client.type(nonExistingKey).get()));
         assertTrue("string".equalsIgnoreCase(client.type(stringKey).get()));
@@ -11168,10 +11387,10 @@ public class SharedCommandTests {
 
         assertEquals(OK, client.set(stringKey, gs("value")).get());
         assertEquals(1, client.lpush(listKey, new GlideString[] {gs("value")}).get());
-        assertEquals(1, client.hset(hashKey, Map.of("1", "2")).get());
+        assertEquals(1, client.hset(hashKey, createMap("1", "2")).get());
         assertEquals(1, client.sadd(setKey, new String[] {"value"}).get());
-        assertEquals(1, client.zadd(zsetKey, Map.of("1", 2d)).get());
-        assertNotNull(client.xadd(streamKey, Map.of("field", "value")));
+        assertEquals(1, client.zadd(zsetKey, createMap("1", 2d)).get());
+        assertNotNull(client.xadd(streamKey, createMap("field", "value")));
 
         assertTrue("none".equalsIgnoreCase(client.type(nonExistingKey).get()));
         assertTrue("string".equalsIgnoreCase(client.type(stringKey).get()));
@@ -11267,7 +11486,7 @@ public class SharedCommandTests {
         String value2 = "value2-" + UUID.randomUUID();
         assertEquals(2, client.lpush(listKey1, new String[] {value1, value2}).get());
 
-        var response = client.brpop(new String[] {listKey1, listKey2}, 0.5).get();
+        String[] response = client.brpop(new String[] {listKey1, listKey2}, 0.5).get();
         assertArrayEquals(new String[] {listKey1, value1}, response);
 
         // nothing popped out
@@ -11294,7 +11513,7 @@ public class SharedCommandTests {
         GlideString value2 = gs("value2-" + UUID.randomUUID());
         assertEquals(2, client.lpush(listKey1, new GlideString[] {value1, value2}).get());
 
-        var response = client.brpop(new GlideString[] {listKey1, listKey2}, 0.5).get();
+        GlideString[] response = client.brpop(new GlideString[] {listKey1, listKey2}, 0.5).get();
         assertArrayEquals(new GlideString[] {listKey1, value1}, response);
 
         // nothing popped out
@@ -11348,7 +11567,7 @@ public class SharedCommandTests {
         String value2 = "value2-" + UUID.randomUUID();
         assertEquals(2, client.lpush(listKey1, new String[] {value1, value2}).get());
 
-        var response = client.blpop(new String[] {listKey1, listKey2}, 0.5).get();
+        String[] response = client.blpop(new String[] {listKey1, listKey2}, 0.5).get();
         assertArrayEquals(new String[] {listKey1, value2}, response);
 
         // nothing popped out
@@ -11375,7 +11594,7 @@ public class SharedCommandTests {
         GlideString value2 = gs("value2-" + UUID.randomUUID());
         assertEquals(2, client.lpush(listKey1, new GlideString[] {value1, value2}).get());
 
-        var response = client.blpop(new GlideString[] {listKey1, listKey2}, 0.5).get();
+        GlideString[] response = client.blpop(new GlideString[] {listKey1, listKey2}, 0.5).get();
         assertArrayEquals(new GlideString[] {listKey1, value2}, response);
 
         // nothing popped out
@@ -11423,7 +11642,7 @@ public class SharedCommandTests {
     @MethodSource("getClients")
     public void zrange_by_index(BaseClient client) {
         String key = UUID.randomUUID().toString();
-        Map<String, Double> membersScores = Map.of("one", 1.0, "two", 2.0, "three", 3.0);
+        Map<String, Double> membersScores = createMap("one", 1.0, "two", 2.0, "three", 3.0);
         assertEquals(3, client.zadd(key, membersScores).get());
 
         RangeByIndex query = new RangeByIndex(0, 1);
@@ -11431,7 +11650,7 @@ public class SharedCommandTests {
 
         query = new RangeByIndex(0, -1);
         assertEquals(
-                Map.of("one", 1.0, "two", 2.0, "three", 3.0), client.zrangeWithScores(key, query).get());
+                createMap("one", 1.0, "two", 2.0, "three", 3.0), client.zrangeWithScores(key, query).get());
 
         query = new RangeByIndex(0, 1);
         assertArrayEquals(new String[] {"three", "two"}, client.zrange(key, query, true).get());
@@ -11447,7 +11666,7 @@ public class SharedCommandTests {
     public void zrange_binary_by_index(BaseClient client) {
         GlideString key = gs(UUID.randomUUID().toString());
         Map<GlideString, Double> membersScores =
-                Map.of(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0);
+                createMap(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0);
         assertEquals(3, client.zadd(key, membersScores).get());
 
         RangeByIndex query = new RangeByIndex(0, 1);
@@ -11455,7 +11674,7 @@ public class SharedCommandTests {
 
         query = new RangeByIndex(0, -1);
         assertEquals(
-                Map.of(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0),
+                createMap(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0),
                 client.zrangeWithScores(key, query).get());
 
         query = new RangeByIndex(0, 1);
@@ -11472,7 +11691,7 @@ public class SharedCommandTests {
     @MethodSource("getClients")
     public void zrange_by_score(BaseClient client) {
         String key = UUID.randomUUID().toString();
-        Map<String, Double> membersScores = Map.of("one", 1.0, "two", 2.0, "three", 3.0);
+        Map<String, Double> membersScores = createMap("one", 1.0, "two", 2.0, "three", 3.0);
         assertEquals(3, client.zadd(key, membersScores).get());
 
         RangeByScore query = new RangeByScore(NEGATIVE_INFINITY, new ScoreBoundary(3, false));
@@ -11480,7 +11699,7 @@ public class SharedCommandTests {
 
         query = new RangeByScore(NEGATIVE_INFINITY, POSITIVE_INFINITY);
         assertEquals(
-                Map.of("one", 1.0, "two", 2.0, "three", 3.0), client.zrangeWithScores(key, query).get());
+                createMap("one", 1.0, "two", 2.0, "three", 3.0), client.zrangeWithScores(key, query).get());
 
         query = new RangeByScore(new ScoreBoundary(3, false), NEGATIVE_INFINITY);
         assertArrayEquals(new String[] {"two", "one"}, client.zrange(key, query, true).get());
@@ -11516,7 +11735,7 @@ public class SharedCommandTests {
     public void zrange_binary_by_score(BaseClient client) {
         GlideString key = gs(UUID.randomUUID().toString());
         Map<GlideString, Double> membersScores =
-                Map.of(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0);
+                createMap(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0);
         assertEquals(3, client.zadd(key, membersScores).get());
 
         RangeByScore query =
@@ -11525,7 +11744,7 @@ public class SharedCommandTests {
 
         query = new RangeByScore(InfScoreBound.NEGATIVE_INFINITY, InfScoreBound.POSITIVE_INFINITY);
         assertEquals(
-                Map.of(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0),
+                createMap(gs("one"), 1.0, gs("two"), 2.0, gs("three"), 3.0),
                 client.zrangeWithScores(key, query).get());
 
         query = new RangeByScore(new ScoreBoundary(3, false), InfScoreBound.NEGATIVE_INFINITY);
@@ -11566,7 +11785,7 @@ public class SharedCommandTests {
     @MethodSource("getClients")
     public void zrange_by_lex(BaseClient client) {
         String key = UUID.randomUUID().toString();
-        Map<String, Double> membersScores = Map.of("a", 1.0, "b", 2.0, "c", 3.0);
+        Map<String, Double> membersScores = createMap("a", 1.0, "b", 2.0, "c", 3.0);
         assertEquals(3, client.zadd(key, membersScores).get());
 
         RangeByLex query = new RangeByLex(InfLexBound.NEGATIVE_INFINITY, new LexBoundary("c", false));
@@ -11599,7 +11818,7 @@ public class SharedCommandTests {
     @MethodSource("getClients")
     public void zrange_binary_by_lex(BaseClient client) {
         GlideString key = gs(UUID.randomUUID().toString());
-        Map<GlideString, Double> membersScores = Map.of(gs("a"), 1.0, gs("b"), 2.0, gs("c"), 3.0);
+        Map<GlideString, Double> membersScores = createMap(gs("a"), 1.0, gs("b"), 2.0, gs("c"), 3.0);
         assertEquals(3, client.zadd(key, membersScores).get());
 
         RangeByLex query = new RangeByLex(InfLexBound.NEGATIVE_INFINITY, new LexBoundary("c", false));
@@ -11953,7 +12172,7 @@ public class SharedCommandTests {
         String hashHashtableKey = UUID.randomUUID().toString();
         // The default value of hash-max-listpack-entries is 512
         for (Integer i = 0; i <= 512; i++) {
-            assertEquals(1, client.hset(hashHashtableKey, Map.of(i.toString(), "2")).get());
+            assertEquals(1, client.hset(hashHashtableKey, createMap(i.toString(), "2")).get());
         }
         assertEquals("hashtable", client.objectEncoding(hashHashtableKey).get());
     }
@@ -11963,7 +12182,7 @@ public class SharedCommandTests {
     @MethodSource("getClients")
     public void objectEncoding_returns_hash_listpack(BaseClient client) {
         String hashListpackKey = UUID.randomUUID().toString();
-        assertEquals(1, client.hset(hashListpackKey, Map.of("1", "2")).get());
+        assertEquals(1, client.hset(hashListpackKey, createMap("1", "2")).get());
         assertEquals(
                 SERVER_VERSION.isLowerThan("7.0.0") ? "ziplist" : "listpack",
                 client.objectEncoding(hashListpackKey).get());
@@ -11976,7 +12195,7 @@ public class SharedCommandTests {
         String zsetSkiplistKey = UUID.randomUUID().toString();
         // The default value of zset-max-listpack-entries is 128
         for (Integer i = 0; i <= 128; i++) {
-            assertEquals(1, client.zadd(zsetSkiplistKey, Map.of(i.toString(), 2d)).get());
+            assertEquals(1, client.zadd(zsetSkiplistKey, createMap(i.toString(), 2d)).get());
         }
         assertEquals("skiplist", client.objectEncoding(zsetSkiplistKey).get());
     }
@@ -11986,7 +12205,7 @@ public class SharedCommandTests {
     @MethodSource("getClients")
     public void objectEncoding_returns_zset_listpack(BaseClient client) {
         String zsetListpackKey = UUID.randomUUID().toString();
-        assertEquals(1, client.zadd(zsetListpackKey, Map.of("1", 2d)).get());
+        assertEquals(1, client.zadd(zsetListpackKey, createMap("1", 2d)).get());
         assertEquals(
                 SERVER_VERSION.isLowerThan("7.0.0") ? "ziplist" : "listpack",
                 client.objectEncoding(zsetListpackKey).get());
@@ -11997,7 +12216,7 @@ public class SharedCommandTests {
     @MethodSource("getClients")
     public void objectEncoding_returns_stream(BaseClient client) {
         String streamKey = UUID.randomUUID().toString();
-        assertNotNull(client.xadd(streamKey, Map.of("field", "value")));
+        assertNotNull(client.xadd(streamKey, createMap("field", "value")));
         assertEquals("stream", client.objectEncoding(streamKey).get());
     }
 
@@ -12202,31 +12421,31 @@ public class SharedCommandTests {
         String key = UUID.randomUUID().toString();
 
         ExecutionException executionException =
-                assertThrows(ExecutionException.class, () -> client.geoadd(key, Map.of()).get());
+                assertThrows(ExecutionException.class, () -> client.geoadd(key, createMap()).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
 
         executionException =
                 assertThrows(
                         ExecutionException.class,
-                        () -> client.geoadd(key, Map.of("Place", new GeospatialData(-181, 0))).get());
+                        () -> client.geoadd(key, createMap("Place", new GeospatialData(-181, 0))).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
 
         executionException =
                 assertThrows(
                         ExecutionException.class,
-                        () -> client.geoadd(key, Map.of("Place", new GeospatialData(181, 0))).get());
+                        () -> client.geoadd(key, createMap("Place", new GeospatialData(181, 0))).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
 
         executionException =
                 assertThrows(
                         ExecutionException.class,
-                        () -> client.geoadd(key, Map.of("Place", new GeospatialData(0, 86))).get());
+                        () -> client.geoadd(key, createMap("Place", new GeospatialData(0, 86))).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
 
         executionException =
                 assertThrows(
                         ExecutionException.class,
-                        () -> client.geoadd(key, Map.of("Place", new GeospatialData(0, -86))).get());
+                        () -> client.geoadd(key, createMap("Place", new GeospatialData(0, -86))).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
     }
 
@@ -12237,31 +12456,31 @@ public class SharedCommandTests {
         GlideString key = gs(UUID.randomUUID().toString());
 
         ExecutionException executionException =
-                assertThrows(ExecutionException.class, () -> client.geoadd(key, Map.of()).get());
+                assertThrows(ExecutionException.class, () -> client.geoadd(key, createMap()).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
 
         executionException =
                 assertThrows(
                         ExecutionException.class,
-                        () -> client.geoadd(key, Map.of(gs("Place"), new GeospatialData(-181, 0))).get());
+                        () -> client.geoadd(key, createMap(gs("Place"), new GeospatialData(-181, 0))).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
 
         executionException =
                 assertThrows(
                         ExecutionException.class,
-                        () -> client.geoadd(key, Map.of(gs("Place"), new GeospatialData(181, 0))).get());
+                        () -> client.geoadd(key, createMap(gs("Place"), new GeospatialData(181, 0))).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
 
         executionException =
                 assertThrows(
                         ExecutionException.class,
-                        () -> client.geoadd(key, Map.of(gs("Place"), new GeospatialData(0, 86))).get());
+                        () -> client.geoadd(key, createMap(gs("Place"), new GeospatialData(0, 86))).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
 
         executionException =
                 assertThrows(
                         ExecutionException.class,
-                        () -> client.geoadd(key, Map.of(gs("Place"), new GeospatialData(0, -86))).get());
+                        () -> client.geoadd(key, createMap(gs("Place"), new GeospatialData(0, -86))).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
     }
 
@@ -12754,8 +12973,8 @@ public class SharedCommandTests {
         long count = 1L;
         Long arraySize = 5L;
         String[] lpushArgs = {"one", "two", "three", "four", "five"};
-        Map<String, String[]> expected = Map.of(key1, new String[] {"five"});
-        Map<String, String[]> expected2 = Map.of(key2, new String[] {"one", "two"});
+        Map<String, String[]> expected = createMap(key1, new String[] {"five"});
+        Map<String, String[]> expected2 = createMap(key2, new String[] {"one", "two"});
 
         // nothing to be popped
         assertNull(client.lmpop(singleKeyArray, ListDirection.LEFT).get());
@@ -12796,9 +13015,9 @@ public class SharedCommandTests {
         long count = 1L;
         Long arraySize = 5L;
         GlideString[] lpushArgs = {gs("one"), gs("two"), gs("three"), gs("four"), gs("five")};
-        Map<GlideString, GlideString[]> expected = Map.of(key1, new GlideString[] {gs("five")});
+        Map<GlideString, GlideString[]> expected = createMap(key1, new GlideString[] {gs("five")});
         Map<GlideString, GlideString[]> expected2 =
-                Map.of(key2, new GlideString[] {gs("one"), gs("two")});
+                createMap(key2, new GlideString[] {gs("one"), gs("two")});
 
         // nothing to be popped
         assertNull(client.lmpop(singleKeyArray, ListDirection.LEFT).get());
@@ -12840,8 +13059,8 @@ public class SharedCommandTests {
         long count = 1L;
         Long arraySize = 5L;
         String[] lpushArgs = {"one", "two", "three", "four", "five"};
-        Map<String, String[]> expected = Map.of(key1, new String[] {"five"});
-        Map<String, String[]> expected2 = Map.of(key2, new String[] {"one", "two"});
+        Map<String, String[]> expected = createMap(key1, new String[] {"five"});
+        Map<String, String[]> expected2 = createMap(key2, new String[] {"one", "two"});
 
         // nothing to be popped
         assertNull(client.blmpop(singleKeyArray, ListDirection.LEFT, 0.1).get());
@@ -12883,9 +13102,9 @@ public class SharedCommandTests {
         long count = 1L;
         Long arraySize = 5L;
         GlideString[] lpushArgs = {gs("one"), gs("two"), gs("three"), gs("four"), gs("five")};
-        Map<GlideString, GlideString[]> expected = Map.of(key1, new GlideString[] {gs("five")});
+        Map<GlideString, GlideString[]> expected = createMap(key1, new GlideString[] {gs("five")});
         Map<GlideString, GlideString[]> expected2 =
-                Map.of(key2, new GlideString[] {gs("one"), gs("two")});
+                createMap(key2, new GlideString[] {gs("one"), gs("two")});
 
         // nothing to be popped
         assertNull(client.blmpop(singleKeyArray, ListDirection.LEFT, 0.1).get());
@@ -12921,7 +13140,7 @@ public class SharedCommandTests {
         assumeTrue(SERVER_VERSION.isGreaterThanOrEqualTo("7.0.0"), "This feature added in version 7");
         String key = UUID.randomUUID().toString();
         // create new client with default request timeout (250 millis)
-        try (var testClient =
+        try (BaseClient testClient =
                 client instanceof GlideClient
                         ? GlideClient.createClient(commonClientConfig().build()).get()
                         : GlideClusterClient.createClient(commonClusterClientConfig().build()).get()) {
@@ -12947,7 +13166,7 @@ public class SharedCommandTests {
         assumeTrue(SERVER_VERSION.isGreaterThanOrEqualTo("7.0.0"), "This feature added in version 7");
         GlideString key = gs(UUID.randomUUID().toString());
         // create new client with default request timeout (250 millis)
-        try (var testClient =
+        try (BaseClient testClient =
                 client instanceof GlideClient
                         ? GlideClient.createClient(commonClientConfig().build()).get()
                         : GlideClusterClient.createClient(commonClusterClientConfig().build()).get()) {
@@ -13295,7 +13514,7 @@ public class SharedCommandTests {
         String key1 = "{key}-1" + UUID.randomUUID();
         String key2 = "{key}-2" + UUID.randomUUID();
         // create new client with extended request timeout (2000 millis) to allow for blocking commands
-        try (var testClient =
+        try (BaseClient testClient =
                 client instanceof GlideClient
                         ? GlideClient.createClient(commonClientConfig().requestTimeout(2000).build()).get()
                         : GlideClusterClient.createClient(
@@ -13325,7 +13544,7 @@ public class SharedCommandTests {
         GlideString key1 = gs("{key}-1" + UUID.randomUUID());
         GlideString key2 = gs("{key}-2" + UUID.randomUUID());
         // create new client with extended request timeout (2000 millis) to allow for blocking commands
-        try (var testClient =
+        try (BaseClient testClient =
                 client instanceof GlideClient
                         ? GlideClient.createClient(commonClientConfig().requestTimeout(2000).build()).get()
                         : GlideClusterClient.createClient(
@@ -13452,14 +13671,14 @@ public class SharedCommandTests {
 
         assertEquals(3, client.sadd(key, new String[] {member1, member2, member3}).get());
         // Pop with count value greater than the size of the set
-        assertEquals(Set.of(member1, member2, member3), client.spopCount(key, 4).get());
+        assertEquals(createSet(member1, member2, member3), client.spopCount(key, 4).get());
         assertEquals(0, client.scard(key).get());
 
         assertEquals(3, client.sadd(key, new String[] {member1, member2, member3}).get());
-        assertEquals(Set.of(), client.spopCount(key, 0).get());
+        assertEquals(Collections.emptySet(), client.spopCount(key, 0).get());
 
         assertNull(client.spop(nonExistingKey).get());
-        assertEquals(Set.of(), client.spopCount(nonExistingKey, 3).get());
+        assertEquals(Collections.emptySet(), client.spopCount(nonExistingKey, 3).get());
 
         // invalid argument - count must be positive
         ExecutionException executionException =
@@ -13491,14 +13710,14 @@ public class SharedCommandTests {
 
         assertEquals(3, client.sadd(key, new GlideString[] {member1, member2, member3}).get());
         // Pop with count value greater than the size of the set
-        assertEquals(Set.of(member1, member2, member3), client.spopCount(key, 4).get());
+        assertEquals(createSet(member1, member2, member3), client.spopCount(key, 4).get());
         assertEquals(0, client.scard(key).get());
 
         assertEquals(3, client.sadd(key, new GlideString[] {member1, member2, member3}).get());
-        assertEquals(Set.of(), client.spopCount(key, 0).get());
+        assertEquals(Collections.emptySet(), client.spopCount(key, 0).get());
 
         assertNull(client.spop(nonExistingKey).get());
-        assertEquals(Set.of(), client.spopCount(nonExistingKey, 3).get());
+        assertEquals(Collections.emptySet(), client.spopCount(nonExistingKey, 3).get());
 
         // invalid argument - count must be positive
         ExecutionException executionException =
@@ -14174,7 +14393,7 @@ public class SharedCommandTests {
         assertFalse(client.copy(source, destination, 1).get());
 
         // source exists, destination does not
-        client.set(source, "one");
+        client.set(source, "one").get();
         assertTrue(client.copy(source, destination, 1, false).get());
         if (isCluster) {
             ((GlideClusterClient) client).select(1).get();
@@ -14190,7 +14409,7 @@ public class SharedCommandTests {
         }
 
         // setting new value for source
-        client.set(source, "two");
+        client.set(source, "two").get();
 
         // both exists, no REPLACE
         assertFalse(client.copy(source, destination, 1).get());
@@ -14249,7 +14468,7 @@ public class SharedCommandTests {
         }
 
         // source exists, destination does not
-        client.set(source, gs("one"));
+        client.set(source, gs("one")).get();
         assertTrue(client.copy(source, destination, 1, false).get());
         if (isCluster) {
             ((GlideClusterClient) client).select(1).get();
@@ -14264,7 +14483,7 @@ public class SharedCommandTests {
         }
 
         // setting new value for source
-        client.set(source, gs("two"));
+        client.set(source, gs("two")).get();
 
         // both exists, no REPLACE
         assertFalse(client.copy(source, destination, 1).get());
@@ -14306,12 +14525,12 @@ public class SharedCommandTests {
         assertFalse(client.copy(source, destination).get());
 
         // source exists, destination does not
-        client.set(source, "one");
+        client.set(source, "one").get();
         assertTrue(client.copy(source, destination, false).get());
         assertEquals("one", client.get(destination).get());
 
         // setting new value for source
-        client.set(source, "two");
+        client.set(source, "two").get();
 
         // both exists, no REPLACE
         assertFalse(client.copy(source, destination).get());
@@ -14338,12 +14557,12 @@ public class SharedCommandTests {
         assertFalse(client.copy(source, destination).get());
 
         // source exists, destination does not
-        client.set(source, gs("one"));
+        client.set(source, gs("one")).get();
         assertTrue(client.copy(source, destination, false).get());
         assertEquals(gs("one"), client.get(destination).get());
 
         // setting new value for source
-        client.set(source, gs("two"));
+        client.set(source, gs("two")).get();
 
         // both exists, no REPLACE
         assertFalse(client.copy(source, destination).get());
@@ -14365,8 +14584,8 @@ public class SharedCommandTests {
         String key3 = "{key}-3" + UUID.randomUUID();
         String nonExisting = UUID.randomUUID().toString();
         String value = UUID.randomUUID().toString();
-        Map<String, String> keyValueMap1 = Map.of(key1, value, key2, value);
-        Map<String, String> keyValueMap2 = Map.of(key2, value, key3, value);
+        Map<String, String> keyValueMap1 = createMap(key1, value, key2, value);
+        Map<String, String> keyValueMap2 = createMap(key2, value, key3, value);
 
         // all keys are empty, successfully set
         assertTrue(client.msetnx(keyValueMap1).get());
@@ -14389,8 +14608,8 @@ public class SharedCommandTests {
         GlideString key3 = gs("{key}-3" + UUID.randomUUID());
         GlideString nonExisting = gs(UUID.randomUUID().toString());
         GlideString value = gs(UUID.randomUUID().toString());
-        Map<GlideString, GlideString> keyValueMap1 = Map.of(key1, value, key2, value);
-        Map<GlideString, GlideString> keyValueMap2 = Map.of(key2, value, key3, value);
+        Map<GlideString, GlideString> keyValueMap1 = createMap(key1, value, key2, value);
+        Map<GlideString, GlideString> keyValueMap2 = createMap(key2, value, key3, value);
 
         // all keys are empty, successfully set
         assertTrue(client.msetnxBinary(keyValueMap1).get());
@@ -14538,17 +14757,18 @@ public class SharedCommandTests {
         String nonSetKey = "{key}-4" + UUID.randomUUID();
         String[] memberList1 = new String[] {"a", "b", "c"};
         String[] memberList2 = new String[] {"b", "c", "d", "e"};
-        Set<String> expectedUnion = Set.of("a", "b", "c", "d", "e");
+        Set<String> expectedUnion = new HashSet<>(Arrays.asList("a", "b", "c", "d", "e"));
 
         assertEquals(3, client.sadd(key1, memberList1).get());
         assertEquals(4, client.sadd(key2, memberList2).get());
         assertEquals(expectedUnion, client.sunion(new String[] {key1, key2}).get());
 
         // Key has an empty set
-        assertEquals(Set.of(), client.sunion(new String[] {key3}).get());
+        assertEquals(Collections.emptySet(), client.sunion(new String[] {key3}).get());
 
         // Empty key with non-empty key returns non-empty key set
-        assertEquals(Set.of(memberList1), client.sunion(new String[] {key1, key3}).get());
+        Set<String> expectedResult = new HashSet<>(Arrays.asList(memberList1));
+        assertEquals(expectedResult, client.sunion(new String[] {key1, key3}).get());
 
         // Exceptions
         // Empty keys
@@ -14574,17 +14794,19 @@ public class SharedCommandTests {
         GlideString nonSetKey = gs("{key}-4" + UUID.randomUUID());
         GlideString[] memberList1 = new GlideString[] {gs("a"), gs("b"), gs("c")};
         GlideString[] memberList2 = new GlideString[] {gs("b"), gs("c"), gs("d"), gs("e")};
-        Set<GlideString> expectedUnion = Set.of(gs("a"), gs("b"), gs("c"), gs("d"), gs("e"));
+        Set<GlideString> expectedUnion =
+                new HashSet<>(Arrays.asList(gs("a"), gs("b"), gs("c"), gs("d"), gs("e")));
 
         assertEquals(3, client.sadd(key1, memberList1).get());
         assertEquals(4, client.sadd(key2, memberList2).get());
         assertEquals(expectedUnion, client.sunion(new GlideString[] {key1, key2}).get());
 
         // Key has an empty set
-        assertEquals(Set.of(), client.sunion(new GlideString[] {key3}).get());
+        assertEquals(Collections.emptySet(), client.sunion(new GlideString[] {key3}).get());
 
         // Empty key with non-empty key returns non-empty key set
-        assertEquals(Set.of(memberList1), client.sunion(new GlideString[] {key1, key3}).get());
+        Set<GlideString> expectedResult = new HashSet<>(Arrays.asList(memberList1));
+        assertEquals(expectedResult, client.sunion(new GlideString[] {key1, key3}).get());
 
         // Exceptions
         // Empty keys
@@ -14821,7 +15043,8 @@ public class SharedCommandTests {
 
         for (int i = 0; i < names.length; i++) {
             assertEquals(
-                    2, client.hset(prefix + (i + 1), Map.of(nameField, names[i], ageField, ages[i])).get());
+                    2,
+                    client.hset(prefix + (i + 1), createMap(nameField, names[i], ageField, ages[i])).get());
         }
 
         assertEquals(5, client.rpush(listKey, userIDs).get());
@@ -14855,7 +15078,7 @@ public class SharedCommandTests {
                                         .limit(new SortBaseOptions.Limit(0L, 2L))
                                         .orderBy(DESC)
                                         .byPattern(agePattern)
-                                        .getPatterns(List.of(namePattern, agePattern))
+                                        .getPatterns(Arrays.asList(namePattern, agePattern))
                                         .build())
                         .get());
 
@@ -14913,7 +15136,7 @@ public class SharedCommandTests {
                                             .limit(new SortBaseOptions.Limit(0L, 2L))
                                             .orderBy(DESC)
                                             .byPattern(agePattern)
-                                            .getPatterns(List.of(namePattern, agePattern))
+                                            .getPatterns(Arrays.asList(namePattern, agePattern))
                                             .build())
                             .get());
 
@@ -14984,7 +15207,7 @@ public class SharedCommandTests {
             assumeTrue(SERVER_VERSION.isGreaterThanOrEqualTo("8.0.0"), "This feature added in version 8");
         }
 
-        var prefix = UUID.randomUUID();
+        UUID prefix = UUID.randomUUID();
         GlideString setKey1 = gs("{" + prefix + "}1");
         GlideString setKey2 = gs("{" + prefix + "}2");
         GlideString setKey3 = gs("{" + prefix + "}3");
@@ -15012,7 +15235,7 @@ public class SharedCommandTests {
                     client
                             .hset(
                                     setKeys[i].toString(),
-                                    Map.of(
+                                    createMap(
                                             nameField.toString(),
                                             names[i].toString(),
                                             ageField.toString(),
@@ -15052,7 +15275,7 @@ public class SharedCommandTests {
                                         .limit(new SortBaseOptions.Limit(0L, 2L))
                                         .orderBy(DESC)
                                         .byPattern(agePattern)
-                                        .getPatterns(List.of(namePattern, agePattern))
+                                        .getPatterns(Arrays.asList(namePattern, agePattern))
                                         .build())
                         .get());
 
@@ -15116,7 +15339,7 @@ public class SharedCommandTests {
                                             .limit(new SortBaseOptions.Limit(0L, 2L))
                                             .orderBy(DESC)
                                             .byPattern(agePattern)
-                                            .getPatterns(List.of(namePattern, agePattern))
+                                            .getPatterns(Arrays.asList(namePattern, agePattern))
                                             .build())
                             .get());
 
@@ -15360,7 +15583,7 @@ public class SharedCommandTests {
         String key1 = "{key}-1" + UUID.randomUUID();
         String key2 = "{key}-2" + UUID.randomUUID();
         String[] members = {"Catania", "Palermo", "edge2", "edge1"};
-        Set<String> membersSet = Set.of(members);
+        Set<String> membersSet = new HashSet<>(Arrays.asList(members));
         GeospatialData[] membersCoordinates = {
             new GeospatialData(15.087269, 37.502669),
             new GeospatialData(13.361389, 38.115556),
@@ -15400,7 +15623,7 @@ public class SharedCommandTests {
                 client
                         .geoadd(
                                 key1,
-                                Map.of(
+                                createMap(
                                         members[0],
                                         membersCoordinates[0],
                                         members[1],
@@ -15412,15 +15635,14 @@ public class SharedCommandTests {
                         .get());
 
         // Search by box, unit: km, from a geospatial data point
-        assertTrue(
-                membersSet.containsAll(
-                        Set.of(
-                                client
-                                        .geosearch(
-                                                key1,
-                                                new CoordOrigin(new GeospatialData(15, 37)),
-                                                new GeoSearchShape(400, 400, GeoUnit.KILOMETERS))
-                                        .get())));
+        String[] searchResult =
+                client
+                        .geosearch(
+                                key1,
+                                new CoordOrigin(new GeospatialData(15, 37)),
+                                new GeoSearchShape(400, 400, GeoUnit.KILOMETERS))
+                        .get();
+        assertTrue(membersSet.containsAll(new HashSet<>(Arrays.asList(searchResult))));
 
         assertArrayEquals(
                 members,
@@ -15641,7 +15863,7 @@ public class SharedCommandTests {
         GlideString key1 = gs("{key}-1" + UUID.randomUUID());
         GlideString key2 = gs("{key}-2" + UUID.randomUUID());
         GlideString[] members = {gs("Catania"), gs("Palermo"), gs("edge2"), gs("edge1")};
-        Set<GlideString> membersSet = Set.of(members);
+        Set<GlideString> membersSet = new HashSet<>(Arrays.asList(members));
         GeospatialData[] membersCoordinates = {
             new GeospatialData(15.087269, 37.502669),
             new GeospatialData(13.361389, 38.115556),
@@ -15681,7 +15903,7 @@ public class SharedCommandTests {
                 client
                         .geoadd(
                                 key1,
-                                Map.of(
+                                createMap(
                                         members[0],
                                         membersCoordinates[0],
                                         members[1],
@@ -15693,15 +15915,14 @@ public class SharedCommandTests {
                         .get());
 
         // Search by box, unit: km, from a geospatial data point
-        assertTrue(
-                membersSet.containsAll(
-                        Set.of(
-                                client
-                                        .geosearch(
-                                                key1,
-                                                new CoordOrigin(new GeospatialData(15, 37)),
-                                                new GeoSearchShape(400, 400, GeoUnit.KILOMETERS))
-                                        .get())));
+        GlideString[] searchResult =
+                client
+                        .geosearch(
+                                key1,
+                                new CoordOrigin(new GeospatialData(15, 37)),
+                                new GeoSearchShape(400, 400, GeoUnit.KILOMETERS))
+                        .get();
+        assertTrue(membersSet.containsAll(new HashSet<>(Arrays.asList(searchResult))));
 
         assertArrayEquals(
                 members,
@@ -15930,23 +16151,23 @@ public class SharedCommandTests {
             new GeospatialData(12.758489, 38.788135)
         };
         Map<String, Double> expectedMap =
-                Map.of(
+                createMap(
                         "Catania", 3479447370796909.0,
                         "Palermo", 3479099956230698.0,
                         "edge2", 3481342659049484.0,
                         "edge1", 3479273021651468.0);
         Map<String, Double> expectedMap2 =
-                Map.of(
+                createMap(
                         "Catania", 56.4412578701582,
                         "Palermo", 190.44242984775784,
                         "edge2", 279.7403417843143,
                         "edge1", 279.7404521356343);
         Map<String, Double> expectedMap3 =
-                Map.of(
+                createMap(
                         "Catania", 3479447370796909.0,
                         "Palermo", 3479099956230698.0);
         Map<String, Double> expectedMap4 =
-                Map.of(
+                createMap(
                         "Catania", 56.4412578701582,
                         "Palermo", 190.44242984775784);
 
@@ -15956,7 +16177,7 @@ public class SharedCommandTests {
                 client
                         .geoadd(
                                 sourceKey,
-                                Map.of(
+                                createMap(
                                         members[0],
                                         members_coordinates[0],
                                         members[1],
@@ -16014,7 +16235,7 @@ public class SharedCommandTests {
 
         // Verify stored results
         zrange_map = client.zrangeWithScores(destinationKey, new RangeByIndex(0, -1)).get();
-        assertDeepEquals(Map.of("Catania", 3479447370796909.0), zrange_map);
+        assertDeepEquals(createMap("Catania", 3479447370796909.0), zrange_map);
 
         // Test storing results of a box search, unit: meters, from a member, with distance
         double metersValue = 400 * 1000;
@@ -16032,7 +16253,7 @@ public class SharedCommandTests {
         // Verify stored results
         zrange_map = client.zrangeWithScores(destinationKey, new RangeByIndex(0, -1)).get();
         assertDeepEquals(
-                Map.of(
+                createMap(
                         "Catania", 0.0,
                         "Palermo", 166274.15156960033,
                         "edge2", 236529.17986494553),
@@ -16089,7 +16310,7 @@ public class SharedCommandTests {
         // Verify stored results
         zrange_map = client.zrangeWithScores(destinationKey, new RangeByIndex(0, -1)).get();
         assertDeepEquals(
-                Map.of(
+                createMap(
                         "Catania", 0.0,
                         "Palermo", 166274.15156960033),
                 zrange_map);
@@ -16231,23 +16452,23 @@ public class SharedCommandTests {
             new GeospatialData(12.758489, 38.788135)
         };
         Map<String, Double> expectedMap =
-                Map.of(
+                createMap(
                         "Catania", 3479447370796909.0,
                         "Palermo", 3479099956230698.0,
                         "edge2", 3481342659049484.0,
                         "edge1", 3479273021651468.0);
         Map<String, Double> expectedMap2 =
-                Map.of(
+                createMap(
                         "Catania", 56.4412578701582,
                         "Palermo", 190.44242984775784,
                         "edge2", 279.7403417843143,
                         "edge1", 279.7404521356343);
         Map<String, Double> expectedMap3 =
-                Map.of(
+                createMap(
                         "Catania", 3479447370796909.0,
                         "Palermo", 3479099956230698.0);
         Map<String, Double> expectedMap4 =
-                Map.of(
+                createMap(
                         "Catania", 56.4412578701582,
                         "Palermo", 190.44242984775784);
 
@@ -16257,7 +16478,7 @@ public class SharedCommandTests {
                 client
                         .geoadd(
                                 sourceKey,
-                                Map.of(
+                                createMap(
                                         members[0],
                                         members_coordinates[0],
                                         members[1],
@@ -16315,7 +16536,7 @@ public class SharedCommandTests {
 
         // Verify stored results
         zrange_map = client.zrangeWithScores(destinationKey.toString(), new RangeByIndex(0, -1)).get();
-        assertDeepEquals(Map.of("Catania", 3479447370796909.0), zrange_map);
+        assertDeepEquals(createMap("Catania", 3479447370796909.0), zrange_map);
 
         // Test storing results of a box search, unit: meters, from a member, with distance
         double metersValue = 400 * 1000;
@@ -16333,7 +16554,7 @@ public class SharedCommandTests {
         // Verify stored results
         zrange_map = client.zrangeWithScores(destinationKey.toString(), new RangeByIndex(0, -1)).get();
         assertDeepEquals(
-                Map.of(
+                createMap(
                         "Catania", 0.0,
                         "Palermo", 166274.15156960033,
                         "edge2", 236529.17986494553),
@@ -16390,7 +16611,7 @@ public class SharedCommandTests {
         // Verify stored results
         zrange_map = client.zrangeWithScores(destinationKey.toString(), new RangeByIndex(0, -1)).get();
         assertDeepEquals(
-                Map.of(
+                createMap(
                         "Catania", 0.0,
                         "Palermo", 166274.15156960033),
                 zrange_map);
@@ -16529,9 +16750,9 @@ public class SharedCommandTests {
         for (int i = 0; i < numberMembers.length; i++) {
             numberMembers[i] = String.valueOf(i);
         }
-        Set<String> numberMembersSet = Set.of(numberMembers);
+        Set<String> numberMembersSet = new HashSet<>(Arrays.asList(numberMembers));
         String[] charMembers = new String[] {"a", "b", "c", "d", "e"};
-        Set<String> charMemberSet = Set.of(charMembers);
+        Set<String> charMemberSet = new HashSet<>(Arrays.asList(charMembers));
         int resultCursorIndex = 0;
         int resultCollectionIndex = 1;
 
@@ -16671,9 +16892,9 @@ public class SharedCommandTests {
         for (int i = 0; i < numberMembers.length; i++) {
             numberMembers[i] = gs(String.valueOf(i));
         }
-        Set<GlideString> numberMembersSet = Set.of(numberMembers);
+        Set<GlideString> numberMembersSet = new HashSet<>(Arrays.asList(numberMembers));
         GlideString[] charMembers = new GlideString[] {gs("a"), gs("b"), gs("c"), gs("d"), gs("e")};
-        Set<GlideString> charMemberSet = Set.of(charMembers);
+        Set<GlideString> charMemberSet = new HashSet<>(Arrays.asList(charMembers));
         int resultCursorIndex = 0;
         int resultCollectionIndex = 1;
 
@@ -17632,7 +17853,7 @@ public class SharedCommandTests {
     public void wait_timeout_check(BaseClient client) {
         String key = UUID.randomUUID().toString();
         // create new client with default request timeout (250 millis)
-        try (var testClient =
+        try (BaseClient testClient =
                 client instanceof GlideClient
                         ? GlideClient.createClient(commonClientConfig().build()).get()
                         : GlideClusterClient.createClient(commonClusterClientConfig().build()).get()) {
@@ -17669,7 +17890,7 @@ public class SharedCommandTests {
 
         // Setup: add stream entry, create consumer group and consumer, read from stream with consumer
         final LinkedHashMap<String, String> dataToAdd =
-                new LinkedHashMap<>() {
+                new LinkedHashMap<String, String>() {
                     {
                         put("a", "b");
                         put("c", "d");
@@ -17679,7 +17900,7 @@ public class SharedCommandTests {
                 streamId1_0,
                 client.xadd(key, dataToAdd, StreamAddOptions.builder().id(streamId1_0).build()).get());
         assertEquals(OK, client.xgroupCreate(key, groupName, streamId0_0).get());
-        client.xreadgroup(Map.of(key, ">"), groupName, consumer).get();
+        client.xreadgroup(createMap(key, ">"), groupName, consumer).get();
 
         Map<String, Object> result = client.xinfoStream(key).get();
         assertEquals(1L, result.get("length"));
@@ -17701,7 +17922,7 @@ public class SharedCommandTests {
         assertEquals(
                 streamId1_1,
                 client
-                        .xadd(key, Map.of("foo", "bar"), StreamAddOptions.builder().id(streamId1_1).build())
+                        .xadd(key, createMap("foo", "bar"), StreamAddOptions.builder().id(streamId1_1).build())
                         .get());
 
         result = client.xinfoStreamFull(key, 1).get();
@@ -17746,7 +17967,10 @@ public class SharedCommandTests {
         assertEquals(
                 streamId1_0,
                 client
-                        .xadd(key, Map.of("field", "value"), StreamAddOptions.builder().id(streamId1_0).build())
+                        .xadd(
+                                key,
+                                createMap("field", "value"),
+                                StreamAddOptions.builder().id(streamId1_0).build())
                         .get());
         assertEquals(1, client.xdel(key, new String[] {streamId1_0}).get());
 
@@ -18455,6 +18679,37 @@ public class SharedCommandTests {
         assertEquals("OK", result);
     }
 
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void reset(BaseClient client) {
+        String result =
+                client instanceof GlideClusterClient
+                        ? ((GlideClusterClient) client).reset().get()
+                        : ((GlideClient) client).reset().get();
+        assertEquals("RESET", result);
+        // Verify client recovers after reset
+        String pong =
+                client instanceof GlideClusterClient
+                        ? ((GlideClusterClient) client).ping().get()
+                        : ((GlideClient) client).ping().get();
+        assertEquals("PONG", pong);
+    }
+
+    @SneakyThrows
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    public void save(BaseClient client) {
+        waitForSaveNotInProgress(client);
+
+        // TODO #6166: Simplify once SAVE declaration moved to base client.
+        if (client instanceof GlideClient) {
+            assertEquals(OK, ((GlideClient) client).save().get());
+        } else {
+            assertEquals(OK, ((GlideClusterClient) client).save().get());
+        }
+    }
+
     /**
      * Helper method to check if ACL file is configured on the server. Attempts to call ACL LOAD and
      * returns true if successful, false if it fails with ACL file not configured error.
@@ -18476,5 +18731,33 @@ public class SharedCommandTests {
             // If it's a different error, rethrow it
             throw e;
         }
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void clientTrackingInfo_cache_off(BaseClient client) {
+
+        // TODO #6144: simplify once clientTrackingInfo is moved to base class
+        Map<String, Object> info =
+                client instanceof GlideClusterClient
+                        ? ((GlideClusterClient) client).clientTrackingInfo().get()
+                        : ((GlideClient) client).clientTrackingInfo().get();
+
+        assertClientTrackingInfo(info, false);
+    }
+
+    @ParameterizedTest(autoCloseArguments = true)
+    @MethodSource("glide.TestSources#serverAssistedCacheClients")
+    @SneakyThrows
+    public void clientTrackingInfo_cache_on(BaseClient client) {
+
+        // TODO #6144: simplify once clientTrackingInfo is moved to base class
+        Map<String, Object> info =
+                client instanceof GlideClusterClient
+                        ? ((GlideClusterClient) client).clientTrackingInfo().get()
+                        : ((GlideClient) client).clientTrackingInfo().get();
+
+        assertClientTrackingInfo(info, true);
     }
 }

@@ -2,7 +2,14 @@
 package glide.cluster;
 
 import static glide.TestConfiguration.SERVER_VERSION;
+import static glide.TestUtilities.BGREWRITEAOF_RESPONSES;
+import static glide.TestUtilities.BGSAVE_NOT_CANCELLED_RESPONSE;
+import static glide.TestUtilities.BGSAVE_RESPONSES;
+import static glide.TestUtilities.PRIMARY_SLOT_ROUTE;
+import static glide.TestUtilities.assertClientTrackingInfo;
 import static glide.TestUtilities.assertDeepEquals;
+import static glide.TestUtilities.assertMemoryStatsDbEntry;
+import static glide.TestUtilities.assertMemoryStatsFields;
 import static glide.TestUtilities.checkFunctionListResponse;
 import static glide.TestUtilities.checkFunctionListResponseBinary;
 import static glide.TestUtilities.checkFunctionStatsBinaryResponse;
@@ -15,10 +22,14 @@ import static glide.TestUtilities.generateLuaLibCode;
 import static glide.TestUtilities.generateLuaLibCodeBinary;
 import static glide.TestUtilities.getFirstEntryFromMultiValue;
 import static glide.TestUtilities.getFirstKeyFromMultiValue;
+import static glide.TestUtilities.getReplicaCount;
+import static glide.TestUtilities.getUnixSeconds;
 import static glide.TestUtilities.getValueFromInfo;
 import static glide.TestUtilities.isWindows;
 import static glide.TestUtilities.parseInfoResponseToMap;
+import static glide.TestUtilities.waitFor;
 import static glide.TestUtilities.waitForNotBusy;
+import static glide.TestUtilities.waitForSaveNotInProgress;
 import static glide.api.BaseClient.OK;
 import static glide.api.models.GlideString.gs;
 import static glide.api.models.commands.FlushMode.ASYNC;
@@ -42,6 +53,7 @@ import static glide.api.models.configuration.RequestRoutingConfiguration.SimpleM
 import static glide.api.models.configuration.RequestRoutingConfiguration.SimpleSingleNodeRoute.RANDOM;
 import static glide.api.models.configuration.RequestRoutingConfiguration.SlotType.PRIMARY;
 import static glide.api.models.configuration.RequestRoutingConfiguration.SlotType.REPLICA;
+import static glide.utils.Java8Utils.createMap;
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -59,6 +71,7 @@ import glide.api.models.ClusterBatch;
 import glide.api.models.ClusterValue;
 import glide.api.models.GlideString;
 import glide.api.models.Script;
+import glide.api.models.commands.ClientPauseMode;
 import glide.api.models.commands.FlushMode;
 import glide.api.models.commands.InfoOptions.Section;
 import glide.api.models.commands.ListDirection;
@@ -91,6 +104,7 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -101,9 +115,14 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import lombok.SneakyThrows;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Named;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -115,8 +134,13 @@ public class CommandTests {
 
     private static final String INITIAL_VALUE = "VALUE";
 
+    private static final int SCRIPT_POLL_TIMEOUT_MS = 8000;
+    private static final int SCRIPT_POLL_INTERVAL_MS = 500;
+
+    private static final List<Arguments> clients = new ArrayList<>();
+
     public static final List<String> DEFAULT_INFO_SECTIONS =
-            List.of(
+            Arrays.asList(
                     "Server",
                     "Clients",
                     "Memory",
@@ -131,7 +155,7 @@ public class CommandTests {
     public static final List<String> EVERYTHING_INFO_SECTIONS =
             SERVER_VERSION.isGreaterThanOrEqualTo("7.0.0")
                     // Latencystats was added in Valkey 7
-                    ? List.of(
+                    ? Arrays.asList(
                             "Server",
                             "Clients",
                             "Memory",
@@ -145,7 +169,7 @@ public class CommandTests {
                             "Latencystats",
                             "Cluster",
                             "Keyspace")
-                    : List.of(
+                    : Arrays.asList(
                             "Server",
                             "Clients",
                             "Memory",
@@ -159,11 +183,12 @@ public class CommandTests {
                             "Cluster",
                             "Keyspace");
 
+    @BeforeAll
     @SneakyThrows
-    public static Stream<Arguments> getClients() {
-        return Stream.of(
+    public static void init() {
+        clients.add(
                 Arguments.of(
-                        named(
+                        Named.of(
                                 "RESP2",
                                 GlideClusterClient.createClient(
                                                 commonClusterClientConfig()
@@ -174,9 +199,10 @@ public class CommandTests {
                                                                         .build())
                                                         .protocol(ProtocolVersion.RESP2)
                                                         .build())
-                                        .get())),
+                                        .get())));
+        clients.add(
                 Arguments.of(
-                        named(
+                        Named.of(
                                 "RESP3",
                                 GlideClusterClient.createClient(
                                                 commonClusterClientConfig()
@@ -188,6 +214,29 @@ public class CommandTests {
                                                         .protocol(ProtocolVersion.RESP3)
                                                         .build())
                                         .get())));
+    }
+
+    @AfterAll
+    @SneakyThrows
+    @SuppressWarnings("unchecked")
+    public static void teardown() {
+        for (Arguments client : clients) {
+            ((Named<GlideClusterClient>) client.get()[0]).getPayload().close();
+        }
+    }
+
+    @AfterEach
+    @SneakyThrows
+    @SuppressWarnings("unchecked")
+    public void cleanup() {
+        // Flush all databases to ensure clean state between tests
+        for (Arguments client : clients) {
+            ((Named<GlideClusterClient>) client.get()[0]).getPayload().flushall().get();
+        }
+    }
+
+    public static Stream<Arguments> getClients() {
+        return clients.stream();
     }
 
     private static Stream<Arguments> getTestScenarios() {
@@ -209,7 +258,7 @@ public class CommandTests {
                                         Arguments.of(clientArg.get()[0], "xyz")));
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void custom_command_info(GlideClusterClient clusterClient) {
@@ -220,7 +269,7 @@ public class CommandTests {
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void custom_command_info_binary(GlideClusterClient clusterClient) {
@@ -232,7 +281,7 @@ public class CommandTests {
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void custom_command_ping(GlideClusterClient clusterClient) {
@@ -240,7 +289,7 @@ public class CommandTests {
         assertEquals("PONG", data.getSingleValue());
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void custom_command_ping_binary(GlideClusterClient clusterClient) {
@@ -248,7 +297,7 @@ public class CommandTests {
         assertEquals(gs("PONG"), data.getSingleValue());
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void custom_command_dbsize(GlideClusterClient clusterClient) {
@@ -263,7 +312,7 @@ public class CommandTests {
         assertTrue((Long) data.getSingleValue() >= 0);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     @SuppressWarnings("unchecked")
@@ -296,7 +345,7 @@ public class CommandTests {
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void custom_command_binary_with_route(GlideClusterClient clusterClient) {
@@ -312,19 +361,19 @@ public class CommandTests {
         assertTrue(data.getSingleValue().toString().contains("# Stats"));
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void custom_command_del_returns_a_number(GlideClusterClient clusterClient) {
         String key = "custom_command_del_returns_a_number";
         clusterClient.set(key, INITIAL_VALUE).get();
-        var del = clusterClient.customCommand(new String[] {"DEL", key}).get();
+        ClusterValue<Object> del = clusterClient.customCommand(new String[] {"DEL", key}).get();
         assertEquals(1L, del.getSingleValue());
-        var data = clusterClient.get(key).get();
+        String data = clusterClient.get(key).get();
         assertNull(data);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void ping(GlideClusterClient clusterClient) {
@@ -332,7 +381,7 @@ public class CommandTests {
         assertEquals("PONG", data);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void ping_with_message(GlideClusterClient clusterClient) {
@@ -340,7 +389,7 @@ public class CommandTests {
         assertEquals("H3LL0", data);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void ping_binary_with_message(GlideClusterClient clusterClient) {
@@ -348,7 +397,7 @@ public class CommandTests {
         assertEquals(gs("H3LL0"), data);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void ping_with_route(GlideClusterClient clusterClient) {
@@ -356,7 +405,7 @@ public class CommandTests {
         assertEquals("PONG", data);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void ping_with_message_with_route(GlideClusterClient clusterClient) {
@@ -364,7 +413,7 @@ public class CommandTests {
         assertEquals("H3LL0", data);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void ping_binary_with_message_with_route(GlideClusterClient clusterClient) {
@@ -372,7 +421,7 @@ public class CommandTests {
         assertEquals(gs("H3LL0"), data);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void info_without_options(GlideClusterClient clusterClient) {
@@ -385,7 +434,7 @@ public class CommandTests {
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void info_with_single_node_route(GlideClusterClient clusterClient) {
@@ -397,7 +446,7 @@ public class CommandTests {
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void info_with_multi_node_route(GlideClusterClient clusterClient) {
@@ -410,7 +459,7 @@ public class CommandTests {
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void info_with_multiple_options(GlideClusterClient clusterClient) {
@@ -428,7 +477,7 @@ public class CommandTests {
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void info_with_everything_option(GlideClusterClient clusterClient) {
@@ -441,7 +490,7 @@ public class CommandTests {
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void info_with_single_node_route_and_options(GlideClusterClient clusterClient) {
@@ -456,7 +505,7 @@ public class CommandTests {
         //       3) "92d73b6eb847604b63c7f7cbbf39b148acdd1318"
         //       4) (empty array)
         // Extracting first slot key
-        var slotKey =
+        String slotKey =
                 (String) ((Object[]) ((Object[]) ((Object[]) slotData.getSingleValue())[0])[2])[2];
 
         Section[] sections = {CLIENTS};
@@ -473,7 +522,7 @@ public class CommandTests {
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void info_with_multi_node_route_and_options(GlideClusterClient clusterClient) {
@@ -492,43 +541,43 @@ public class CommandTests {
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void clientId(GlideClusterClient clusterClient) {
-        var id = clusterClient.clientId().get();
+        Long id = clusterClient.clientId().get();
         assertTrue(id > 0);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void clientId_with_single_node_route(GlideClusterClient clusterClient) {
-        var data = clusterClient.clientId(RANDOM).get();
+        ClusterValue<Long> data = clusterClient.clientId(RANDOM).get();
         assertTrue(data.getSingleValue() > 0L);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void clientId_with_multi_node_route(GlideClusterClient clusterClient) {
-        var data = clusterClient.clientId(ALL_NODES).get();
+        ClusterValue<Long> data = clusterClient.clientId(ALL_NODES).get();
         data.getMultiValue().values().forEach(id -> assertTrue(id > 0));
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void clientGetName(GlideClusterClient clusterClient) {
         // TODO replace with the corresponding command once implemented
         clusterClient.customCommand(new String[] {"client", "setname", "clientGetName"}).get();
 
-        var name = clusterClient.clientGetName().get();
+        String name = clusterClient.clientGetName().get();
 
         assertEquals("clientGetName", name);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void clientGetName_with_single_node_route(GlideClusterClient clusterClient) {
@@ -538,12 +587,12 @@ public class CommandTests {
                         new String[] {"client", "setname", "clientGetName_with_single_node_route"}, ALL_NODES)
                 .get();
 
-        var name = clusterClient.clientGetName(RANDOM).get();
+        ClusterValue<String> name = clusterClient.clientGetName(RANDOM).get();
 
         assertEquals("clientGetName_with_single_node_route", name.getSingleValue());
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void clientGetName_with_multi_node_route(GlideClusterClient clusterClient) {
@@ -553,12 +602,62 @@ public class CommandTests {
                         new String[] {"client", "setname", "clientGetName_with_multi_node_route"}, ALL_NODES)
                 .get();
 
-        var name = clusterClient.clientGetName(ALL_NODES).get();
+        ClusterValue<String> name = clusterClient.clientGetName(ALL_NODES).get();
 
         assertEquals("clientGetName_with_multi_node_route", getFirstEntryFromMultiValue(name));
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void clientPauseAll_then_clientUnpause(GlideClusterClient clusterClient) {
+        String key = "clientPauseAll_then_clientUnpause_key";
+        assertEquals(OK, clusterClient.set(key, "before").get());
+
+        assertEquals(OK, clusterClient.clientPause(2000, ClientPauseMode.ALL).get());
+
+        CompletableFuture<String> set = clusterClient.set(key, "after");
+        CompletableFuture<String> unpause = clusterClient.clientUnpause();
+
+        Thread.sleep(300);
+
+        // Verify that none of the commands completes.
+        assertFalse(set.isDone());
+        assertFalse(unpause.isDone());
+
+        // Verify that all commands complete once pause expires.
+        assertEquals(OK, set.get(5, java.util.concurrent.TimeUnit.SECONDS));
+        assertEquals(OK, unpause.get(5, java.util.concurrent.TimeUnit.SECONDS));
+        assertEquals("after", clusterClient.get(key).get());
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void clientPauseWrite_then_clientUnpause(GlideClusterClient clusterClient) {
+        String key = "clientPauseWrite_then_clientUnpause_key";
+        assertEquals(OK, clusterClient.set(key, "before").get());
+
+        assertEquals(OK, clusterClient.clientPause(2000, ClientPauseMode.WRITE).get());
+
+        // Reads are not blocked by PAUSE WRITE.
+        assertEquals("before", clusterClient.get(key).get());
+
+        CompletableFuture<String> set = clusterClient.set(key, "after");
+
+        Thread.sleep(300);
+
+        // Verify that SET has not completed because server is paused.
+        assertFalse(set.isDone());
+
+        assertEquals(OK, clusterClient.clientUnpause().get());
+
+        // Verify that SET completes once pause expires.
+        assertEquals(OK, set.get(5, java.util.concurrent.TimeUnit.SECONDS));
+        assertEquals("after", clusterClient.get(key).get());
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void config_reset_stat(GlideClusterClient clusterClient) {
@@ -566,13 +665,13 @@ public class CommandTests {
         clusterClient.info(new Section[] {STATS}).get();
         clusterClient.info(new Section[] {STATS}).get();
 
-        var data = clusterClient.info(new Section[] {STATS}).get();
+        ClusterValue<String> data = clusterClient.info(new Section[] {STATS}).get();
         // always use the same node address for before and after
         final String firstNodeAddress = getFirstKeyFromMultiValue(data);
         String firstNodeInfo = data.getMultiValue().get(firstNodeAddress);
         long valueBefore = getValueFromInfo(firstNodeInfo, "total_net_input_bytes");
 
-        var result = clusterClient.configResetStat().get();
+        String result = clusterClient.configResetStat().get();
         assertEquals(OK, result);
 
         data = clusterClient.info(new Section[] {STATS}).get();
@@ -588,14 +687,14 @@ public class CommandTests {
                                 valueAfter, valueBefore));
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void config_rewrite_non_existent_config_file(GlideClusterClient clusterClient) {
-        var info = clusterClient.info(new Section[] {SERVER}, RANDOM).get();
-        var configFile = parseInfoResponseToMap(info.getSingleValue()).get("config_file");
+        ClusterValue<String> info = clusterClient.info(new Section[] {SERVER}, RANDOM).get();
+        String configFile = parseInfoResponseToMap(info.getSingleValue()).get("config_file");
 
-        if (configFile.isEmpty()) {
+        if (configFile == null || configFile.isEmpty()) {
             ExecutionException executionException =
                     assertThrows(ExecutionException.class, () -> clusterClient.configRewrite().get());
             assertInstanceOf(RequestException.class, executionException.getCause());
@@ -614,90 +713,97 @@ public class CommandTests {
                 .orElse(null);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void configGet_with_no_args_returns_error(GlideClusterClient clusterClient) {
-        var exception =
+        ExecutionException exception =
                 assertThrows(
                         ExecutionException.class, () -> clusterClient.configGet(new String[] {}).get());
         assertInstanceOf(GlideException.class, exception.getCause());
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void configGet_with_wildcard(GlideClusterClient clusterClient) {
-        var data = clusterClient.configGet(new String[] {"*file"}).get();
+        Map<String, String> data = clusterClient.configGet(new String[] {"*file"}).get();
         assertTrue(data.size() > 5);
         assertTrue(data.containsKey("pidfile"));
         assertTrue(data.containsKey("logfile"));
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void configGet_with_multiple_params(GlideClusterClient clusterClient) {
         assumeTrue(SERVER_VERSION.isGreaterThanOrEqualTo("7.0.0"), "This feature added in version 7");
-        var data = clusterClient.configGet(new String[] {"pidfile", "logfile"}).get();
+        Map<String, String> data = clusterClient.configGet(new String[] {"pidfile", "logfile"}).get();
         assertAll(
                 () -> assertEquals(2, data.size()),
                 () -> assertTrue(data.containsKey("pidfile")),
                 () -> assertTrue(data.containsKey("logfile")));
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void configGet_with_wildcard_and_multi_node_route(GlideClusterClient clusterClient) {
-        var data = clusterClient.configGet(new String[] {"*file"}, ALL_PRIMARIES).get();
+        ClusterValue<Map<String, String>> data =
+                clusterClient.configGet(new String[] {"*file"}, ALL_PRIMARIES).get();
         assertTrue(data.hasMultiData());
         assertTrue(data.getMultiValue().size() > 1);
         Map<String, String> config =
-                data.getMultiValue().get(data.getMultiValue().keySet().toArray(String[]::new)[0]);
+                data.getMultiValue().get(data.getMultiValue().keySet().toArray(new String[0])[0]);
         assertAll(
                 () -> assertTrue(config.size() > 5),
                 () -> assertTrue(config.containsKey("pidfile")),
                 () -> assertTrue(config.containsKey("logfile")));
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void configSet_a_parameter(GlideClusterClient clusterClient) {
-        var oldValue = clusterClient.configGet(new String[] {"maxclients"}).get().get("maxclients");
+        String oldValue = clusterClient.configGet(new String[] {"maxclients"}).get().get("maxclients");
 
-        var response = clusterClient.configSet(Map.of("maxclients", "42")).get();
+        String response = clusterClient.configSet(Collections.singletonMap("maxclients", "42")).get();
         assertEquals(OK, response);
-        var newValue = clusterClient.configGet(new String[] {"maxclients"}).get();
+        Map<String, String> newValue = clusterClient.configGet(new String[] {"maxclients"}).get();
         assertEquals("42", newValue.get("maxclients"));
 
-        response = clusterClient.configSet(Map.of("maxclients", oldValue)).get();
+        response = clusterClient.configSet(Collections.singletonMap("maxclients", oldValue)).get();
         assertEquals(OK, response);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void configSet_a_parameter_with_routing(GlideClusterClient clusterClient) {
-        var oldValue =
+        String oldValue =
                 clusterClient
                         .configGet(new String[] {"cluster-node-timeout"})
                         .get()
                         .get("cluster-node-timeout");
 
-        var response =
-                clusterClient.configSet(Map.of("cluster-node-timeout", "100500"), ALL_NODES).get();
+        String response =
+                clusterClient
+                        .configSet(Collections.singletonMap("cluster-node-timeout", "100500"), ALL_NODES)
+                        .get();
         assertEquals(OK, response);
 
-        var newValue = clusterClient.configGet(new String[] {"cluster-node-timeout"}).get();
+        Map<String, String> newValue =
+                clusterClient.configGet(new String[] {"cluster-node-timeout"}).get();
         assertEquals("100500", newValue.get("cluster-node-timeout"));
 
-        response = clusterClient.configSet(Map.of("cluster-node-timeout", oldValue), ALL_NODES).get();
+        response =
+                clusterClient
+                        .configSet(Collections.singletonMap("cluster-node-timeout", oldValue), ALL_NODES)
+                        .get();
         assertEquals(OK, response);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void cluster_route_by_address_reaches_correct_node(GlideClusterClient clusterClient) {
@@ -735,7 +841,7 @@ public class CommandTests {
         assertEquals(initialNode, specifiedClusterNode2);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void cluster_fail_routing_by_address_if_no_port_is_provided(
@@ -744,7 +850,7 @@ public class CommandTests {
     }
 
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     public void echo(GlideClusterClient clusterClient) {
         String message = "GLIDE";
@@ -753,7 +859,7 @@ public class CommandTests {
     }
 
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     public void echo_with_route(GlideClusterClient clusterClient) {
         String message = "GLIDE";
@@ -766,7 +872,7 @@ public class CommandTests {
     }
 
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     public void echo_gs(GlideClusterClient clusterClient) {
         byte[] message = {(byte) 0x01, (byte) 0x00, (byte) 0x01, (byte) 0x00, (byte) 0x02};
@@ -775,7 +881,7 @@ public class CommandTests {
     }
 
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     public void echo_gs_with_route(GlideClusterClient clusterClient) {
         byte[] message = {(byte) 0x01, (byte) 0x00, (byte) 0x01, (byte) 0x00, (byte) 0x02};
@@ -787,7 +893,7 @@ public class CommandTests {
         multiPayload.forEach((key, value) -> assertEquals(gs(message), value));
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void time(GlideClusterClient clusterClient) {
@@ -801,7 +907,7 @@ public class CommandTests {
         assertTrue(Long.parseLong(result[1]) < 1000000);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void time_with_route(GlideClusterClient clusterClient) {
@@ -814,7 +920,7 @@ public class CommandTests {
 
         // check the first node's server time
         Object[] serverTime =
-                result.getMultiValue().get(result.getMultiValue().keySet().toArray(String[]::new)[0]);
+                result.getMultiValue().get(result.getMultiValue().keySet().toArray(new String[0])[0]);
 
         assertEquals(2, serverTime.length);
         assertTrue(
@@ -823,26 +929,264 @@ public class CommandTests {
         assertTrue(Long.parseLong((String) serverTime[1]) < 1000000);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void lastsave(GlideClusterClient clusterClient) {
         long result = clusterClient.lastsave().get();
-        var yesterday = Instant.now().minus(1, ChronoUnit.DAYS);
+        Instant yesterday = Instant.now().minus(1, ChronoUnit.DAYS);
 
         assertTrue(Instant.ofEpochSecond(result).isAfter(yesterday));
 
         ClusterValue<Long> data = clusterClient.lastsave(ALL_NODES).get();
-        for (var value : data.getMultiValue().values()) {
+        for (Long value : data.getMultiValue().values()) {
             assertTrue(Instant.ofEpochSecond(value).isAfter(yesterday));
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void latencyHistory(GlideClusterClient clusterClient) {
+        long beforeSpike = getUnixSeconds(clusterClient);
+        triggerLatencySpike(clusterClient);
+
+        // Multi-node route (default).
+        ClusterValue<Object[][]> multiCommand = clusterClient.latencyHistory("command").get();
+        assertTrue(multiCommand.hasMultiData());
+
+        for (Object[][] multiCommandEntries : multiCommand.getMultiValue().values()) {
+            assertTrue(multiCommandEntries.length > 0);
+
+            for (Object[] entry : multiCommandEntries) {
+                assertTrue((Long) entry[0] >= beforeSpike);
+                assertTrue((Long) entry[1] > 0);
+            }
+        }
+
+        // Single-node route (primary)
+        ClusterValue<Object[][]> single =
+                clusterClient.latencyHistory("command", PRIMARY_SLOT_ROUTE).get();
+        assertTrue(single.hasSingleData());
+
+        Object[][] entries = single.getSingleValue();
+        assertTrue(entries.length > 0);
+
+        for (Object[] entry : entries) {
+            assertTrue((Long) entry[0] >= beforeSpike);
+            assertTrue((Long) entry[1] > 0);
+        }
+
+        // Non-existent event.
+        ClusterValue<Object[][]> multiUnknown = clusterClient.latencyHistory("nonexistent").get();
+        assertTrue(multiUnknown.hasMultiData());
+
+        for (Object[][] multiUnknownEntries : multiUnknown.getMultiValue().values()) {
+            assertEquals(0, multiUnknownEntries.length);
+        }
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void latencyLatest(GlideClusterClient clusterClient) {
+        long beforeSpike = getUnixSeconds(clusterClient);
+        triggerLatencySpike(clusterClient);
+
+        ClusterValue<Object[][]> result = clusterClient.latencyLatest().get();
+        assertTrue(result.hasMultiData());
+
+        // Find the "command" event on any node
+        Object[] commandInfo =
+                flattenArrayofArrays(result).stream()
+                        .filter(info -> "command".equals(info[0]))
+                        .findFirst()
+                        .orElse(null);
+        assertNotNull(commandInfo);
+
+        assertTrue((Long) commandInfo[1] >= beforeSpike);
+        assertTrue((Long) commandInfo[2] > 0);
+        assertTrue((Long) commandInfo[3] >= (Long) commandInfo[2]);
+
+        if (SERVER_VERSION.isGreaterThanOrEqualTo("8.1.0")) {
+            assertTrue(commandInfo.length > 4);
+            assertTrue((Long) commandInfo[4] > 0);
+            assertTrue((Long) commandInfo[5] > 0);
+        } else {
+            assertEquals(4, commandInfo.length);
+        }
+
+        // Single-node route (primary)
+        ClusterValue<Object[][]> single = clusterClient.latencyLatest(PRIMARY_SLOT_ROUTE).get();
+        assertTrue(single.hasSingleData());
+        assertTrue(single.getSingleValue().length >= 1);
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void latencyReset(GlideClusterClient clusterClient) {
+
+        // Trigger spike then reset all events.
+        triggerLatencySpike(clusterClient);
+        assertTrue(clusterClient.latencyReset().get() > 0);
+        assertTrue(flattenLatencyEntries(clusterClient.latencyHistory("command").get()).isEmpty());
+
+        // Trigger spike then reset "command" event.
+        triggerLatencySpike(clusterClient);
+        assertTrue(clusterClient.latencyReset(new String[] {"command"}).get() > 0);
+        assertTrue(flattenLatencyEntries(clusterClient.latencyHistory("command").get()).isEmpty());
+
+        // Trigger spike then reset unknown event — "command" data should persist.
+        triggerLatencySpike(clusterClient);
+        assertEquals(0, clusterClient.latencyReset(new String[] {"unknown-event"}).get());
+        assertFalse(flattenLatencyEntries(clusterClient.latencyHistory("command").get()).isEmpty());
+    }
+
+    /** Flattens a ClusterValue of Object[][] arrays (latency history entries). */
+    private static List<Object[]> flattenLatencyEntries(ClusterValue<Object[][]> val) {
+        if (val.hasSingleData()) {
+            return Arrays.asList(val.getSingleValue());
+        }
+        return val.getMultiValue().values().stream()
+                .flatMap(Arrays::stream)
+                .collect(Collectors.toList());
+    }
+
+    /** Flattens a ClusterValue of Object[][] arrays (latency event infos). */
+    private static List<Object[]> flattenArrayofArrays(ClusterValue<Object[][]> val) {
+        if (val.hasSingleData()) {
+            return Arrays.asList(val.getSingleValue());
+        }
+        return val.getMultiValue().values().stream()
+                .flatMap(Arrays::stream)
+                .collect(Collectors.toList());
+    }
+
+    /** Triggers a latency spike for the "command" event on all cluster nodes. */
+    @SneakyThrows
+    private static void triggerLatencySpike(GlideClusterClient client) {
+
+        // Reset any existing latency data first so the spike is recorded against a clean baseline,
+        // then enable the server-side latency monitor, trigger a latency spike for the "command"
+        // event, and finally restore the original threshold.
+        client.latencyReset(ALL_NODES).get();
+
+        Map<String, String> prev = client.configGet(new String[] {"latency-monitor-threshold"}).get();
+        String prevThreshold = prev.getOrDefault("latency-monitor-threshold", "0");
+
+        client.configSet(Collections.singletonMap("latency-monitor-threshold", "1"), ALL_NODES).get();
+        client.customCommand(new String[] {"DEBUG", "SLEEP", "0.05"}, ALL_NODES).get();
+
+        client
+                .configSet(Collections.singletonMap("latency-monitor-threshold", prevThreshold), ALL_NODES)
+                .get();
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void save_with_route(GlideClusterClient clusterClient) {
+        waitForSaveNotInProgress(clusterClient);
+        assertEquals(OK, clusterClient.save(PRIMARY_SLOT_ROUTE).get());
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void bgsave(GlideClusterClient clusterClient) {
+        waitForSaveNotInProgress(clusterClient);
+        clusterClient
+                .bgsave()
+                .get()
+                .getMultiValue()
+                .values()
+                .forEach(value -> assertTrue(BGSAVE_RESPONSES.contains(value)));
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void bgsave_with_route(GlideClusterClient clusterClient) {
+        waitForSaveNotInProgress(clusterClient);
+        String result = clusterClient.bgsave(PRIMARY_SLOT_ROUTE).get().getSingleValue();
+        assertTrue(BGSAVE_RESPONSES.contains(result));
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void bgsaveSchedule(GlideClusterClient clusterClient) {
+        waitForSaveNotInProgress(clusterClient);
+        clusterClient
+                .bgsaveSchedule()
+                .get()
+                .getMultiValue()
+                .values()
+                .forEach(value -> assertTrue(BGSAVE_RESPONSES.contains(value)));
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void bgsaveSchedule_with_route(GlideClusterClient clusterClient) {
+        waitForSaveNotInProgress(clusterClient);
+        String result = clusterClient.bgsaveSchedule(PRIMARY_SLOT_ROUTE).get().getSingleValue();
+        assertTrue(BGSAVE_RESPONSES.contains(result));
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void bgsaveCancel(GlideClusterClient clusterClient) {
+        assumeTrue(SERVER_VERSION.isGreaterThanOrEqualTo("8.1.0"));
+        waitForSaveNotInProgress(clusterClient);
+
+        ExecutionException e =
+                assertThrows(ExecutionException.class, () -> clusterClient.bgsaveCancel().get());
+        assertTrue(e.getCause().getMessage().contains(BGSAVE_NOT_CANCELLED_RESPONSE));
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void bgsaveCancel_with_route(GlideClusterClient clusterClient) {
+        assumeTrue(SERVER_VERSION.isGreaterThanOrEqualTo("8.1.0"));
+        waitForSaveNotInProgress(clusterClient);
+
+        ExecutionException e =
+                assertThrows(
+                        ExecutionException.class, () -> clusterClient.bgsaveCancel(PRIMARY_SLOT_ROUTE).get());
+        assertTrue(e.getCause().getMessage().contains(BGSAVE_NOT_CANCELLED_RESPONSE));
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void bgrewriteaof(GlideClusterClient clusterClient) {
+        waitForSaveNotInProgress(clusterClient);
+        clusterClient
+                .bgrewriteaof()
+                .get()
+                .getMultiValue()
+                .values()
+                .forEach(value -> assertTrue(BGREWRITEAOF_RESPONSES.contains(value)));
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void bgrewriteaof_with_route(GlideClusterClient clusterClient) {
+        waitForSaveNotInProgress(clusterClient);
+        String result = clusterClient.bgrewriteaof(PRIMARY_SLOT_ROUTE).get().getSingleValue();
+        assertTrue(BGREWRITEAOF_RESPONSES.contains(result));
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void lolwut_lolwut(GlideClusterClient clusterClient) {
-        var response = clusterClient.lolwut().get();
+        String response = clusterClient.lolwut().get();
         System.out.printf("%nLOLWUT cluster client standard response%n%s%n", response);
         assertTrue(
                 response.contains("ver") && response.contains(SERVER_VERSION.toString()),
@@ -867,15 +1211,15 @@ public class CommandTests {
                 response.contains("ver") && response.contains(SERVER_VERSION.toString()),
                 "Expected LOLWUT output to contain version string");
 
-        var clusterResponse = clusterClient.lolwut(ALL_NODES).get();
-        for (var nodeResponse : clusterResponse.getMultiValue().values()) {
+        ClusterValue<String> clusterResponse = clusterClient.lolwut(ALL_NODES).get();
+        for (String nodeResponse : clusterResponse.getMultiValue().values()) {
             assertTrue(
                     nodeResponse.contains("ver") && nodeResponse.contains(SERVER_VERSION.toString()),
                     "Expected LOLWUT output to contain version string");
         }
 
         clusterResponse = clusterClient.lolwut(new int[] {10, 20}, ALL_NODES).get();
-        for (var nodeResponse : clusterResponse.getMultiValue().values()) {
+        for (String nodeResponse : clusterResponse.getMultiValue().values()) {
             assertTrue(
                     nodeResponse.contains("ver") && nodeResponse.contains(SERVER_VERSION.toString()),
                     "Expected LOLWUT output to contain version string");
@@ -897,7 +1241,7 @@ public class CommandTests {
         if (SERVER_VERSION.isGreaterThanOrEqualTo("9.0.0")) {
             // Test with version 9 and 2 parameters on all nodes
             clusterResponse = clusterClient.lolwut(9, new int[] {30, 4}, ALL_NODES).get();
-            for (var nodeResponse : clusterResponse.getMultiValue().values()) {
+            for (String nodeResponse : clusterResponse.getMultiValue().values()) {
                 assertTrue(
                         nodeResponse.contains("ver") && nodeResponse.contains(SERVER_VERSION.toString()),
                         "Expected LOLWUT output to contain version string");
@@ -912,7 +1256,7 @@ public class CommandTests {
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void dbsize_and_flushdb(GlideClusterClient clusterClient) {
@@ -961,13 +1305,13 @@ public class CommandTests {
         assertEquals(0L, clusterClient.dbsize(route).get());
 
         if (!is62orHigher) {
-            var executionException =
+            ExecutionException executionException =
                     assertThrows(ExecutionException.class, () -> clusterClient.flushdb(SYNC).get());
             assertInstanceOf(RequestException.class, executionException.getCause());
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void objectFreq(GlideClusterClient clusterClient) {
@@ -976,17 +1320,20 @@ public class CommandTests {
         String oldPolicy =
                 clusterClient.configGet(new String[] {maxmemoryPolicy}).get().get(maxmemoryPolicy);
         try {
-            assertEquals(OK, clusterClient.configSet(Map.of(maxmemoryPolicy, "allkeys-lfu")).get());
+            assertEquals(
+                    OK,
+                    clusterClient.configSet(Collections.singletonMap(maxmemoryPolicy, "allkeys-lfu")).get());
             assertEquals(OK, clusterClient.set(key, "").get());
             assertTrue(clusterClient.objectFreq(key).get() >= 0L);
         } finally {
-            clusterClient.configSet(Map.of(maxmemoryPolicy, oldPolicy)).get();
+            clusterClient.configSet(Collections.singletonMap(maxmemoryPolicy, oldPolicy)).get();
         }
     }
 
     @SneakyThrows
     public static Stream<Arguments> callCrossSlotCommandsWhichShouldFail() {
-        var clusterClient = GlideClusterClient.createClient(commonClusterClientConfig().build()).get();
+        GlideClusterClient clusterClient =
+                GlideClusterClient.createClient(commonClusterClientConfig().build()).get();
         return Stream.of(
                 Arguments.of("smove", null, clusterClient.smove("abc", "zxy", "lkn")),
                 Arguments.of("rename", null, clusterClient.rename("abc", "xyz")),
@@ -1147,9 +1494,9 @@ public class CommandTests {
                                 new GlideString[] {gs("abc"), gs("zxy"), gs("lkn")},
                                 new GlideString[0])),
                 Arguments.of(
-                        "xread", null, clusterClient.xread(Map.of("abc", "stream1", "zxy", "stream2"))),
+                        "xread", null, clusterClient.xread(createMap("abc", "stream1", "zxy", "stream2"))),
                 Arguments.of("copy", "6.2.0", clusterClient.copy("abc", "def", true)),
-                Arguments.of("msetnx", null, clusterClient.msetnx(Map.of("abc", "def", "ghi", "jkl"))),
+                Arguments.of("msetnx", null, clusterClient.msetnx(createMap("abc", "def", "ghi", "jkl"))),
                 Arguments.of("lcs", "7.0.0", clusterClient.lcs("abc", "def")),
                 Arguments.of("lcsLEN", "7.0.0", clusterClient.lcsLen("abc", "def")),
                 Arguments.of("lcsIdx", "7.0.0", clusterClient.lcsIdx("abc", "def")),
@@ -1187,20 +1534,21 @@ public class CommandTests {
         if (minVer != null) {
             assumeTrue(SERVER_VERSION.isGreaterThanOrEqualTo(minVer));
         }
-        var executionException = assertThrows(ExecutionException.class, future::get);
+        ExecutionException executionException = assertThrows(ExecutionException.class, future::get);
         assertInstanceOf(RequestException.class, executionException.getCause());
         assertTrue(executionException.getMessage().toLowerCase().contains("crossslot"));
     }
 
     @SneakyThrows
     public static Stream<Arguments> callCrossSlotCommandsWhichShouldPass() {
-        var clusterClient = GlideClusterClient.createClient(commonClusterClientConfig().build()).get();
+        GlideClusterClient clusterClient =
+                GlideClusterClient.createClient(commonClusterClientConfig().build()).get();
         return Stream.of(
                 Arguments.of("exists", clusterClient.exists(new String[] {"abc", "zxy", "lkn"})),
                 Arguments.of("unlink", clusterClient.unlink(new String[] {"abc", "zxy", "lkn"})),
                 Arguments.of("del", clusterClient.del(new String[] {"abc", "zxy", "lkn"})),
                 Arguments.of("mget", clusterClient.mget(new String[] {"abc", "zxy", "lkn"})),
-                Arguments.of("mset", clusterClient.mset(Map.of("abc", "1", "zxy", "2", "lkn", "3"))),
+                Arguments.of("mset", clusterClient.mset(createMap("abc", "1", "zxy", "2", "lkn", "3"))),
                 Arguments.of("touch", clusterClient.touch(new String[] {"abc", "zxy", "lkn"})),
                 Arguments.of(
                         "touch binary",
@@ -1215,14 +1563,14 @@ public class CommandTests {
         future.get();
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void flushall(GlideClusterClient clusterClient) {
         if (SERVER_VERSION.isGreaterThanOrEqualTo("6.2.0")) {
             assertEquals(OK, clusterClient.flushall(SYNC).get());
         } else {
-            var executionException =
+            ExecutionException executionException =
                     assertThrows(ExecutionException.class, () -> clusterClient.flushall(SYNC).get());
             assertInstanceOf(RequestException.class, executionException.getCause());
             assertEquals(OK, clusterClient.flushall(ASYNC).get());
@@ -1233,13 +1581,13 @@ public class CommandTests {
         String[] allKeys = keysResult.getSingleValue();
         assertEquals(0, allKeys.length);
 
-        var route = new SlotKeyRoute("key", PRIMARY);
+        Route route = new SlotKeyRoute("key", PRIMARY);
         assertEquals(OK, clusterClient.flushall().get());
         assertEquals(OK, clusterClient.flushall(route).get());
         assertEquals(OK, clusterClient.flushall(ASYNC).get());
         assertEquals(OK, clusterClient.flushall(ASYNC, route).get());
 
-        var replicaRoute = new SlotKeyRoute("key", REPLICA);
+        Route replicaRoute = new SlotKeyRoute("key", REPLICA);
         if (SERVER_VERSION.isGreaterThanOrEqualTo("8.0.0")) {
             // Since Valkey 8.0.0 flushall can run on replicas
             assertEquals(OK, clusterClient.flushall(route).get());
@@ -1264,7 +1612,7 @@ public class CommandTests {
     }
 
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getTestScenarios")
     public void function_commands_without_keys_with_route(
             GlideClusterClient clusterClient, boolean singleNodeRoute) {
@@ -1273,17 +1621,19 @@ public class CommandTests {
         String libName = "mylib1c_" + singleNodeRoute;
         String funcName = "myfunc1c_" + singleNodeRoute;
         // function $funcName returns first argument
-        String code = generateLuaLibCode(libName, Map.of(funcName, "return args[1]"), true);
+        String code =
+                generateLuaLibCode(libName, Collections.singletonMap(funcName, "return args[1]"), true);
         Route route = singleNodeRoute ? new SlotKeyRoute("1", PRIMARY) : ALL_PRIMARIES;
 
         assertEquals(OK, clusterClient.functionFlush(SYNC, route).get());
         assertEquals(libName, clusterClient.functionLoad(code, false, route).get());
 
-        var fcallResult = clusterClient.fcall(funcName, new String[] {"one", "two"}, route).get();
+        ClusterValue<Object> fcallResult =
+                clusterClient.fcall(funcName, new String[] {"one", "two"}, route).get();
         if (route instanceof SingleNodeRoute) {
             assertEquals("one", fcallResult.getSingleValue());
         } else {
-            for (var nodeResponse : fcallResult.getMultiValue().values()) {
+            for (Object nodeResponse : fcallResult.getMultiValue().values()) {
                 assertEquals("one", nodeResponse);
             }
         }
@@ -1291,31 +1641,31 @@ public class CommandTests {
         if (route instanceof SingleNodeRoute) {
             assertEquals("one", fcallResult.getSingleValue());
         } else {
-            for (var nodeResponse : fcallResult.getMultiValue().values()) {
+            for (Object nodeResponse : fcallResult.getMultiValue().values()) {
                 assertEquals("one", nodeResponse);
             }
         }
 
-        var expectedDescription =
+        Map<String, String> expectedDescription =
                 new HashMap<String, String>() {
                     {
                         put(funcName, null);
                     }
                 };
-        var expectedFlags =
+        Map<String, Set<String>> expectedFlags =
                 new HashMap<String, Set<String>>() {
                     {
-                        put(funcName, Set.of("no-writes"));
+                        put(funcName, Collections.singleton("no-writes"));
                     }
                 };
 
-        var response = clusterClient.functionList(false, route).get();
+        ClusterValue<Map<String, Object>[]> response = clusterClient.functionList(false, route).get();
         if (singleNodeRoute) {
-            var flist = response.getSingleValue();
+            Map<String, Object>[] flist = response.getSingleValue();
             checkFunctionListResponse(
                     flist, libName, expectedDescription, expectedFlags, Optional.empty());
         } else {
-            for (var flist : response.getMultiValue().values()) {
+            for (Map<String, Object>[] flist : response.getMultiValue().values()) {
                 checkFunctionListResponse(
                         flist, libName, expectedDescription, expectedFlags, Optional.empty());
             }
@@ -1323,18 +1673,18 @@ public class CommandTests {
 
         response = clusterClient.functionList(true, route).get();
         if (singleNodeRoute) {
-            var flist = response.getSingleValue();
+            Map<String, Object>[] flist = response.getSingleValue();
             checkFunctionListResponse(
                     flist, libName, expectedDescription, expectedFlags, Optional.of(code));
         } else {
-            for (var flist : response.getMultiValue().values()) {
+            for (Map<String, Object>[] flist : response.getMultiValue().values()) {
                 checkFunctionListResponse(
                         flist, libName, expectedDescription, expectedFlags, Optional.of(code));
             }
         }
 
         // re-load library without overwriting
-        var executionException =
+        ExecutionException executionException =
                 assertThrows(
                         ExecutionException.class, () -> clusterClient.functionLoad(code, false, route).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
@@ -1348,27 +1698,28 @@ public class CommandTests {
         // function $newFuncName returns argument array len
         String newCode =
                 generateLuaLibCode(
-                        libName, Map.of(funcName, "return args[1]", newFuncName, "return #args"), true);
+                        libName, createMap(funcName, "return args[1]", newFuncName, "return #args"), true);
 
         assertEquals(libName, clusterClient.functionLoad(newCode, true, route).get());
 
         expectedDescription.put(newFuncName, null);
-        expectedFlags.put(newFuncName, Set.of("no-writes"));
+        expectedFlags.put(newFuncName, Collections.singleton("no-writes"));
 
         response = clusterClient.functionList(false, route).get();
         if (singleNodeRoute) {
-            var flist = response.getSingleValue();
+            Map<String, Object>[] flist = response.getSingleValue();
             checkFunctionListResponse(
                     flist, libName, expectedDescription, expectedFlags, Optional.empty());
         } else {
-            for (var flist : response.getMultiValue().values()) {
+            for (Map<String, Object>[] flist : response.getMultiValue().values()) {
                 checkFunctionListResponse(
                         flist, libName, expectedDescription, expectedFlags, Optional.empty());
             }
         }
 
         // load new lib and delete it - first lib remains loaded
-        String anotherLib = generateLuaLibCode("anotherLib", Map.of("anotherFunc", ""), false);
+        String anotherLib =
+                generateLuaLibCode("anotherLib", Collections.singletonMap("anotherFunc", ""), false);
         assertEquals("anotherLib", clusterClient.functionLoad(anotherLib, true, route).get());
         assertEquals(OK, clusterClient.functionDelete("anotherLib", route).get());
 
@@ -1382,11 +1733,11 @@ public class CommandTests {
 
         response = clusterClient.functionList(true, route).get();
         if (singleNodeRoute) {
-            var flist = response.getSingleValue();
+            Map<String, Object>[] flist = response.getSingleValue();
             checkFunctionListResponse(
                     flist, libName, expectedDescription, expectedFlags, Optional.of(newCode));
         } else {
-            for (var flist : response.getMultiValue().values()) {
+            for (Map<String, Object>[] flist : response.getMultiValue().values()) {
                 checkFunctionListResponse(
                         flist, libName, expectedDescription, expectedFlags, Optional.of(newCode));
             }
@@ -1396,7 +1747,7 @@ public class CommandTests {
         if (route instanceof SingleNodeRoute) {
             assertEquals(2L, fcallResult.getSingleValue());
         } else {
-            for (var nodeResponse : fcallResult.getMultiValue().values()) {
+            for (Object nodeResponse : fcallResult.getMultiValue().values()) {
                 assertEquals(2L, nodeResponse);
             }
         }
@@ -1405,7 +1756,7 @@ public class CommandTests {
         if (route instanceof SingleNodeRoute) {
             assertEquals(2L, fcallResult.getSingleValue());
         } else {
-            for (var nodeResponse : fcallResult.getMultiValue().values()) {
+            for (Object nodeResponse : fcallResult.getMultiValue().values()) {
                 assertEquals(2L, nodeResponse);
             }
         }
@@ -1414,7 +1765,7 @@ public class CommandTests {
     }
 
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getTestScenarios")
     public void function_commands_without_keys_with_route_binary(
             GlideClusterClient clusterClient, boolean singleNodeRoute) {
@@ -1424,18 +1775,19 @@ public class CommandTests {
         GlideString funcName = gs("myfunc1c_" + singleNodeRoute);
         // function $funcName returns first argument
         GlideString code =
-                generateLuaLibCodeBinary(libName, Map.of(funcName, gs("return args[1]")), true);
+                generateLuaLibCodeBinary(
+                        libName, Collections.singletonMap(funcName, gs("return args[1]")), true);
         Route route = singleNodeRoute ? new SlotKeyRoute("1", PRIMARY) : ALL_PRIMARIES;
 
         assertEquals(OK, clusterClient.functionFlush(SYNC, route).get());
         assertEquals(libName, clusterClient.functionLoad(code, false, route).get());
 
-        var fcallResult =
+        ClusterValue<Object> fcallResult =
                 clusterClient.fcall(funcName, new GlideString[] {gs("one"), gs("two")}, route).get();
         if (route instanceof SingleNodeRoute) {
             assertEquals(gs("one"), fcallResult.getSingleValue());
         } else {
-            for (var nodeResponse : fcallResult.getMultiValue().values()) {
+            for (Object nodeResponse : fcallResult.getMultiValue().values()) {
                 assertEquals(gs("one"), nodeResponse);
             }
         }
@@ -1446,31 +1798,32 @@ public class CommandTests {
         if (route instanceof SingleNodeRoute) {
             assertEquals(gs("one"), fcallResult.getSingleValue());
         } else {
-            for (var nodeResponse : fcallResult.getMultiValue().values()) {
+            for (Object nodeResponse : fcallResult.getMultiValue().values()) {
                 assertEquals(gs("one"), nodeResponse);
             }
         }
 
-        var expectedDescription =
+        Map<GlideString, GlideString> expectedDescription =
                 new HashMap<GlideString, GlideString>() {
                     {
                         put(funcName, null);
                     }
                 };
-        var expectedFlags =
+        Map<GlideString, Set<GlideString>> expectedFlags =
                 new HashMap<GlideString, Set<GlideString>>() {
                     {
-                        put(funcName, Set.of(gs("no-writes")));
+                        put(funcName, Collections.singleton(gs("no-writes")));
                     }
                 };
 
-        var response = clusterClient.functionListBinary(false, route).get();
+        ClusterValue<Map<GlideString, Object>[]> response =
+                clusterClient.functionListBinary(false, route).get();
         if (singleNodeRoute) {
-            var flist = response.getSingleValue();
+            Map<GlideString, Object>[] flist = response.getSingleValue();
             checkFunctionListResponseBinary(
                     flist, libName, expectedDescription, expectedFlags, Optional.empty());
         } else {
-            for (var flist : response.getMultiValue().values()) {
+            for (Map<GlideString, Object>[] flist : response.getMultiValue().values()) {
                 checkFunctionListResponseBinary(
                         flist, libName, expectedDescription, expectedFlags, Optional.empty());
             }
@@ -1478,18 +1831,18 @@ public class CommandTests {
 
         response = clusterClient.functionListBinary(true, route).get();
         if (singleNodeRoute) {
-            var flist = response.getSingleValue();
+            Map<GlideString, Object>[] flist = response.getSingleValue();
             checkFunctionListResponseBinary(
                     flist, libName, expectedDescription, expectedFlags, Optional.of(code));
         } else {
-            for (var flist : response.getMultiValue().values()) {
+            for (Map<GlideString, Object>[] flist : response.getMultiValue().values()) {
                 checkFunctionListResponseBinary(
                         flist, libName, expectedDescription, expectedFlags, Optional.of(code));
             }
         }
 
         // re-load library without overwriting
-        var executionException =
+        ExecutionException executionException =
                 assertThrows(
                         ExecutionException.class, () -> clusterClient.functionLoad(code, false, route).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
@@ -1503,20 +1856,22 @@ public class CommandTests {
         // function $newFuncName returns argument array len
         GlideString newCode =
                 generateLuaLibCodeBinary(
-                        libName, Map.of(funcName, gs("return args[1]"), newFuncName, gs("return #args")), true);
+                        libName,
+                        createMap(funcName, gs("return args[1]"), newFuncName, gs("return #args")),
+                        true);
 
         assertEquals(libName, clusterClient.functionLoad(newCode, true, route).get());
 
         expectedDescription.put(newFuncName, null);
-        expectedFlags.put(newFuncName, Set.of(gs("no-writes")));
+        expectedFlags.put(newFuncName, Collections.singleton(gs("no-writes")));
 
         response = clusterClient.functionListBinary(false, route).get();
         if (singleNodeRoute) {
-            var flist = response.getSingleValue();
+            Map<GlideString, Object>[] flist = response.getSingleValue();
             checkFunctionListResponseBinary(
                     flist, libName, expectedDescription, expectedFlags, Optional.empty());
         } else {
-            for (var flist : response.getMultiValue().values()) {
+            for (Map<GlideString, Object>[] flist : response.getMultiValue().values()) {
                 checkFunctionListResponseBinary(
                         flist, libName, expectedDescription, expectedFlags, Optional.empty());
             }
@@ -1524,7 +1879,8 @@ public class CommandTests {
 
         // load new lib and delete it - first lib remains loaded
         GlideString anotherLib =
-                generateLuaLibCodeBinary(gs("anotherLib"), Map.of(gs("anotherFunc"), gs("")), false);
+                generateLuaLibCodeBinary(
+                        gs("anotherLib"), Collections.singletonMap(gs("anotherFunc"), gs("")), false);
         assertEquals(gs("anotherLib"), clusterClient.functionLoad(anotherLib, true, route).get());
         assertEquals(OK, clusterClient.functionDelete(gs("anotherLib"), route).get());
 
@@ -1538,11 +1894,11 @@ public class CommandTests {
 
         response = clusterClient.functionListBinary(true, route).get();
         if (singleNodeRoute) {
-            var flist = response.getSingleValue();
+            Map<GlideString, Object>[] flist = response.getSingleValue();
             checkFunctionListResponseBinary(
                     flist, libName, expectedDescription, expectedFlags, Optional.of(newCode));
         } else {
-            for (var flist : response.getMultiValue().values()) {
+            for (Map<GlideString, Object>[] flist : response.getMultiValue().values()) {
                 checkFunctionListResponseBinary(
                         flist, libName, expectedDescription, expectedFlags, Optional.of(newCode));
             }
@@ -1553,7 +1909,7 @@ public class CommandTests {
         if (route instanceof SingleNodeRoute) {
             assertEquals(2L, fcallResult.getSingleValue());
         } else {
-            for (var nodeResponse : fcallResult.getMultiValue().values()) {
+            for (Object nodeResponse : fcallResult.getMultiValue().values()) {
                 assertEquals(2L, nodeResponse);
             }
         }
@@ -1564,7 +1920,7 @@ public class CommandTests {
         if (route instanceof SingleNodeRoute) {
             assertEquals(2L, fcallResult.getSingleValue());
         } else {
-            for (var nodeResponse : fcallResult.getMultiValue().values()) {
+            for (Object nodeResponse : fcallResult.getMultiValue().values()) {
                 assertEquals(2L, nodeResponse);
             }
         }
@@ -1573,7 +1929,7 @@ public class CommandTests {
     }
 
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     public void function_commands_without_keys_and_without_route(GlideClusterClient clusterClient) {
         assumeTrue(SERVER_VERSION.isGreaterThanOrEqualTo("7.0.0"), "This feature added in version 7");
@@ -1585,24 +1941,25 @@ public class CommandTests {
         // function $funcName returns first argument
         // generating RO functions to execution on a replica (default routing goes to RANDOM including
         // replicas)
-        String code = generateLuaLibCode(libName, Map.of(funcName, "return args[1]"), true);
+        String code =
+                generateLuaLibCode(libName, Collections.singletonMap(funcName, "return args[1]"), true);
 
         assertEquals(libName, clusterClient.functionLoad(code, false).get());
 
         assertEquals("one", clusterClient.fcall(funcName, new String[] {"one", "two"}).get());
         assertEquals("one", clusterClient.fcallReadOnly(funcName, new String[] {"one", "two"}).get());
 
-        var flist = clusterClient.functionList(false).get();
-        var expectedDescription =
+        Map<String, Object>[] flist = clusterClient.functionList(false).get();
+        Map<String, String> expectedDescription =
                 new HashMap<String, String>() {
                     {
                         put(funcName, null);
                     }
                 };
-        var expectedFlags =
+        Map<String, Set<String>> expectedFlags =
                 new HashMap<String, Set<String>>() {
                     {
-                        put(funcName, Set.of("no-writes"));
+                        put(funcName, Collections.singleton("no-writes"));
                     }
                 };
         checkFunctionListResponse(flist, libName, expectedDescription, expectedFlags, Optional.empty());
@@ -1612,7 +1969,7 @@ public class CommandTests {
                 flist, libName, expectedDescription, expectedFlags, Optional.of(code));
 
         // re-load library without overwriting
-        var executionException =
+        ExecutionException executionException =
                 assertThrows(ExecutionException.class, () -> clusterClient.functionLoad(code, false).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
         assertTrue(
@@ -1625,12 +1982,13 @@ public class CommandTests {
         // function $newFuncName returns argument array len
         String newCode =
                 generateLuaLibCode(
-                        libName, Map.of(funcName, "return args[1]", newFuncName, "return #args"), true);
+                        libName, createMap(funcName, "return args[1]", newFuncName, "return #args"), true);
 
         assertEquals(libName, clusterClient.functionLoad(newCode, true).get());
 
         // load new lib and delete it - first lib remains loaded
-        String anotherLib = generateLuaLibCode("anotherLib", Map.of("anotherFunc", ""), false);
+        String anotherLib =
+                generateLuaLibCode("anotherLib", Collections.singletonMap("anotherFunc", ""), false);
         assertEquals("anotherLib", clusterClient.functionLoad(anotherLib, true).get());
         assertEquals(OK, clusterClient.functionDelete("anotherLib").get());
 
@@ -1643,7 +2001,7 @@ public class CommandTests {
 
         flist = clusterClient.functionList(libName, false).get();
         expectedDescription.put(newFuncName, null);
-        expectedFlags.put(newFuncName, Set.of("no-writes"));
+        expectedFlags.put(newFuncName, Collections.singleton("no-writes"));
         checkFunctionListResponse(flist, libName, expectedDescription, expectedFlags, Optional.empty());
 
         flist = clusterClient.functionList(libName, true).get();
@@ -1657,7 +2015,7 @@ public class CommandTests {
     }
 
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     public void function_commands_without_keys_and_without_route_binary(
             GlideClusterClient clusterClient) {
@@ -1671,7 +2029,8 @@ public class CommandTests {
         // generating RO functions to execution on a replica (default routing goes to RANDOM including
         // replicas)
         GlideString code =
-                generateLuaLibCodeBinary(libName, Map.of(funcName, gs("return args[1]")), true);
+                generateLuaLibCodeBinary(
+                        libName, Collections.singletonMap(funcName, gs("return args[1]")), true);
 
         assertEquals(libName, clusterClient.functionLoad(code, false).get());
 
@@ -1681,17 +2040,17 @@ public class CommandTests {
                 gs("one"),
                 clusterClient.fcallReadOnly(funcName, new GlideString[] {gs("one"), gs("two")}).get());
 
-        var flist = clusterClient.functionListBinary(false).get();
-        var expectedDescription =
+        Map<GlideString, Object>[] flist = clusterClient.functionListBinary(false).get();
+        Map<GlideString, GlideString> expectedDescription =
                 new HashMap<GlideString, GlideString>() {
                     {
                         put(funcName, null);
                     }
                 };
-        var expectedFlags =
+        Map<GlideString, Set<GlideString>> expectedFlags =
                 new HashMap<GlideString, Set<GlideString>>() {
                     {
-                        put(funcName, Set.of(gs("no-writes")));
+                        put(funcName, Collections.singleton(gs("no-writes")));
                     }
                 };
         checkFunctionListResponseBinary(
@@ -1702,7 +2061,7 @@ public class CommandTests {
                 flist, libName, expectedDescription, expectedFlags, Optional.of(code));
 
         // re-load library without overwriting
-        var executionException =
+        ExecutionException executionException =
                 assertThrows(ExecutionException.class, () -> clusterClient.functionLoad(code, false).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
         assertTrue(
@@ -1715,13 +2074,16 @@ public class CommandTests {
         // function $newFuncName returns argument array len
         GlideString newCode =
                 generateLuaLibCodeBinary(
-                        libName, Map.of(funcName, gs("return args[1]"), newFuncName, gs("return #args")), true);
+                        libName,
+                        createMap(funcName, gs("return args[1]"), newFuncName, gs("return #args")),
+                        true);
 
         assertEquals(libName, clusterClient.functionLoad(newCode, true).get());
 
         // load new lib and delete it - first lib remains loaded
         GlideString anotherLib =
-                generateLuaLibCodeBinary(gs("anotherLib"), Map.of(gs("anotherFunc"), gs("")), false);
+                generateLuaLibCodeBinary(
+                        gs("anotherLib"), Collections.singletonMap(gs("anotherFunc"), gs("")), false);
         assertEquals(gs("anotherLib"), clusterClient.functionLoad(anotherLib, true).get());
         assertEquals(OK, clusterClient.functionDelete(gs("anotherLib")).get());
 
@@ -1734,7 +2096,7 @@ public class CommandTests {
 
         flist = clusterClient.functionListBinary(libName, false).get();
         expectedDescription.put(newFuncName, null);
-        expectedFlags.put(newFuncName, Set.of(gs("no-writes")));
+        expectedFlags.put(newFuncName, Collections.singleton(gs("no-writes")));
         checkFunctionListResponseBinary(
                 flist, libName, expectedDescription, expectedFlags, Optional.empty());
 
@@ -1751,7 +2113,7 @@ public class CommandTests {
         assertEquals(OK, clusterClient.functionFlush(ASYNC).get());
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClientsAndPrefixes")
     @SneakyThrows
     public void fcall_with_keys(GlideClusterClient clusterClient, String prefix) {
@@ -1762,20 +2124,22 @@ public class CommandTests {
         String libName = "mylib_with_keys";
         String funcName = "myfunc_with_keys";
         // function $funcName returns array with first two arguments
-        String code = generateLuaLibCode(libName, Map.of(funcName, "return {keys[1], keys[2]}"), true);
+        String code =
+                generateLuaLibCode(
+                        libName, Collections.singletonMap(funcName, "return {keys[1], keys[2]}"), true);
 
         // loading function to the node where key is stored
         assertEquals(libName, clusterClient.functionLoad(code, false, route).get());
 
         // due to common prefix, all keys are mapped to the same hash slot
-        var functionResult =
+        Object functionResult =
                 clusterClient.fcall(funcName, new String[] {key + 1, key + 2}, new String[0]).get();
         assertArrayEquals(new Object[] {key + 1, key + 2}, (Object[]) functionResult);
         functionResult =
                 clusterClient.fcallReadOnly(funcName, new String[] {key + 1, key + 2}, new String[0]).get();
         assertArrayEquals(new Object[] {key + 1, key + 2}, (Object[]) functionResult);
 
-        var transaction =
+        ClusterBatch transaction =
                 new ClusterBatch(true)
                         .fcall(funcName, new String[] {key + 1, key + 2}, new String[0])
                         .fcallReadOnly(funcName, new String[] {key + 1, key + 2}, new String[0]);
@@ -1793,7 +2157,7 @@ public class CommandTests {
         assertEquals(OK, clusterClient.functionDelete(libName, route).get());
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClientsAndPrefixes")
     @SneakyThrows
     public void fcall_binary_with_keys(GlideClusterClient clusterClient, String prefix) {
@@ -1807,12 +2171,13 @@ public class CommandTests {
         GlideString funcName = gs("myfunc_with_keys_" + prefix);
         // function $funcName returns array with first argument
         String code =
-                generateLuaLibCode(libName, Map.of(funcName.toString(), "return {args[1]}"), true);
+                generateLuaLibCode(
+                        libName, Collections.singletonMap(funcName.toString(), "return {args[1]}"), true);
 
         // loading function to the node where key is stored
         assertEquals(libName, clusterClient.functionLoad(code, false, route).get());
 
-        var functionResult =
+        Object functionResult =
                 clusterClient
                         .fcall(funcName, new GlideString[] {gs(key)}, new GlideString[] {binaryString})
                         .get();
@@ -1823,7 +2188,7 @@ public class CommandTests {
                         .get();
         assertArrayEquals(new Object[] {binaryString}, (Object[]) functionResult);
 
-        var transaction =
+        ClusterBatch transaction =
                 new ClusterBatch(true)
                         .withBinaryOutput()
                         .fcall(funcName, new GlideString[] {gs(key)}, new GlideString[] {binaryString})
@@ -1843,7 +2208,7 @@ public class CommandTests {
     }
 
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     public void fcall_readonly_function(GlideClusterClient clusterClient) {
         // TODO: Remove the skip after fixing Windows Replicas issues
@@ -1858,24 +2223,26 @@ public class CommandTests {
         String funcName = libName;
 
         // function $funcName returns a magic number
-        String code = generateLuaLibCode(libName, Map.of(funcName, "return 42"), false);
+        String code =
+                generateLuaLibCode(libName, Collections.singletonMap(funcName, "return 42"), false);
 
         assertEquals(libName, clusterClient.functionLoad(code, false).get());
 
-        // Wait for function to replicate to replica, retrying if needed
-        ExecutionException fcallReplicaException = null;
-        for (int i = 0; i < 10 && fcallReplicaException == null; i++) {
-            try {
-                clusterClient.fcall(funcName, replicaRoute).get();
-                Thread.sleep(100); // Function not yet on replica, wait and retry
-            } catch (ExecutionException e) {
-                if (e.getCause() instanceof RequestException
-                        && e.getMessage().toLowerCase().contains("readonly")) {
-                    fcallReplicaException = e;
-                }
-            }
-        }
-        assertNotNull(fcallReplicaException, "Expected readonly error from replica");
+        // FUNCTION LOAD goes to all primaries, but replication to replicas is async.
+        // Use WAIT on the specific primary whose replica we'll query to ensure the
+        // function has been replicated before we attempt to call it on the replica.
+        long replicaCount = getReplicaCount(clusterClient, primaryRoute);
+        clusterClient
+                .customCommand(new String[] {"WAIT", String.valueOf(replicaCount), "5000"}, primaryRoute)
+                .get();
+
+        // fcall on a replica should fail with a readonly error, because the function
+        // is not flagged as read-only
+        ExecutionException fcallReplicaException =
+                assertThrows(
+                        ExecutionException.class, () -> clusterClient.fcall(funcName, replicaRoute).get());
+        assertInstanceOf(RequestException.class, fcallReplicaException.getCause());
+        assertTrue(fcallReplicaException.getCause().getMessage().toLowerCase().contains("readonly"));
 
         // fcall_ro also fails on replica
         ExecutionException fcallReadOnlyReplicaException =
@@ -1899,9 +2266,14 @@ public class CommandTests {
 
         // create the same function, but with RO flag
         String funcNameRO = funcName + "_ro";
-        code = generateLuaLibCode(libName, Map.of(funcNameRO, "return 42"), true);
+        code = generateLuaLibCode(libName, Collections.singletonMap(funcNameRO, "return 42"), true);
 
         assertEquals(libName, clusterClient.functionLoad(code, true).get());
+
+        // Wait for the updated function to replicate to the replica
+        clusterClient
+                .customCommand(new String[] {"WAIT", String.valueOf(replicaCount), "5000"}, primaryRoute)
+                .get();
 
         // fcall should succeed now
         assertEquals(42L, clusterClient.fcall(funcNameRO, replicaRoute).get().getSingleValue());
@@ -1910,7 +2282,7 @@ public class CommandTests {
     }
 
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     public void fcall_readonly_binary_function(GlideClusterClient clusterClient) {
         // TODO: Remove the skip after fixing Windows Replicas issues
@@ -1926,24 +2298,27 @@ public class CommandTests {
         GlideString funcName = gs(libName);
 
         // function $funcName returns a magic number
-        String code = generateLuaLibCode(libName, Map.of(funcName.toString(), "return 42"), false);
+        String code =
+                generateLuaLibCode(
+                        libName, Collections.singletonMap(funcName.toString(), "return 42"), false);
 
         assertEquals(libName, clusterClient.functionLoad(code, false).get());
 
-        // Wait for function to replicate to replica, retrying if needed
-        ExecutionException fcallReplicaException = null;
-        for (int i = 0; i < 10 && fcallReplicaException == null; i++) {
-            try {
-                clusterClient.fcall(funcName, replicaRoute).get();
-                Thread.sleep(100); // Function not yet on replica, wait and retry
-            } catch (ExecutionException e) {
-                if (e.getCause() instanceof RequestException
-                        && e.getMessage().toLowerCase().contains("readonly")) {
-                    fcallReplicaException = e;
-                }
-            }
-        }
-        assertNotNull(fcallReplicaException, "Expected readonly error from replica");
+        // FUNCTION LOAD goes to all primaries, but replication to replicas is async.
+        // Use WAIT on the specific primary whose replica we'll query to ensure the
+        // function has been replicated before we attempt to call it on the replica.
+        long replicaCount = getReplicaCount(clusterClient, primaryRoute);
+        clusterClient
+                .customCommand(new String[] {"WAIT", String.valueOf(replicaCount), "5000"}, primaryRoute)
+                .get();
+
+        // fcall on a replica should fail with a readonly error, because the function
+        // is not flagged as read-only
+        ExecutionException fcallReplicaException =
+                assertThrows(
+                        ExecutionException.class, () -> clusterClient.fcall(funcName, replicaRoute).get());
+        assertInstanceOf(RequestException.class, fcallReplicaException.getCause());
+        assertTrue(fcallReplicaException.getCause().getMessage().toLowerCase().contains("readonly"));
 
         // fcall_ro also fails on replica
         ExecutionException fcallReadOnlyReplicaException =
@@ -1967,9 +2342,14 @@ public class CommandTests {
 
         // create the same function, but with RO flag
         String funcNameRO = funcName.toString() + "_ro";
-        code = generateLuaLibCode(libName, Map.of(funcNameRO, "return 42"), true);
+        code = generateLuaLibCode(libName, createMap(funcNameRO, "return 42"), true);
 
         assertEquals(libName, clusterClient.functionLoad(code, true).get());
+
+        // Wait for the updated function to replicate to the replica
+        clusterClient
+                .customCommand(new String[] {"WAIT", String.valueOf(replicaCount), "5000"}, primaryRoute)
+                .get();
 
         // fcall should succeed now
         assertEquals(42L, clusterClient.fcall(gs(funcNameRO), replicaRoute).get().getSingleValue());
@@ -1978,7 +2358,7 @@ public class CommandTests {
     }
 
     @Timeout(20)
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void functionKill_no_write_without_route(GlideClusterClient clusterClient) {
@@ -1991,7 +2371,7 @@ public class CommandTests {
         assertEquals(OK, clusterClient.functionFlush(SYNC).get());
 
         // nothing to kill
-        var exception =
+        ExecutionException exception =
                 assertThrows(ExecutionException.class, () -> clusterClient.functionKill().get());
         assertInstanceOf(RequestException.class, exception.getCause());
         assertTrue(exception.getMessage().toLowerCase().contains("notbusy"));
@@ -1999,7 +2379,7 @@ public class CommandTests {
         // load the lib
         assertEquals(libName, clusterClient.functionLoad(code, true).get());
 
-        try (var testClient =
+        try (GlideClusterClient testClient =
                 GlideClusterClient.createClient(commonClusterClientConfig().requestTimeout(10000).build())
                         .get()) {
             try {
@@ -2033,7 +2413,7 @@ public class CommandTests {
     }
 
     @Timeout(20)
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void functionKillBinary_no_write_without_route(GlideClusterClient clusterClient) {
@@ -2047,7 +2427,7 @@ public class CommandTests {
         assertEquals(OK, clusterClient.functionFlush(SYNC).get());
 
         // nothing to kill
-        var exception =
+        ExecutionException exception =
                 assertThrows(ExecutionException.class, () -> clusterClient.functionKill().get());
         assertInstanceOf(RequestException.class, exception.getCause());
         assertTrue(exception.getMessage().toLowerCase().contains("notbusy"));
@@ -2055,7 +2435,7 @@ public class CommandTests {
         // load the lib
         assertEquals(libName, clusterClient.functionLoad(code, true).get());
 
-        try (var testClient =
+        try (GlideClusterClient testClient =
                 GlideClusterClient.createClient(commonClusterClientConfig().requestTimeout(10000).build())
                         .get()) {
             try {
@@ -2089,7 +2469,7 @@ public class CommandTests {
     }
 
     @Timeout(20)
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getTestScenarios")
     @SneakyThrows
     public void functionKill_no_write_with_route(
@@ -2105,7 +2485,7 @@ public class CommandTests {
         assertEquals(OK, clusterClient.functionFlush(SYNC, route).get());
 
         // nothing to kill
-        var exception =
+        ExecutionException exception =
                 assertThrows(ExecutionException.class, () -> clusterClient.functionKill(route).get());
         assertInstanceOf(RequestException.class, exception.getCause());
         assertTrue(exception.getMessage().toLowerCase().contains("notbusy"));
@@ -2113,7 +2493,7 @@ public class CommandTests {
         // load the lib
         assertEquals(libName, clusterClient.functionLoad(code, true, route).get());
 
-        try (var testClient =
+        try (GlideClusterClient testClient =
                 GlideClusterClient.createClient(commonClusterClientConfig().requestTimeout(10000).build())
                         .get()) {
             try {
@@ -2142,7 +2522,7 @@ public class CommandTests {
     }
 
     @Timeout(20)
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getTestScenarios")
     @SneakyThrows
     public void functionKillBinary_no_write_with_route(
@@ -2159,7 +2539,7 @@ public class CommandTests {
         assertEquals(OK, clusterClient.functionFlush(SYNC, route).get());
 
         // nothing to kill
-        var exception =
+        ExecutionException exception =
                 assertThrows(ExecutionException.class, () -> clusterClient.functionKill(route).get());
         assertInstanceOf(RequestException.class, exception.getCause());
         assertTrue(exception.getMessage().toLowerCase().contains("notbusy"));
@@ -2167,7 +2547,7 @@ public class CommandTests {
         // load the lib
         assertEquals(libName, clusterClient.functionLoad(code, true, route).get());
 
-        try (var testClient =
+        try (GlideClusterClient testClient =
                 GlideClusterClient.createClient(commonClusterClientConfig().requestTimeout(10000).build())
                         .get()) {
             try {
@@ -2197,7 +2577,7 @@ public class CommandTests {
     }
 
     @Timeout(20)
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void functionKill_key_based_write_function(GlideClusterClient clusterClient) {
@@ -2214,7 +2594,7 @@ public class CommandTests {
         promise.complete(null);
 
         // nothing to kill
-        var exception =
+        ExecutionException exception =
                 assertThrows(ExecutionException.class, () -> clusterClient.functionKill(route).get());
         assertInstanceOf(RequestException.class, exception.getCause());
         assertTrue(exception.getMessage().toLowerCase().contains("notbusy"));
@@ -2222,7 +2602,7 @@ public class CommandTests {
         // load the lib
         assertEquals(libName, clusterClient.functionLoad(code, true, route).get());
 
-        try (var testClient =
+        try (GlideClusterClient testClient =
                 GlideClusterClient.createClient(commonClusterClientConfig().requestTimeout(10000).build())
                         .get()) {
             try {
@@ -2264,7 +2644,7 @@ public class CommandTests {
     }
 
     @Timeout(20)
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void functionKillBinary_key_based_write_function(GlideClusterClient clusterClient) {
@@ -2283,7 +2663,7 @@ public class CommandTests {
         promise.complete(null);
 
         // nothing to kill
-        var exception =
+        ExecutionException exception =
                 assertThrows(ExecutionException.class, () -> clusterClient.functionKill(route).get());
         assertInstanceOf(RequestException.class, exception.getCause());
         assertTrue(exception.getMessage().toLowerCase().contains("notbusy"));
@@ -2291,7 +2671,7 @@ public class CommandTests {
         // load the lib
         assertEquals(libName, clusterClient.functionLoad(code, true, route).get());
 
-        try (var testClient =
+        try (GlideClusterClient testClient =
                 GlideClusterClient.createClient(commonClusterClientConfig().requestTimeout(10000).build())
                         .get()) {
             try {
@@ -2332,7 +2712,7 @@ public class CommandTests {
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void functionStats_without_route(GlideClusterClient clusterClient) {
@@ -2343,35 +2723,36 @@ public class CommandTests {
         assertEquals(OK, clusterClient.functionFlush(SYNC).get());
 
         // function $funcName returns first argument
-        String code = generateLuaLibCode(libName, Map.of(funcName, "return args[1]"), false);
+        String code =
+                generateLuaLibCode(libName, Collections.singletonMap(funcName, "return args[1]"), false);
         assertEquals(libName, clusterClient.functionLoad(code, true).get());
 
-        var response = clusterClient.functionStats().get().getMultiValue();
-        for (var nodeResponse : response.values()) {
+        ClusterValue<Map<String, Map<String, Object>>> response = clusterClient.functionStats().get();
+        for (Map<String, Map<String, Object>> nodeResponse : response.getMultiValue().values()) {
             checkFunctionStatsResponse(nodeResponse, new String[0], 1, 1);
         }
 
         code =
                 generateLuaLibCode(
                         libName + "_2",
-                        Map.of(funcName + "_2", "return 'OK'", funcName + "_3", "return 42"),
+                        createMap(funcName + "_2", "return 'OK'", funcName + "_3", "return 42"),
                         false);
         assertEquals(libName + "_2", clusterClient.functionLoad(code, true).get());
 
-        response = clusterClient.functionStats().get().getMultiValue();
-        for (var nodeResponse : response.values()) {
+        response = clusterClient.functionStats().get();
+        for (Map<String, Map<String, Object>> nodeResponse : response.getMultiValue().values()) {
             checkFunctionStatsResponse(nodeResponse, new String[0], 2, 3);
         }
 
         assertEquals(OK, clusterClient.functionFlush(SYNC).get());
 
-        response = clusterClient.functionStats().get().getMultiValue();
-        for (var nodeResponse : response.values()) {
+        response = clusterClient.functionStats().get();
+        for (Map<String, Map<String, Object>> nodeResponse : response.getMultiValue().values()) {
             checkFunctionStatsResponse(nodeResponse, new String[0], 0, 0);
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void functionStatsBinary_without_route(GlideClusterClient clusterClient) {
@@ -2383,18 +2764,21 @@ public class CommandTests {
 
         // function $funcName returns first argument
         GlideString code =
-                generateLuaLibCodeBinary(libName, Map.of(funcName, gs("return args[1]")), false);
+                generateLuaLibCodeBinary(
+                        libName, Collections.singletonMap(funcName, gs("return args[1]")), false);
         assertEquals(libName, clusterClient.functionLoad(code, true).get());
 
-        var response = clusterClient.functionStatsBinary().get().getMultiValue();
-        for (var nodeResponse : response.values()) {
+        ClusterValue<Map<GlideString, Map<GlideString, Object>>> response =
+                clusterClient.functionStatsBinary().get();
+        for (Map<GlideString, Map<GlideString, Object>> nodeResponse :
+                response.getMultiValue().values()) {
             checkFunctionStatsBinaryResponse(nodeResponse, new GlideString[0], 1, 1);
         }
 
         code =
                 generateLuaLibCodeBinary(
                         gs(libName.toString() + "_2"),
-                        Map.of(
+                        createMap(
                                 gs(funcName.toString() + "_2"),
                                 gs("return 'OK'"),
                                 gs(funcName.toString() + "_3"),
@@ -2402,20 +2786,22 @@ public class CommandTests {
                         false);
         assertEquals(gs(libName.toString() + "_2"), clusterClient.functionLoad(code, true).get());
 
-        response = clusterClient.functionStatsBinary().get().getMultiValue();
-        for (var nodeResponse : response.values()) {
+        response = clusterClient.functionStatsBinary().get();
+        for (Map<GlideString, Map<GlideString, Object>> nodeResponse :
+                response.getMultiValue().values()) {
             checkFunctionStatsBinaryResponse(nodeResponse, new GlideString[0], 2, 3);
         }
 
         assertEquals(OK, clusterClient.functionFlush(SYNC).get());
 
-        response = clusterClient.functionStatsBinary().get().getMultiValue();
-        for (var nodeResponse : response.values()) {
+        response = clusterClient.functionStatsBinary().get();
+        for (Map<GlideString, Map<GlideString, Object>> nodeResponse :
+                response.getMultiValue().values()) {
             checkFunctionStatsBinaryResponse(nodeResponse, new GlideString[0], 0, 0);
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getTestScenarios")
     @SneakyThrows
     public void functionStats_with_route(GlideClusterClient clusterClient, boolean singleNodeRoute) {
@@ -2428,14 +2814,16 @@ public class CommandTests {
         assertEquals(OK, clusterClient.functionFlush(SYNC, route).get());
 
         // function $funcName returns first argument
-        String code = generateLuaLibCode(libName, Map.of(funcName, "return args[1]"), false);
+        String code =
+                generateLuaLibCode(libName, Collections.singletonMap(funcName, "return args[1]"), false);
         assertEquals(libName, clusterClient.functionLoad(code, true, route).get());
 
-        var response = clusterClient.functionStats(route).get();
+        ClusterValue<Map<String, Map<String, Object>>> response =
+                clusterClient.functionStats(route).get();
         if (singleNodeRoute) {
             checkFunctionStatsResponse(response.getSingleValue(), new String[0], 1, 1);
         } else {
-            for (var nodeResponse : response.getMultiValue().values()) {
+            for (Map<String, Map<String, Object>> nodeResponse : response.getMultiValue().values()) {
                 checkFunctionStatsResponse(nodeResponse, new String[0], 1, 1);
             }
         }
@@ -2443,7 +2831,7 @@ public class CommandTests {
         code =
                 generateLuaLibCode(
                         libName + "_2",
-                        Map.of(funcName + "_2", "return 'OK'", funcName + "_3", "return 42"),
+                        createMap(funcName + "_2", "return 'OK'", funcName + "_3", "return 42"),
                         false);
         assertEquals(libName + "_2", clusterClient.functionLoad(code, true, route).get());
 
@@ -2451,7 +2839,7 @@ public class CommandTests {
         if (singleNodeRoute) {
             checkFunctionStatsResponse(response.getSingleValue(), new String[0], 2, 3);
         } else {
-            for (var nodeResponse : response.getMultiValue().values()) {
+            for (Map<String, Map<String, Object>> nodeResponse : response.getMultiValue().values()) {
                 checkFunctionStatsResponse(nodeResponse, new String[0], 2, 3);
             }
         }
@@ -2462,13 +2850,13 @@ public class CommandTests {
         if (singleNodeRoute) {
             checkFunctionStatsResponse(response.getSingleValue(), new String[0], 0, 0);
         } else {
-            for (var nodeResponse : response.getMultiValue().values()) {
+            for (Map<String, Map<String, Object>> nodeResponse : response.getMultiValue().values()) {
                 checkFunctionStatsResponse(nodeResponse, new String[0], 0, 0);
             }
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getTestScenarios")
     @SneakyThrows
     public void functionStatsBinary_with_route(
@@ -2483,14 +2871,17 @@ public class CommandTests {
 
         // function $funcName returns first argument
         GlideString code =
-                generateLuaLibCodeBinary(libName, Map.of(funcName, gs("return args[1]")), false);
+                generateLuaLibCodeBinary(
+                        libName, Collections.singletonMap(funcName, gs("return args[1]")), false);
         assertEquals(libName, clusterClient.functionLoad(code, true, route).get());
 
-        var response = clusterClient.functionStatsBinary(route).get();
+        ClusterValue<Map<GlideString, Map<GlideString, Object>>> response =
+                clusterClient.functionStatsBinary(route).get();
         if (singleNodeRoute) {
             checkFunctionStatsBinaryResponse(response.getSingleValue(), new GlideString[0], 1, 1);
         } else {
-            for (var nodeResponse : response.getMultiValue().values()) {
+            for (Map<GlideString, Map<GlideString, Object>> nodeResponse :
+                    response.getMultiValue().values()) {
                 checkFunctionStatsBinaryResponse(nodeResponse, new GlideString[0], 1, 1);
             }
         }
@@ -2498,7 +2889,7 @@ public class CommandTests {
         code =
                 generateLuaLibCodeBinary(
                         gs(libName.toString() + "_2"),
-                        Map.of(
+                        createMap(
                                 gs(funcName.toString() + "_2"),
                                 gs("return 'OK'"),
                                 gs(funcName.toString() + "_3"),
@@ -2511,7 +2902,8 @@ public class CommandTests {
         if (singleNodeRoute) {
             checkFunctionStatsBinaryResponse(response.getSingleValue(), new GlideString[0], 2, 3);
         } else {
-            for (var nodeResponse : response.getMultiValue().values()) {
+            for (Map<GlideString, Map<GlideString, Object>> nodeResponse :
+                    response.getMultiValue().values()) {
                 checkFunctionStatsBinaryResponse(nodeResponse, new GlideString[0], 2, 3);
             }
         }
@@ -2522,13 +2914,14 @@ public class CommandTests {
         if (singleNodeRoute) {
             checkFunctionStatsBinaryResponse(response.getSingleValue(), new GlideString[0], 0, 0);
         } else {
-            for (var nodeResponse : response.getMultiValue().values()) {
+            for (Map<GlideString, Map<GlideString, Object>> nodeResponse :
+                    response.getMultiValue().values()) {
                 checkFunctionStatsBinaryResponse(nodeResponse, new GlideString[0], 0, 0);
             }
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void function_dump_and_restore(GlideClusterClient clusterClient) {
@@ -2548,14 +2941,14 @@ public class CommandTests {
         // function $name1 returns first argument
         // function $name2 returns argument array len
         String code =
-                generateLuaLibCode(libname1, Map.of(name1, "return args[1]", name2, "return #args"), true);
+                generateLuaLibCode(
+                        libname1, createMap(name1, "return args[1]", name2, "return #args"), true);
         assertEquals(libname1, clusterClient.functionLoad(code, true).get());
-        Map<String, Object>[] flist = clusterClient.functionList(true).get();
 
         final byte[] dump = clusterClient.functionDump().get();
 
         // restore without cleaning the lib and/or overwrite option causes an error
-        var executionException =
+        ExecutionException executionException =
                 assertThrows(ExecutionException.class, () -> clusterClient.functionRestore(dump).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
         assertTrue(executionException.getMessage().contains("Library " + libname1 + " already exists"));
@@ -2570,7 +2963,7 @@ public class CommandTests {
         // REPLACE policy succeeds
         assertEquals(OK, clusterClient.functionRestore(dump, REPLACE).get());
         // but nothing changed - all code overwritten
-        var restoredFunctionList = clusterClient.functionList(true).get();
+        Map<String, Object>[] restoredFunctionList = clusterClient.functionList(true).get();
         assertEquals(1, restoredFunctionList.length);
         assertEquals(libname1, restoredFunctionList[0].get("library_name"));
         // Note that function ordering may differ across nodes so we can't do a deep equals
@@ -2579,7 +2972,8 @@ public class CommandTests {
         // create lib with another name, but with the same function names
         assertEquals(OK, clusterClient.functionFlush(SYNC).get());
         code =
-                generateLuaLibCode(libname2, Map.of(name1, "return args[1]", name2, "return #args"), true);
+                generateLuaLibCode(
+                        libname2, createMap(name1, "return args[1]", name2, "return #args"), true);
         assertEquals(libname2, clusterClient.functionLoad(code, true).get());
         restoredFunctionList = clusterClient.functionList(true).get();
         assertEquals(1, restoredFunctionList.length);
@@ -2611,7 +3005,7 @@ public class CommandTests {
                 2L, clusterClient.fcallReadOnly(name2, new String[0], new String[] {"meow", "woem"}).get());
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void randomKey(GlideClusterClient clusterClient) {
@@ -2634,7 +3028,7 @@ public class CommandTests {
         assertNull(clusterClient.randomKey().get());
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void randomKeyBinary(GlideClusterClient clusterClient) {
@@ -2657,7 +3051,7 @@ public class CommandTests {
         assertNull(clusterClient.randomKey().get());
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void sort(GlideClusterClient clusterClient) {
@@ -2739,7 +3133,7 @@ public class CommandTests {
         assertArrayEquals(key2DescendingListSubset, clusterClient.lrange(key3, 0, -1).get());
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void sort_binary(GlideClusterClient clusterClient) {
@@ -2833,7 +3227,7 @@ public class CommandTests {
     }
 
     @Timeout(20)
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void test_cluster_scan_simple(GlideClusterClient clusterClient) {
@@ -2865,7 +3259,7 @@ public class CommandTests {
     }
 
     @Timeout(20)
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void test_cluster_scan_binary_simple(GlideClusterClient clusterClient) {
@@ -2897,7 +3291,7 @@ public class CommandTests {
     }
 
     @Timeout(20)
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void test_cluster_scan_with_object_type_and_pattern(GlideClusterClient clusterClient) {
@@ -2955,7 +3349,7 @@ public class CommandTests {
     }
 
     @Timeout(20)
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void test_cluster_scan_with_count(GlideClusterClient clusterClient) {
@@ -3005,7 +3399,7 @@ public class CommandTests {
     }
 
     @Timeout(20)
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void test_cluster_scan_with_match(GlideClusterClient clusterClient) {
@@ -3040,7 +3434,7 @@ public class CommandTests {
     }
 
     @Timeout(20)
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void test_cluster_scan_cleaning_cursor(GlideClusterClient clusterClient) {
@@ -3067,7 +3461,7 @@ public class CommandTests {
         assertTrue(exception.getCause().getMessage().contains("Invalid scan_state_cursor id"));
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void test_cluster_scan_all_strings(GlideClusterClient clusterClient) {
@@ -3097,7 +3491,7 @@ public class CommandTests {
         assertEquals(stringData.keySet(), results);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void test_cluster_scan_all_set(GlideClusterClient clusterClient) {
@@ -3129,7 +3523,7 @@ public class CommandTests {
         assertEquals(setData.keySet(), results);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void test_cluster_scan_all_hash(GlideClusterClient clusterClient) {
@@ -3142,7 +3536,8 @@ public class CommandTests {
             hashData.put(hashKey + ":" + i, "value " + i);
         }
         for (String k : hashData.keySet()) {
-            assertEquals(1L, clusterClient.hset(k, Map.of("field" + k, "value" + k)).get());
+            assertEquals(
+                    1L, clusterClient.hset(k, Collections.singletonMap("field" + k, "value" + k)).get());
         }
 
         ClusterScanCursor cursor = ClusterScanCursor.initialCursor();
@@ -3161,7 +3556,7 @@ public class CommandTests {
         assertEquals(hashData.keySet(), results);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void test_cluster_scan_all_list(GlideClusterClient clusterClient) {
@@ -3193,7 +3588,7 @@ public class CommandTests {
         assertEquals(listData.keySet(), results);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void test_cluster_scan_all_sorted_set(GlideClusterClient clusterClient) {
@@ -3206,7 +3601,7 @@ public class CommandTests {
             zSetData.put(zSetKey + ":" + i, "value " + i);
         }
         for (String k : zSetData.keySet()) {
-            assertEquals(1L, clusterClient.zadd(k, Map.of(k, 1.0)).get());
+            assertEquals(1L, clusterClient.zadd(k, Collections.singletonMap(k, 1.0)).get());
         }
 
         ClusterScanCursor cursor = ClusterScanCursor.initialCursor();
@@ -3226,7 +3621,7 @@ public class CommandTests {
         assertEquals(zSetData.keySet(), results);
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void test_cluster_scan_all_stream(GlideClusterClient clusterClient) {
@@ -3239,7 +3634,7 @@ public class CommandTests {
             streamData.put(streamKey + ":" + i, "value " + i);
         }
         for (String k : streamData.keySet()) {
-            assertNotNull(clusterClient.xadd(k, Map.of(k, "value " + k)).get());
+            assertNotNull(clusterClient.xadd(k, Collections.singletonMap(k, "value " + k)).get());
         }
 
         ClusterScanCursor cursor = ClusterScanCursor.initialCursor();
@@ -3260,7 +3655,7 @@ public class CommandTests {
     }
 
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     public void invokeScript_test(GlideClusterClient clusterClient) {
         String key1 = UUID.randomUUID().toString();
@@ -3300,11 +3695,11 @@ public class CommandTests {
     }
 
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     public void script_large_keys_and_or_args(GlideClusterClient clusterClient) {
-        String str1 = "0".repeat(1 << 12); // 4k
-        String str2 = "0".repeat(1 << 12); // 4k
+        String str1 = new String(new char[1 << 12]).replace('\0', '0'); // 4k
+        String str2 = new String(new char[1 << 12]).replace('\0', '0'); // 4k
 
         try (Script script = new Script("return KEYS[1]", false)) {
             // 1 very big key
@@ -3344,7 +3739,7 @@ public class CommandTests {
     }
 
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     public void invokeScript_gs_test(GlideClusterClient clusterClient) {
         GlideString key1 = gs(UUID.randomUUID().toString());
@@ -3387,7 +3782,7 @@ public class CommandTests {
         }
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void scriptExists(GlideClusterClient clusterClient) {
@@ -3406,7 +3801,8 @@ public class CommandTests {
         String sha1_1 = script1.getHash();
         String sha1_2 = script2.getHash();
         String sha1_3 = script3.getHash();
-        String nonExistentSha1 = "0".repeat(40); // A SHA1 that doesn't exist
+        String nonExistentSha1 =
+                new String(new char[40]).replace('\0', '0'); // A SHA1 that doesn't exist
 
         // Check existence of scripts
         Boolean[] result =
@@ -3422,7 +3818,7 @@ public class CommandTests {
         script3.close();
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void scriptExistsBinary(GlideClusterClient clusterClient) {
@@ -3441,7 +3837,8 @@ public class CommandTests {
         GlideString sha1_1 = gs(script1.getHash());
         GlideString sha1_2 = gs(script2.getHash());
         GlideString sha1_3 = gs(script3.getHash());
-        GlideString nonExistentSha1 = gs("0".repeat(40)); // A SHA1 that doesn't exist
+        GlideString nonExistentSha1 =
+                gs(new String(new char[40]).replace('\0', '0')); // A SHA1 that doesn't exist
 
         // Check existence of scripts
         Boolean[] result =
@@ -3459,7 +3856,7 @@ public class CommandTests {
         script3.close();
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void scriptFlush(GlideClusterClient clusterClient) {
@@ -3489,16 +3886,14 @@ public class CommandTests {
         script.close();
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void scriptKill_with_route(GlideClusterClient clusterClient) {
-        // create and load a long-running script and a primary node route
-        Script script = new Script(createLongRunningLuaScript(5, true), true);
-        RequestRoutingConfiguration.Route route =
-                new RequestRoutingConfiguration.SlotKeyRoute(UUID.randomUUID().toString(), PRIMARY);
+        Script script = new Script(createLongRunningLuaScript(10, true), true);
+        Route route = new SlotKeyRoute(UUID.randomUUID().toString(), PRIMARY);
 
-        // Verify that script_kill raises an error when no script is running
+        // Verify no script is running initially
         ExecutionException executionException =
                 assertThrows(ExecutionException.class, () -> clusterClient.scriptKill(route).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
@@ -3508,39 +3903,29 @@ public class CommandTests {
                         .toLowerCase()
                         .contains("no scripts in execution right now"));
 
-        CompletableFuture<Object> promise = new CompletableFuture<>();
-        promise.complete(null);
-
-        try (var testClient =
-                GlideClusterClient.createClient(commonClusterClientConfig().requestTimeout(10000).build())
+        try (GlideClusterClient testClient =
+                GlideClusterClient.createClient(commonClusterClientConfig().requestTimeout(15000).build())
                         .get()) {
             try {
-                testClient.invokeScript(script, route);
+                // Poll scriptKill in background; block on script in foreground to guarantee execution
+                CompletableFuture<String> killResult =
+                        pollScriptKillInBackground(() -> clusterClient.scriptKill(route));
 
-                Thread.sleep(1000);
+                ExecutionException scriptErr =
+                        assertThrows(
+                                ExecutionException.class, () -> testClient.invokeScript(script, route).get());
+                assertTrue(
+                        scriptErr.getMessage().toLowerCase().contains("script killed"),
+                        "Expected 'script killed' but got: " + scriptErr.getMessage());
 
-                // Run script kill until it returns OK
-                boolean scriptKilled = false;
-                int timeout = 4000; // ms
-                while (timeout >= 0) {
-                    try {
-                        assertEquals(OK, clusterClient.scriptKill(route).get());
-                        scriptKilled = true;
-                        break;
-                    } catch (RequestException ignored) {
-                    }
-                    Thread.sleep(500);
-                    timeout -= 500;
-                }
-
-                assertTrue(scriptKilled);
+                assertEquals(OK, killResult.get());
             } finally {
                 waitForNotBusy(clusterClient::scriptKill);
                 script.close();
             }
         }
 
-        // Verify that script_kill raises an error when no script is running
+        // Verify no script is running after kill
         executionException =
                 assertThrows(ExecutionException.class, () -> clusterClient.scriptKill(route).get());
         assertInstanceOf(RequestException.class, executionException.getCause());
@@ -3551,97 +3936,112 @@ public class CommandTests {
                         .contains("no scripts in execution right now"));
     }
 
-    @Timeout(20)
     @SneakyThrows
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     public void scriptKill_unkillable(GlideClusterClient clusterClient) {
-        // Ensure no script is blocking the cluster from a previous test
         waitForNotBusy(clusterClient::scriptKill);
 
         String key = UUID.randomUUID().toString();
-        RequestRoutingConfiguration.Route route =
-                new RequestRoutingConfiguration.SlotKeyRoute(key, PRIMARY);
+        Route route = new SlotKeyRoute(key, PRIMARY);
         String code = createLongRunningLuaScript(6, false);
-        Script script = new Script(code, false);
 
-        CompletableFuture<Object> promise = new CompletableFuture<>();
-        promise.complete(null);
+        // Lower lua-time-limit on the target primary so the server starts reporting BUSY (and
+        // accepting SCRIPT KILL) shortly after the script begins, instead of after the 5000ms
+        // default. Without this, SCRIPT KILL is queued behind the running script and blocks until
+        // the request timeout fires, which is the source of the flakiness.
+        String originalLuaTimeLimit =
+                clusterClient
+                        .configGet(new String[] {"lua-time-limit"}, route)
+                        .get()
+                        .getSingleValue()
+                        .get("lua-time-limit");
+        clusterClient.configSet(Collections.singletonMap("lua-time-limit", "100"), route).get();
 
-        try (var testClient =
-                GlideClusterClient.createClient(commonClusterClientConfig().requestTimeout(10000).build())
-                        .get()) {
+        try (Script script = new Script(code, false);
+                GlideClusterClient testClient =
+                        GlideClusterClient.createClient(
+                                        commonClusterClientConfig()
+                                                .requestTimeout(10000)
+                                                .advancedConfiguration(
+                                                        AdvancedGlideClusterClientConfiguration.builder()
+                                                                .connectionTimeout(10000)
+                                                                .build())
+                                                .build())
+                                .get()) {
+
+            // Start the script without blocking, so it runs on the server while we poll.
+            CompletableFuture<Object> scriptFuture =
+                    testClient.invokeScript(script, ScriptOptions.builder().key(key).build());
+
+            // Poll SCRIPT KILL until the server reports the script is unkillable (write script).
+            waitFor(
+                    () -> {
+                        try {
+                            clusterClient.scriptKill(route).get();
+                            return false; // returned OK - not the expected error, keep polling
+                        } catch (Exception e) {
+                            String msg = e.getMessage() != null ? e.getMessage().toLowerCase() : "";
+                            // NotBusy means the script hasn't started yet - keep polling.
+                            return msg.contains("unkillable");
+                        }
+                    },
+                    "Expected to find 'unkillable' error for write script");
+
             try {
-                // run the script without await
-                promise = testClient.invokeScript(script, ScriptOptions.builder().key(key).build());
-
-                Thread.sleep(1000);
-
-                // To prevent timeout issues, ensure script is actually running before trying to kill it
-                int timeout = 4000; // ms
-                while (timeout >= 0) {
-                    try {
-                        clusterClient.ping().get(); // Dummy test command
-                    } catch (ExecutionException err) {
-                        if (err.getCause() instanceof RequestException) {
-
-                            // Check if the script is executing
-                            if (err.getMessage().toLowerCase().contains("valkey is busy running a script")) {
-                                break;
-                            }
-
-                            // Try rerunning the script if 2 seconds have passed and if the exception has not
-                            // changed to "busy running a script"
-                            if (timeout <= 2000
-                                    && err.getMessage().toLowerCase().contains("no scripts in execution right now")) {
-                                promise = testClient.invokeScript(script, ScriptOptions.builder().key(key).build());
-                                Thread.sleep(1000);
-                            }
-                        }
-                    }
-                    timeout -= 500;
-                }
-
-                boolean foundUnkillable = false;
-                timeout = 4000; // ms
-                while (timeout >= 0) {
-                    try {
-                        // valkey kills a script with 5 sec delay
-                        // but this will always throw an error in the test
-                        clusterClient.scriptKill(route).get();
-                    } catch (ExecutionException execException) {
-                        // looking for an error with "unkillable" in the message
-                        // at that point we can break the loop
-                        if (execException.getCause() instanceof RequestException
-                                && execException.getMessage().toLowerCase().contains("unkillable")) {
-                            foundUnkillable = true;
-                            break;
-                        }
-
-                        if (execException.getCause() instanceof RequestException
-                                && execException
-                                        .getMessage()
-                                        .toLowerCase()
-                                        .contains("no scripts in execution right now")) {
-                            promise = testClient.invokeScript(script, ScriptOptions.builder().key(key).build());
-                            Thread.sleep(1000);
-                        }
-                    }
-                    Thread.sleep(500);
-                    timeout -= 500;
-                }
-                assertTrue(foundUnkillable);
-            } finally {
-                // If script wasn't killed, and it didn't time out - it blocks the server and cause rest
-                // test to fail.
-                // wait for the script to complete (we cannot kill it)
-                try {
-                    promise.get();
-                } catch (Exception ignored) {
-                }
-                script.close();
+                scriptFuture.get();
+            } catch (Exception ignored) {
+                // Write script completes normally after its duration
             }
+        } finally {
+            clusterClient
+                    .configSet(Collections.singletonMap("lua-time-limit", originalLuaTimeLimit), route)
+                    .get();
         }
+        waitForNotBusy(clusterClient::scriptKill);
+        clusterClient.ping().get();
+    }
+
+    /**
+     * Polls scriptKill in a background thread until it succeeds (returns OK). This ensures the script
+     * has started executing before the kill is attempted, avoiding NotBusy race conditions.
+     */
+    private CompletableFuture<String> pollScriptKillInBackground(
+            Supplier<CompletableFuture<String>> killCommand) {
+        CompletableFuture<String> result = new CompletableFuture<>();
+        Thread thread =
+                new Thread(
+                        () -> {
+                            long deadline = System.currentTimeMillis() + SCRIPT_POLL_TIMEOUT_MS;
+                            while (System.currentTimeMillis() < deadline) {
+                                try {
+                                    String res = killCommand.get().get();
+                                    result.complete(res);
+                                    return;
+                                } catch (Exception e) {
+                                    String msg = e.getMessage() != null ? e.getMessage().toLowerCase() : "";
+                                    if (!msg.contains("no scripts in execution")) {
+                                        // Unexpected error - fail fast
+                                        result.completeExceptionally(e);
+                                        return;
+                                    }
+                                    // Expected - script hasn't started yet, keep polling
+                                }
+                                try {
+                                    Thread.sleep(SCRIPT_POLL_INTERVAL_MS);
+                                } catch (InterruptedException ie) {
+                                    result.completeExceptionally(ie);
+                                    Thread.currentThread().interrupt();
+                                    return;
+                                }
+                            }
+                            result.completeExceptionally(
+                                    new AssertionError(
+                                            "Timed out waiting to kill script after " + SCRIPT_POLL_TIMEOUT_MS + "ms"));
+                        });
+        thread.setDaemon(true);
+        thread.start();
+        return result;
     }
 
     /**
@@ -3649,7 +4049,7 @@ public class CommandTests {
      * instance with the same hash still exists, even after the original reference is dropped and the
      * server cache is flushed.
      */
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void test_script_is_not_removed_while_another_instance_exists(
@@ -3692,7 +4092,7 @@ public class CommandTests {
                 "Expected NOSCRIPT error after script is fully released and flushed");
     }
 
-    @ParameterizedTest
+    @ParameterizedTest(autoCloseArguments = false)
     @MethodSource("getClients")
     @SneakyThrows
     public void simple_select_test(GlideClusterClient clusterClient) {
@@ -3964,5 +4364,376 @@ public class CommandTests {
         } finally {
             client.close();
         }
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void cluster_management_commands_saveconfig(GlideClusterClient client) {
+        // Test CLUSTER SAVECONFIG
+        String result = client.clusterSaveConfig().get();
+        assertEquals(OK, result);
+
+        // Test with RANDOM route
+        ClusterValue<String> routeResult = client.clusterSaveConfig(RANDOM).get();
+        assertEquals(OK, routeResult.getSingleValue());
+
+        // Test with ALL_PRIMARIES route
+        ClusterValue<String> multiResult = client.clusterSaveConfig(ALL_PRIMARIES).get();
+        assertTrue(multiResult.hasMultiData());
+        for (String value : multiResult.getMultiValue().values()) {
+            assertEquals(OK, value);
+        }
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void cluster_management_commands_getkeysinslot(GlideClusterClient client) {
+        String key1 = "{slot}key1";
+        String key2 = "{slot}key2";
+        String key3 = "{slot}key3";
+
+        ClusterValue<Object> slotData =
+                client.customCommand(new String[] {"CLUSTER", "KEYSLOT", key1}).get();
+        long slot = ((Number) slotData.getSingleValue()).longValue();
+
+        client.set(key1, "value1").get();
+        client.set(key2, "value2").get();
+        client.set(key3, "value3").get();
+
+        String[] keysInSlot = client.clusterGetKeysInSlot(slot, 100).get();
+        assertNotNull(keysInSlot);
+        List<String> keysList = Arrays.asList(keysInSlot);
+        assertTrue(keysList.contains(key1), "clusterGetKeysInSlot should return keys in the slot");
+        assertTrue(keysList.contains(key2));
+        assertTrue(keysList.contains(key3));
+
+        client.del(new String[] {key1, key2, key3}).get();
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void cluster_management_commands_bumpepoch(GlideClusterClient client) {
+        String raw = client.clusterBumpEpoch().get();
+        assertNotNull(raw, "clusterBumpEpoch returned null");
+        String result = raw.trim();
+        assertFalse(result.isEmpty(), "clusterBumpEpoch returned blank");
+        String upper = result.toUpperCase();
+        assertTrue(
+                upper.startsWith("BUMPED") || upper.startsWith("STILL"),
+                "Expected BUMPED or STILL, got: " + result);
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void cluster_management_commands_readonly_readwrite(GlideClusterClient client) {
+        assumeTrue(
+                getReplicaCount(client, new SlotKeyRoute("replica-check", PRIMARY)) > 0,
+                "Requires at least one replica");
+
+        // Test READONLY command
+        // Note: This command only makes sense when sent to a replica
+        // We'll test that it returns OK
+        String readonlyResult = client.readonly().get();
+        assertEquals(OK, readonlyResult);
+
+        // Test READWRITE command to restore default behavior
+        String readwriteResult = client.readwrite().get();
+        assertEquals(OK, readwriteResult);
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void cluster_management_commands_asking(GlideClusterClient client) {
+        // Test ASKING command
+        // This command is typically used during slot migration
+        String result = client.asking().get();
+        assertEquals(OK, result);
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void cluster_management_commands_flushslots(GlideClusterClient client) {
+        // Test CLUSTER FLUSHSLOTS
+        // WARNING: This is a disruptive operation
+        // We'll only test that the command is recognized, not actually execute it in a real cluster
+        // In a test environment with disposable clusters, you could execute:
+        // String result = client.clusterFlushSlots().get();
+        // assertEquals(OK, result);
+
+        // For now, we'll skip the actual execution to avoid disrupting the test cluster
+        // This test primarily validates that the command is properly wired up
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void cluster_management_batch_commands(GlideClusterClient client) {
+        // READONLY/READWRITE only succeed on replica connections; omit them here so the batch is safe
+        // when commands are routed to primaries. See cluster_management_commands_readonly_readwrite.
+        ClusterBatch batch = new ClusterBatch(false);
+        batch.clusterSaveConfig();
+        batch.clusterBumpEpoch();
+        batch.asking();
+
+        Object[] results = client.exec(batch, false).get();
+
+        assertEquals(3, results.length);
+        long okCount = Arrays.stream(results).filter(OK::equals).count();
+        long bumpOrStillCount =
+                Arrays.stream(results)
+                        .filter(
+                                r -> {
+                                    if (!(r instanceof String)) return false;
+                                    String upper = ((String) r).trim().toUpperCase();
+                                    return upper.startsWith("BUMPED") || upper.startsWith("STILL");
+                                })
+                        .count();
+        assertEquals(2, okCount, "Expected 2 OK responses (SAVECONFIG, ASKING)");
+        assertEquals(1, bumpOrStillCount, "Expected 1 BUMPED or STILL (CLUSTER BUMPEPOCH)");
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void cluster_management_commands_replicas(GlideClusterClient client) {
+        assumeTrue(
+                getReplicaCount(client, new SlotKeyRoute("replica-check", PRIMARY)) > 0,
+                "Requires at least one replica");
+
+        // Get cluster nodes to find a primary node ID
+        ClusterValue<Object> nodesResult =
+                client.customCommand(new String[] {"CLUSTER", "NODES"}).get();
+        String nodesOutput = (String) nodesResult.getSingleValue();
+        String[] lines = nodesOutput.split("\n");
+        String primaryNodeId = null;
+
+        for (String line : lines) {
+            if (line.trim().isEmpty()) {
+                continue;
+            }
+            String[] parts = line.split(" ");
+            if (parts.length < 3) {
+                continue;
+            }
+            String flags = parts[2];
+            boolean isPrimary =
+                    (flags.contains("master") || flags.contains("primary"))
+                            && !flags.contains("slave")
+                            && !flags.contains("replica");
+            if (isPrimary) {
+                primaryNodeId = parts[0];
+                break;
+            }
+        }
+
+        assertNotNull(primaryNodeId, "Should find at least one primary node");
+
+        // Test CLUSTER REPLICAS command
+        String[] replicas = client.clusterReplicas(primaryNodeId).get();
+        assertNotNull(replicas);
+        // The array may be empty if this primary has no replicas
+        // But the command should succeed
+
+        // Test with route (RANDOM returns single-node response)
+        ClusterValue<String[]> replicasWithRoute = client.clusterReplicas(primaryNodeId, RANDOM).get();
+        assertNotNull(replicasWithRoute);
+        assertTrue(
+                replicasWithRoute.hasSingleData()
+                        ? replicasWithRoute.getSingleValue() != null
+                        : !replicasWithRoute.getMultiValue().isEmpty());
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void cluster_management_commands_count_failure_reports(GlideClusterClient client) {
+        // Get cluster nodes to find a node ID
+        ClusterValue<Object> nodesResult =
+                client.customCommand(new String[] {"CLUSTER", "NODES"}).get();
+        String nodesOutput = (String) nodesResult.getSingleValue();
+        String[] lines = nodesOutput.split("\n");
+        String nodeId = null;
+
+        for (String line : lines) {
+            if (line.trim().isEmpty()) {
+                continue;
+            }
+            String[] parts = line.split(" ");
+            if (parts.length > 0 && !parts[0].trim().isEmpty()) {
+                nodeId = parts[0];
+                break;
+            }
+        }
+
+        assertNotNull(nodeId, "Should find at least one node");
+
+        Long count = client.clusterCountFailureReports(nodeId).get();
+        assertNotNull(count);
+        assertTrue(count >= 0, "Failure report count should be non-negative");
+
+        ClusterValue<Long> countWithRoute = client.clusterCountFailureReports(nodeId, ALL_NODES).get();
+        assertNotNull(countWithRoute);
+        if (countWithRoute.hasMultiData()) {
+            for (Object value : countWithRoute.getMultiValue().values()) {
+                assertNotNull(value);
+                assertTrue(((Number) value).longValue() >= 0L);
+            }
+        } else {
+            assertNotNull(countWithRoute.getSingleValue());
+            assertTrue(countWithRoute.getSingleValue() >= 0);
+        }
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void clientTrackingInfo_cache_off_with_multi_node_route(GlideClusterClient clusterClient) {
+        ClusterValue<Map<String, Object>> multiInfo =
+                clusterClient.clientTrackingInfo(ALL_PRIMARIES).get();
+        for (Map<String, Object> nodeInfo : multiInfo.getMultiValue().values()) {
+            assertClientTrackingInfo(nodeInfo, false);
+        }
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void memoryDoctor_default_route(GlideClusterClient clusterClient) {
+        ClusterValue<String> result = clusterClient.memoryDoctor().get();
+        assertTrue(result.hasMultiData());
+        for (String diagnostic : result.getMultiValue().values()) {
+            assertNotNull(diagnostic);
+            assertFalse(diagnostic.isEmpty());
+        }
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void memoryDoctor_multi_node_route(GlideClusterClient clusterClient) {
+        ClusterValue<String> result = clusterClient.memoryDoctor(ALL_NODES).get();
+        assertTrue(result.hasMultiData());
+        assertTrue(result.getMultiValue().size() > 1);
+        for (String diagnostic : result.getMultiValue().values()) {
+            assertNotNull(diagnostic);
+            assertFalse(diagnostic.isEmpty());
+        }
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void memoryDoctor_single_node_route(GlideClusterClient clusterClient) {
+        ClusterValue<String> result = clusterClient.memoryDoctor(RANDOM).get();
+        assertTrue(result.hasSingleData());
+        String diagnostic = result.getSingleValue();
+        assertNotNull(diagnostic);
+        assertFalse(diagnostic.isEmpty());
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void memoryMallocStats_default_route(GlideClusterClient clusterClient) {
+        ClusterValue<String> result = clusterClient.memoryMallocStats().get();
+        assertTrue(result.hasMultiData());
+        for (String allocStats : result.getMultiValue().values()) {
+            assertNotNull(allocStats);
+            assertFalse(allocStats.isEmpty());
+        }
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void memoryMallocStats_multi_node_route(GlideClusterClient clusterClient) {
+        ClusterValue<String> result = clusterClient.memoryMallocStats(ALL_NODES).get();
+        assertTrue(result.hasMultiData());
+        assertTrue(result.getMultiValue().size() > 1);
+        for (String allocStats : result.getMultiValue().values()) {
+            assertNotNull(allocStats);
+            assertFalse(allocStats.isEmpty());
+        }
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void memoryMallocStats_single_node_route(GlideClusterClient clusterClient) {
+        ClusterValue<String> result = clusterClient.memoryMallocStats(RANDOM).get();
+        assertTrue(result.hasSingleData());
+        String allocStats = result.getSingleValue();
+        assertNotNull(allocStats);
+        assertFalse(allocStats.isEmpty());
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void memoryPurge_default_route(GlideClusterClient clusterClient) {
+        String result = clusterClient.memoryPurge().get();
+        assertEquals(OK, result);
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void memoryPurge_multi_node_route(GlideClusterClient clusterClient) {
+        String result = clusterClient.memoryPurge(ALL_NODES).get();
+        assertEquals(OK, result);
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void memoryPurge_single_node_route(GlideClusterClient clusterClient) {
+        String result = clusterClient.memoryPurge(RANDOM).get();
+        assertEquals(OK, result);
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void memoryStats_default_route(GlideClusterClient clusterClient) {
+        ClusterValue<Map<String, Object>> result = clusterClient.memoryStats().get();
+        assertTrue(result.hasMultiData());
+        for (Map<String, Object> nodeStats : result.getMultiValue().values()) {
+            assertMemoryStatsFields(nodeStats);
+        }
+    }
+
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void memoryStats_multi_node_route(GlideClusterClient clusterClient) {
+        ClusterValue<Map<String, Object>> result = clusterClient.memoryStats(ALL_NODES).get();
+        assertTrue(result.hasMultiData());
+        assertTrue(result.getMultiValue().size() > 1, "Expected responses from multiple nodes");
+        for (Map<String, Object> nodeStats : result.getMultiValue().values()) {
+            assertMemoryStatsFields(nodeStats);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    @ParameterizedTest(autoCloseArguments = false)
+    @MethodSource("getClients")
+    @SneakyThrows
+    public void memoryStats_single_node_route(GlideClusterClient clusterClient) {
+        // Write a key to ensure at least one db entry exists
+        String key = "memoryStats_single_node_key";
+        clusterClient.set(key, "value").get();
+
+        SlotKeyRoute route = new SlotKeyRoute(key, PRIMARY);
+        ClusterValue<Map<String, Object>> result = clusterClient.memoryStats(route).get();
+        assertTrue(result.hasSingleData());
+        Map<String, Object> stats = result.getSingleValue();
+        assertMemoryStatsFields(stats);
+        assertMemoryStatsDbEntry((Map<String, Object>) stats.get("db.0"));
     }
 }

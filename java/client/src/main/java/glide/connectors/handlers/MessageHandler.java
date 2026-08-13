@@ -212,7 +212,7 @@ public class MessageHandler {
                     firstMessagePromiseRequested = true;
                     return firstMessagePromise;
                 }
-                var future = new CompletableFuture<PubSubMessage>();
+                CompletableFuture<PubSubMessage> future = new CompletableFuture<>();
                 future.complete(message);
                 return future;
             }
@@ -221,6 +221,11 @@ public class MessageHandler {
         /** Get a new message or null if nothing stored so far. */
         public PubSubMessage popSync() {
             return messageQueue.poll();
+        }
+
+        /** Return the number of messages currently buffered in the queue. */
+        public int size() {
+            return messageQueue.size();
         }
     }
 }

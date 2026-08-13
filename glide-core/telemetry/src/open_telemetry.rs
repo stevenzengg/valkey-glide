@@ -1,17 +1,22 @@
 use crate::Telemetry;
 use logger_core::log_warn;
 use once_cell::sync::OnceCell;
-use opentelemetry::global::ObjectSafeSpan;
-use opentelemetry::trace::{SpanKind, TraceContextExt, TraceError};
+use opentelemetry::trace::{
+    Span, SpanContext, SpanId, SpanKind, TraceContextExt, TraceFlags, TraceId, TraceState,
+};
 use opentelemetry::{global, trace::Tracer};
 use opentelemetry_otlp::{MetricExporter, Protocol, WithExportConfig};
-use opentelemetry_sdk::export::trace::SpanExporter;
-use opentelemetry_sdk::metrics::{MetricError, SdkMeterProvider};
+use opentelemetry_sdk::error::OTelSdkError;
+use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::runtime::Tokio;
-use opentelemetry_sdk::trace::{BatchConfig, BatchSpanProcessor, TracerProvider};
+use opentelemetry_sdk::trace::{
+    BatchConfig, BatchSpanProcessor, SdkTracerProvider, SpanExporter,
+    span_processor_with_async_runtime::BatchSpanProcessor as AsyncBatchSpanProcessor,
+};
 use std::io::{Error, ErrorKind};
 use std::path::PathBuf;
+use std::str::FromStr;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -33,11 +38,14 @@ const SUBSCRIPTION_LAST_SYNC_TIMESTAMP_METRIC: &str = "glide.subscription_last_s
 /// Custom error type for OpenTelemetry errors in Glide
 #[derive(Debug, Error)]
 pub enum GlideOTELError {
-    #[error("Glide OpenTelemetry trace error: {0}")]
-    TraceError(#[from] TraceError),
+    #[error("Glide OpenTelemetry exporter build error: {0}")]
+    ExporterBuildError(#[from] opentelemetry_otlp::ExporterBuildError),
 
-    #[error("Glide OpenTelemetry metric error: {0}")]
-    MetricError(#[from] MetricError),
+    #[error("Glide OpenTelemetry SDK error: {0}")]
+    SdkError(#[from] OTelSdkError),
+
+    #[error("Glide OpenTelemetry trace error: {0}")]
+    TraceError(String),
 
     #[error("Glide OpenTelemetry error: Failed to acquire read lock")]
     ReadLockError,
@@ -215,16 +223,65 @@ impl GlideSpanInner {
     }
 
     /// Create new span as a child of `parent`, returning an error if the parent span lock is poisoned.
-    pub fn new_with_parent(name: &str, parent: &GlideSpanInner) -> Result<Self, TraceError> {
+    pub fn new_with_parent(name: &str, parent: &GlideSpanInner) -> Result<Self, GlideOTELError> {
         let parent_span_ctx = parent
             .span
             .read()
-            .map_err(|_| TraceError::from(SPAN_READ_LOCK_ERR))?
+            .map_err(|_| GlideOTELError::TraceError(SPAN_READ_LOCK_ERR.to_string()))?
             .span_context()
             .clone();
 
         let parent_context =
             opentelemetry::Context::new().with_remote_span_context(parent_span_ctx);
+
+        let tracer = global::tracer(TRACE_SCOPE);
+        let span = Arc::new(RwLock::new(
+            tracer
+                .span_builder(name.to_string())
+                .with_kind(SpanKind::Client)
+                .start_with_context(&tracer, &parent_context),
+        ));
+        Ok(GlideSpanInner {
+            span,
+            #[cfg(test)]
+            reference_count: Arc::new(AtomicUsize::new(1)),
+        })
+    }
+
+    /// Create a new span as a child of a remote span context identified by raw hex IDs.
+    ///
+    /// This is used for cross-process context propagation, e.g. when a Node.js OTel SDK
+    /// passes its active span context to the Rust core.
+    pub fn new_with_remote_context(
+        name: &str,
+        trace_id_hex: &str,
+        span_id_hex: &str,
+        trace_flags: u8,
+        trace_state: Option<&str>,
+    ) -> Result<Self, GlideOTELError> {
+        let trace_id = TraceId::from_hex(trace_id_hex).map_err(|_| {
+            GlideOTELError::TraceError(format!("Invalid trace_id hex: {trace_id_hex}"))
+        })?;
+        let span_id = SpanId::from_hex(span_id_hex).map_err(|_| {
+            GlideOTELError::TraceError(format!("Invalid span_id hex: {span_id_hex}"))
+        })?;
+
+        let trace_state = match trace_state {
+            Some(s) => TraceState::from_str(s)
+                .map_err(|_| GlideOTELError::TraceError(format!("Invalid trace_state: {s}")))?,
+            None => TraceState::default(),
+        };
+
+        let remote_span_context = SpanContext::new(
+            trace_id,
+            span_id,
+            TraceFlags::new(trace_flags),
+            true, // is_remote
+            trace_state,
+        );
+
+        let parent_context =
+            opentelemetry::Context::new().with_remote_span_context(remote_span_context);
 
         let tracer = global::tracer(TRACE_SCOPE);
         let span = Arc::new(RwLock::new(
@@ -253,11 +310,7 @@ impl GlideSpanInner {
         self.span
             .write()
             .expect(SPAN_WRITE_LOCK_ERR)
-            .add_event_with_timestamp(
-                name.to_string().into(),
-                std::time::SystemTime::now(),
-                attributes,
-            );
+            .add_event_with_timestamp(name.to_string(), std::time::SystemTime::now(), attributes);
     }
 
     pub fn set_status(&self, status: GlideSpanStatus) {
@@ -277,15 +330,31 @@ impl GlideSpanInner {
         }
     }
 
+    /// Set a string attribute on this span.
+    pub fn set_attribute(&self, key: &str, value: impl Into<opentelemetry::Value>) {
+        self.span
+            .write()
+            .expect(SPAN_WRITE_LOCK_ERR)
+            .set_attribute(opentelemetry::KeyValue::new(key.to_string(), value.into()));
+    }
+
+    /// Set an integer attribute on this span.
+    pub fn set_attribute_i64(&self, key: &str, value: i64) {
+        self.span
+            .write()
+            .expect(SPAN_WRITE_LOCK_ERR)
+            .set_attribute(opentelemetry::KeyValue::new(key.to_string(), value));
+    }
+
     /// Create new span, add it as a child to this span and return it.
     /// Returns an error if the child span creation fails.
-    pub fn add_span(&self, name: &str) -> Result<GlideSpanInner, TraceError> {
+    pub fn add_span(&self, name: &str) -> Result<GlideSpanInner, GlideOTELError> {
         let child = GlideSpanInner::new_with_parent(name, self)?;
         {
             let child_span = child
                 .span
                 .read()
-                .map_err(|_| TraceError::from(SPAN_READ_LOCK_ERR))?;
+                .map_err(|_| GlideOTELError::TraceError(SPAN_READ_LOCK_ERR.to_string()))?;
             self.span
                 .write()
                 .expect(SPAN_WRITE_LOCK_ERR)
@@ -350,6 +419,25 @@ impl GlideSpan {
         }
     }
 
+    /// Create a new span as a child of a remote span context identified by raw hex IDs.
+    pub fn new_with_remote_context(
+        name: &str,
+        trace_id_hex: &str,
+        span_id_hex: &str,
+        trace_flags: u8,
+        trace_state: Option<&str>,
+    ) -> Result<Self, GlideOTELError> {
+        Ok(GlideSpan {
+            inner: GlideSpanInner::new_with_remote_context(
+                name,
+                trace_id_hex,
+                span_id_hex,
+                trace_flags,
+                trace_state,
+            )?,
+        })
+    }
+
     /// Attach event with name to this span.
     pub fn add_event(&self, name: &str) {
         self.inner.add_event(name, None)
@@ -364,10 +452,20 @@ impl GlideSpan {
         self.inner.set_status(status)
     }
 
+    /// Set a string attribute on this span.
+    pub fn set_attribute(&self, key: &str, value: impl Into<opentelemetry::Value>) {
+        self.inner.set_attribute(key, value)
+    }
+
+    /// Set an integer attribute on this span.
+    pub fn set_attribute_i64(&self, key: &str, value: i64) {
+        self.inner.set_attribute_i64(key, value)
+    }
+
     /// Add child span to this span and return it
-    pub fn add_span(&self, name: &str) -> Result<GlideSpan, opentelemetry::trace::TraceError> {
+    pub fn add_span(&self, name: &str) -> Result<GlideSpan, GlideOTELError> {
         let inner_span = self.inner.add_span(name).map_err(|err| {
-            TraceError::from(format!("Failed to create child span '{}': {}", name, err))
+            GlideOTELError::TraceError(format!("Failed to create child span '{}': {}", name, err))
         })?;
 
         Ok(GlideSpan { inner: inner_span })
@@ -496,11 +594,27 @@ impl GlideOpenTelemetryConfigBuilder {
     }
 }
 
-fn build_span_exporter(
+/// Build a dedicated-thread batch span processor. Used for the file exporter,
+/// whose `export` performs only synchronous IO and is therefore safe under the
+/// processor's internal `block_on`.
+fn build_file_span_processor(
     batch_config: BatchConfig,
     exporter: impl SpanExporter + 'static,
-) -> BatchSpanProcessor<Tokio> {
-    BatchSpanProcessor::builder(exporter, Tokio)
+) -> BatchSpanProcessor {
+    BatchSpanProcessor::builder(exporter)
+        .with_batch_config(batch_config)
+        .build()
+}
+
+/// Build a Tokio async-runtime batch span processor. Required for the OTLP
+/// exporters, which use an async HTTP client (`reqwest-client`) / tonic and need
+/// a running Tokio reactor to export. The dedicated-thread processor cannot
+/// drive these async transports.
+fn build_otlp_span_processor(
+    batch_config: BatchConfig,
+    exporter: impl SpanExporter + 'static,
+) -> AsyncBatchSpanProcessor<Tokio> {
+    AsyncBatchSpanProcessor::builder(exporter, Tokio)
         .with_batch_config(batch_config)
         .build()
 }
@@ -514,6 +628,15 @@ static MOVED_COUNTER: OnceLock<opentelemetry::metrics::Counter<u64>> = OnceLock:
 static SUBSCRIPTION_OUT_OF_SYNC_COUNTER: OnceLock<opentelemetry::metrics::Counter<u64>> =
     OnceLock::new();
 static SUBSCRIPTION_LAST_SYNC_GAUGE: OnceLock<opentelemetry::metrics::Gauge<u64>> = OnceLock::new();
+static POOL_HIT_COUNTER: OnceLock<opentelemetry::metrics::Counter<u64>> = OnceLock::new();
+static POOL_MISS_COUNTER: OnceLock<opentelemetry::metrics::Counter<u64>> = OnceLock::new();
+static SCOPE_ACQUIRE_COUNTER: OnceLock<opentelemetry::metrics::Counter<u64>> = OnceLock::new();
+static SCOPE_RELEASE_COUNTER: OnceLock<opentelemetry::metrics::Counter<u64>> = OnceLock::new();
+
+/// Holds the tracer provider so it can be flushed/shut down explicitly.
+/// `opentelemetry::global::shutdown_tracer_provider` was removed in 0.32, so
+/// shutdown now goes through the owned [`SdkTracerProvider`].
+static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 
 /// Singleton instance of GlideOpenTelemetry. Ensures that telemetry setup happens only once across the application.
 static OTEL: OnceCell<RwLock<GlideOpenTelemetry>> = OnceCell::new();
@@ -541,10 +664,10 @@ impl GlideOpenTelemetry {
 
         // Check for obviously invalid pointer values
         // Pointers should be aligned to at least 8 bytes on 64-bit systems
-        if span_ptr % 8 != 0 {
+        if !span_ptr.is_multiple_of(8) {
             logger_core::log_warn(
                 "OpenTelemetry",
-                &format!(
+                format!(
                     "Invalid span pointer - misaligned pointer: 0x{:x}",
                     span_ptr
                 ),
@@ -558,7 +681,7 @@ impl GlideOpenTelemetry {
         if span_ptr < MIN_VALID_ADDRESS {
             logger_core::log_warn(
                 "OpenTelemetry",
-                &format!("Invalid span pointer - address too low: 0x{:x}", span_ptr),
+                format!("Invalid span pointer - address too low: 0x{:x}", span_ptr),
             );
             return false;
         }
@@ -570,7 +693,7 @@ impl GlideOpenTelemetry {
         if span_ptr > MAX_VALID_ADDRESS {
             logger_core::log_warn(
                 "OpenTelemetry",
-                &format!("Invalid span pointer - address too high: 0x{:x}", span_ptr),
+                format!("Invalid span pointer - address too high: 0x{:x}", span_ptr),
             );
             return false;
         }
@@ -589,10 +712,10 @@ impl GlideOpenTelemetry {
     ///
     /// # Safety
     /// This function validates the pointer before attempting conversion, but still uses unsafe code
-    pub unsafe fn span_from_pointer(span_ptr: u64) -> Result<GlideSpan, TraceError> {
+    pub unsafe fn span_from_pointer(span_ptr: u64) -> Result<GlideSpan, GlideOTELError> {
         // First validate the pointer
         if !unsafe { Self::is_span_pointer_valid(span_ptr) } {
-            return Err(TraceError::from(format!(
+            return Err(GlideOTELError::TraceError(format!(
                 "Invalid span pointer: 0x{:x} failed validation checks",
                 span_ptr
             )));
@@ -656,12 +779,12 @@ impl GlideOpenTelemetry {
         }
 
         // Validate trace_sample_percentage
-        if let Some(traces_config) = config.traces.as_ref() {
-            if traces_config.trace_sample_percentage > 100 {
-                return Err(GlideOTELError::Other(
-                    "Trace sample percentage must be between 0 and 100".into(),
-                ));
-            }
+        if let Some(traces_config) = config.traces.as_ref()
+            && traces_config.trace_sample_percentage > 100
+        {
+            return Err(GlideOTELError::Other(
+                "Trace sample percentage must be between 0 and 100".into(),
+            ));
         }
         Ok(())
     }
@@ -676,22 +799,28 @@ impl GlideOpenTelemetry {
             .build();
 
         let env_protocol = protocol_from_env(OtelSignal::Traces);
-        let trace_exporter = match trace_exporter {
+        // The file exporter uses the dedicated-thread span processor while the
+        // OTLP exporters use the Tokio async-runtime processor (their async
+        // transports require a reactor). Those processors are different concrete
+        // types, so the `SdkTracerProvider` is built inside each arm.
+        let provider = match trace_exporter {
             GlideOpenTelemetrySignalsExporter::File(p) => {
                 let exporter = crate::SpanExporterFile::new(p.clone()).map_err(|e| {
                     GlideOTELError::Other(format!("Failed to create traces exporter: {}", e))
                 })?;
-                build_span_exporter(batch_config, exporter)
+                SdkTracerProvider::builder()
+                    .with_span_processor(build_file_span_processor(batch_config, exporter))
+                    .build()
             }
             GlideOpenTelemetrySignalsExporter::Http(url) => {
-                match env_protocol.unwrap_or(Protocol::HttpBinary) {
+                let processor = match env_protocol.unwrap_or(Protocol::HttpBinary) {
                     Protocol::Grpc => {
                         let exporter = opentelemetry_otlp::SpanExporter::builder()
                             .with_tonic()
                             .with_endpoint(url)
                             .with_protocol(Protocol::Grpc)
                             .build()?;
-                        build_span_exporter(batch_config, exporter)
+                        build_otlp_span_processor(batch_config, exporter)
                     }
                     protocol => {
                         let exporter = opentelemetry_otlp::SpanExporter::builder()
@@ -699,9 +828,12 @@ impl GlideOpenTelemetry {
                             .with_endpoint(url)
                             .with_protocol(protocol)
                             .build()?;
-                        build_span_exporter(batch_config, exporter)
+                        build_otlp_span_processor(batch_config, exporter)
                     }
-                }
+                };
+                SdkTracerProvider::builder()
+                    .with_span_processor(processor)
+                    .build()
             }
             GlideOpenTelemetrySignalsExporter::Grpc(url) => {
                 let protocol = env_protocol.unwrap_or(Protocol::Grpc);
@@ -713,14 +845,14 @@ impl GlideOpenTelemetry {
                         ),
                     );
                 }
-                match protocol {
+                let processor = match protocol {
                     Protocol::Grpc => {
                         let exporter = opentelemetry_otlp::SpanExporter::builder()
                             .with_tonic()
                             .with_endpoint(url)
                             .with_protocol(Protocol::Grpc)
                             .build()?;
-                        build_span_exporter(batch_config, exporter)
+                        build_otlp_span_processor(batch_config, exporter)
                     }
                     protocol => {
                         let exporter = opentelemetry_otlp::SpanExporter::builder()
@@ -728,16 +860,19 @@ impl GlideOpenTelemetry {
                             .with_endpoint(url)
                             .with_protocol(protocol)
                             .build()?;
-                        build_span_exporter(batch_config, exporter)
+                        build_otlp_span_processor(batch_config, exporter)
                     }
-                }
+                };
+                SdkTracerProvider::builder()
+                    .with_span_processor(processor)
+                    .build()
             }
         };
 
         global::set_text_map_propagator(TraceContextPropagator::new());
-        let provider = TracerProvider::builder()
-            .with_span_processor(trace_exporter)
-            .build();
+        // Keep a clone so the provider can be flushed/shut down explicitly later;
+        // `global::shutdown_tracer_provider` was removed in opentelemetry 0.32.
+        let _ = TRACER_PROVIDER.set(provider.clone());
         global::set_tracer_provider(provider);
 
         Ok(())
@@ -749,14 +884,22 @@ impl GlideOpenTelemetry {
         metrics_exporter: &GlideOpenTelemetrySignalsExporter,
     ) -> Result<(), GlideOTELError> {
         let env_protocol = protocol_from_env(OtelSignal::Metrics);
-        let metrics_exporter = match metrics_exporter {
+        // The async-runtime `PeriodicReader<E>` is generic over the exporter
+        // type, so the file and OTLP readers are distinct concrete types. Build
+        // the `SdkMeterProvider` inside each arm to keep the reader type local.
+        let meter_provider = match metrics_exporter {
             GlideOpenTelemetrySignalsExporter::File(p) => {
                 let exporter = crate::FileMetricExporter::new(p.clone()).map_err(|e| {
                     GlideOTELError::Other(format!("Failed to create metrics exporter: {}", e))
                 })?;
-                opentelemetry_sdk::metrics::PeriodicReader::builder(exporter, Tokio)
+                // The file exporter performs synchronous IO, so the
+                // dedicated-thread `PeriodicReader` (the 0.32 default) drives it
+                // reliably on the configured interval without needing the async
+                // runtime.
+                let reader = opentelemetry_sdk::metrics::PeriodicReader::builder(exporter)
                     .with_interval(flush_interval_ms)
-                    .build()
+                    .build();
+                SdkMeterProvider::builder().with_reader(reader).build()
             }
             GlideOpenTelemetrySignalsExporter::Http(url) => {
                 let protocol = env_protocol.unwrap_or(Protocol::HttpBinary);
@@ -772,9 +915,10 @@ impl GlideOpenTelemetry {
                         .with_protocol(p)
                         .build()?,
                 };
-                opentelemetry_sdk::metrics::PeriodicReader::builder(exporter, Tokio)
+                let reader = opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader::builder(exporter, Tokio)
                     .with_interval(flush_interval_ms)
-                    .build()
+                    .build();
+                SdkMeterProvider::builder().with_reader(reader).build()
             }
             GlideOpenTelemetrySignalsExporter::Grpc(url) => {
                 let protocol = env_protocol.unwrap_or(Protocol::Grpc);
@@ -798,15 +942,13 @@ impl GlideOpenTelemetry {
                         .with_protocol(p)
                         .build()?,
                 };
-                opentelemetry_sdk::metrics::PeriodicReader::builder(exporter, Tokio)
+                let reader = opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader::builder(exporter, Tokio)
                     .with_interval(flush_interval_ms)
-                    .build()
+                    .build();
+                SdkMeterProvider::builder().with_reader(reader).build()
             }
         };
 
-        let meter_provider = SdkMeterProvider::builder()
-            .with_reader(metrics_exporter)
-            .build();
         global::set_meter_provider(meter_provider);
 
         Ok(())
@@ -891,6 +1033,42 @@ impl GlideOpenTelemetry {
                 )
             })?;
 
+        // Pool hit counter
+        let _ = POOL_HIT_COUNTER.set(
+            meter
+                .u64_counter("glide.pool.hits")
+                .with_description("Number of pool acquire hits (client found in idle)")
+                .with_unit("1")
+                .build(),
+        );
+
+        // Pool miss counter
+        let _ = POOL_MISS_COUNTER.set(
+            meter
+                .u64_counter("glide.pool.misses")
+                .with_description("Number of pool acquire misses (no idle client)")
+                .with_unit("1")
+                .build(),
+        );
+
+        // Scope acquire counter
+        let _ = SCOPE_ACQUIRE_COUNTER.set(
+            meter
+                .u64_counter("glide.scope.acquires")
+                .with_description("Number of scope connections acquired")
+                .with_unit("1")
+                .build(),
+        );
+
+        // Scope release counter
+        let _ = SCOPE_RELEASE_COUNTER.set(
+            meter
+                .u64_counter("glide.scope.releases")
+                .with_description("Number of scope connections released")
+                .with_unit("1")
+                .build(),
+        );
+
         Ok(())
     }
 
@@ -964,6 +1142,46 @@ impl GlideOpenTelemetry {
         Ok(())
     }
 
+    /// Record a pool acquire hit (client found in idle list).
+    pub fn record_pool_hit() -> Result<(), GlideOTELError> {
+        if GlideOpenTelemetry::is_initialized() {
+            if let Some(counter) = POOL_HIT_COUNTER.get() {
+                counter.add(1, &[]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a pool acquire miss (no idle client available).
+    pub fn record_pool_miss() -> Result<(), GlideOTELError> {
+        if GlideOpenTelemetry::is_initialized() {
+            if let Some(counter) = POOL_MISS_COUNTER.get() {
+                counter.add(1, &[]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a scope connection acquire.
+    pub fn record_scope_acquire() -> Result<(), GlideOTELError> {
+        if GlideOpenTelemetry::is_initialized() {
+            if let Some(counter) = SCOPE_ACQUIRE_COUNTER.get() {
+                counter.add(1, &[]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a scope connection release.
+    pub fn record_scope_release() -> Result<(), GlideOTELError> {
+        if GlideOpenTelemetry::is_initialized() {
+            if let Some(counter) = SCOPE_RELEASE_COUNTER.get() {
+                counter.add(1, &[]);
+            }
+        }
+        Ok(())
+    }
+
     /// Update the timestamp of when subscriptions were last in sync
     ///
     /// Records the current system time as a Unix timestamp in milliseconds.
@@ -1003,7 +1221,14 @@ impl GlideOpenTelemetry {
 
     /// Trigger a shutdown procedure flushing all remaining traces
     pub fn shutdown() {
-        global::shutdown_tracer_provider();
+        if let Some(provider) = TRACER_PROVIDER.get()
+            && let Err(e) = provider.shutdown()
+        {
+            log_warn(
+                "opentelemetry",
+                format!("Failed to shut down tracer provider: {e}"),
+            );
+        }
     }
 
     /// Check if OpenTelemetry is initialized
@@ -1031,6 +1256,17 @@ mod tests {
     fn string_property_to_u64(json: &serde_json::Value, prop: &str) -> u64 {
         let s = json[prop].to_string().replace('"', "");
         s.parse::<u64>().unwrap()
+    }
+
+    /// Helper function to find a metric by name in the metrics array
+    fn find_metric_by_name<'a>(
+        metric_json: &'a serde_json::Value,
+        metric_name: &str,
+    ) -> Option<&'a serde_json::Value> {
+        metric_json["scope_metrics"][0]["metrics"]
+            .as_array()?
+            .iter()
+            .find(|m| m["name"] == metric_name)
     }
 
     async fn init_otel() -> Result<(), GlideOTELError> {
@@ -1092,29 +1328,40 @@ mod tests {
                 .filter(|l| !l.trim().is_empty())
                 .collect();
 
-            assert!(
-                lines.len() == 3 || lines.len() == 4,
-                "Expected 3 or 4 lines, got {}. file content: {file_content:?}",
-                lines.len()
-            );
+            // Parse all spans and find the ones we created by name
+            let mut network_span: Option<serde_json::Value> = None;
+            let mut root_span_1: Option<serde_json::Value> = None;
+            let mut root_span_2: Option<serde_json::Value> = None;
 
-            // Adjust base index if there are only 3 lines (no header line)
-            let base = if lines.len() == 3 { 0 } else { 1 };
+            for line in lines {
+                if let Ok(span) = serde_json::from_str::<serde_json::Value>(line) {
+                    match span["name"].as_str() {
+                        Some("Network_Span") if network_span.is_none() => network_span = Some(span),
+                        Some("Root_Span_1") if span["status"] == "Ok" && root_span_1.is_none() => {
+                            root_span_1 = Some(span)
+                        }
+                        Some("Root_Span_2") if root_span_2.is_none() => root_span_2 = Some(span),
+                        _ => {}
+                    }
+                }
+            }
 
-            let span_json: serde_json::Value = serde_json::from_str(lines[base]).unwrap();
-            assert_eq!(span_json["name"], "Network_Span");
-            let network_span_id = span_json["span_id"].to_string();
-            let network_span_start_time = string_property_to_u64(&span_json, "start_time");
-            let network_span_end_time = string_property_to_u64(&span_json, "end_time");
+            let network_span = network_span.expect("Network_Span not found");
+            let root_span_1 = root_span_1.expect("Root_Span_1 not found");
+            let root_span_2 = root_span_2.expect("Root_Span_2 not found");
+
+            // Verify Network_Span timing
+            let network_span_id = network_span["span_id"].to_string();
+            let network_span_start_time = string_property_to_u64(&network_span, "start_time");
+            let network_span_end_time = string_property_to_u64(&network_span, "end_time");
 
             // Because of the sleep above, the network span should be at least 100ms (units are microseconds)
             assert!(network_span_end_time - network_span_start_time >= 100_000);
 
-            let span_json: serde_json::Value = serde_json::from_str(lines[base + 1]).unwrap();
-            assert_eq!(span_json["name"], "Root_Span_1");
-            assert_eq!(span_json["links"].as_array().unwrap().len(), 1); // we expect 1 child
-            let root_1_span_start_time = string_property_to_u64(&span_json, "start_time");
-            let root_1_span_end_time = string_property_to_u64(&span_json, "end_time");
+            // Verify Root_Span_1 has the network span as a child
+            assert_eq!(root_span_1["links"].as_array().unwrap().len(), 1); // we expect 1 child
+            let root_1_span_start_time = string_property_to_u64(&root_span_1, "start_time");
+            let root_1_span_end_time = string_property_to_u64(&root_span_1, "end_time");
 
             // The network span started *after* its parent
             assert!(network_span_start_time >= root_1_span_start_time);
@@ -1122,12 +1369,11 @@ mod tests {
             // The parent span ends *after* the child span (by at least 100ms)
             assert!(root_1_span_end_time - network_span_end_time >= 100_000);
 
-            let child_span_id = span_json["links"][0]["span_id"].to_string();
+            let child_span_id = root_span_1["links"][0]["span_id"].to_string();
             assert_eq!(child_span_id, network_span_id);
 
-            let span_json: serde_json::Value = serde_json::from_str(lines[base + 2]).unwrap();
-            assert_eq!(span_json["name"], "Root_Span_2");
-            assert_eq!(span_json["events"].as_array().unwrap().len(), 2); // we expect 2 events
+            // Verify Root_Span_2 has 2 events
+            assert_eq!(root_span_2["events"].as_array().unwrap().len(), 2); // we expect 2 events
         });
     }
 
@@ -1203,20 +1449,15 @@ mod tests {
                 .collect();
 
             let metric_json: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-            assert_eq!(
-                metric_json["scope_metrics"][0]["metrics"][0]["name"],
-                "glide.retry_attempts"
-            );
-            assert_eq!(
-                metric_json["scope_metrics"][0]["metrics"][0]["data_points"][0]["value"],
-                1
-            );
+            let retry_metric = find_metric_by_name(&metric_json, "glide.retry_attempts")
+                .expect("glide.retry_attempts metric not found");
+            assert_eq!(retry_metric["data_points"][0]["value"], 1);
+
             let metric_json: serde_json::Value =
                 serde_json::from_str(lines[lines.len() - 1]).unwrap();
-            assert_eq!(
-                metric_json["scope_metrics"][0]["metrics"][0]["data_points"][0]["value"],
-                3
-            );
+            let retry_metric = find_metric_by_name(&metric_json, "glide.retry_attempts")
+                .expect("glide.retry_attempts metric not found");
+            assert_eq!(retry_metric["data_points"][0]["value"], 3);
         });
     }
 
@@ -1241,20 +1482,15 @@ mod tests {
                 .collect();
 
             let metric_json: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-            assert_eq!(
-                metric_json["scope_metrics"][0]["metrics"][0]["name"],
-                "glide.moved_errors"
-            );
-            assert_eq!(
-                metric_json["scope_metrics"][0]["metrics"][0]["data_points"][0]["value"],
-                1
-            );
+            let moved_metric = find_metric_by_name(&metric_json, "glide.moved_errors")
+                .expect("glide.moved_errors metric not found");
+            assert_eq!(moved_metric["data_points"][0]["value"], 1);
+
             let metric_json: serde_json::Value =
                 serde_json::from_str(lines[lines.len() - 1]).unwrap();
-            assert_eq!(
-                metric_json["scope_metrics"][0]["metrics"][0]["data_points"][0]["value"],
-                3
-            );
+            let moved_metric = find_metric_by_name(&metric_json, "glide.moved_errors")
+                .expect("glide.moved_errors metric not found");
+            assert_eq!(moved_metric["data_points"][0]["value"], 3);
         });
     }
 
@@ -1294,11 +1530,28 @@ mod tests {
                 .filter(|l| !l.trim().is_empty())
                 .collect();
 
-            let span_json: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
-            assert_eq!(span_json["status"], "Ok");
+            // Find the specific spans by name and status
+            let mut ok_span: Option<serde_json::Value> = None;
+            let mut error_span: Option<serde_json::Value> = None;
 
-            let span_json: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
-            let status = span_json["status"].as_str().unwrap_or("");
+            for line in lines {
+                if let Ok(span) = serde_json::from_str::<serde_json::Value>(line) {
+                    if span["name"] == "Root_Span_1" && span["status"] == "Ok" {
+                        ok_span = Some(span);
+                    } else if span["name"] == "Root_Span_2" {
+                        let status = span["status"].as_str().unwrap_or("");
+                        if status.starts_with("Error") {
+                            error_span = Some(span);
+                        }
+                    }
+                }
+            }
+
+            let ok_span = ok_span.expect("Root_Span_1 with Ok status not found");
+            assert_eq!(ok_span["status"], "Ok");
+
+            let error_span = error_span.expect("Root_Span_2 with Error status not found");
+            let status = error_span["status"].as_str().unwrap_or("");
             assert!(status.starts_with("Error"));
             assert!(status.contains("simple error"));
         });
@@ -1544,6 +1797,60 @@ mod tests {
                 error_msg.contains("failed validation checks"),
                 "Error message should mention validation failure"
             );
+        });
+    }
+
+    #[test]
+    fn test_new_with_remote_context_valid_inputs() {
+        let rt = shared_runtime();
+        rt.block_on(async {
+            init_otel().await.unwrap();
+
+            let result = GlideSpanInner::new_with_remote_context(
+                "remote_child",
+                "0af7651916cd43dd8448eb211c80319c", // valid 32-char hex trace ID
+                "b7ad6b7169203331",                 // valid 16-char hex span ID
+                1,                                  // trace flags
+                None,
+            );
+            assert!(result.is_ok(), "Valid inputs should return Ok");
+
+            let span = result.unwrap();
+            span.end();
+        });
+    }
+
+    #[test]
+    fn test_new_with_remote_context_invalid_trace_id() {
+        let rt = shared_runtime();
+        rt.block_on(async {
+            init_otel().await.unwrap();
+
+            let result = GlideSpanInner::new_with_remote_context(
+                "remote_child",
+                "not_valid_hex",
+                "b7ad6b7169203331",
+                1,
+                None,
+            );
+            assert!(result.is_err(), "Invalid trace_id should return Err");
+        });
+    }
+
+    #[test]
+    fn test_new_with_remote_context_invalid_span_id() {
+        let rt = shared_runtime();
+        rt.block_on(async {
+            init_otel().await.unwrap();
+
+            let result = GlideSpanInner::new_with_remote_context(
+                "remote_child",
+                "0af7651916cd43dd8448eb211c80319c",
+                "zzzzzzzzzzzzzzzz", // 16 chars but not valid hex
+                1,
+                None,
+            );
+            assert!(result.is_err(), "Invalid span_id should return Err");
         });
     }
 
