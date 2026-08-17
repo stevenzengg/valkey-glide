@@ -2,8 +2,10 @@
 package glide.api.models.configuration;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -23,6 +25,16 @@ public class BaseClientConfigurationTest {
 
         @Override
         public BaseSubscriptionConfiguration getSubscriptionConfiguration() {
+            return null;
+        }
+
+        @Override
+        public AdvancedBaseClientConfiguration getAdvancedConfiguration() {
+            return null;
+        }
+
+        @Override
+        public ClientSideCache getClientSideCache() {
             return null;
         }
 
@@ -100,8 +112,9 @@ public class BaseClientConfigurationTest {
 
     @Test
     public void testPubsubReconciliationIntervalMs_zero_throws() {
-        var builder = AdvancedGlideClientConfiguration.builder();
-        var exception =
+        AdvancedGlideClientConfiguration.AdvancedGlideClientConfigurationBuilder builder =
+                AdvancedGlideClientConfiguration.builder();
+        IllegalArgumentException exception =
                 assertThrows(
                         IllegalArgumentException.class, () -> builder.pubsubReconciliationIntervalMs(0));
         assertEquals("pubsubReconciliationIntervalMs must be positive, got: 0", exception.getMessage());
@@ -109,11 +122,65 @@ public class BaseClientConfigurationTest {
 
     @Test
     public void testPubsubReconciliationIntervalMs_negative_throws() {
-        var builder = AdvancedGlideClientConfiguration.builder();
-        var exception =
+        AdvancedGlideClientConfiguration.AdvancedGlideClientConfigurationBuilder builder =
+                AdvancedGlideClientConfiguration.builder();
+        IllegalArgumentException exception =
                 assertThrows(
                         IllegalArgumentException.class, () -> builder.pubsubReconciliationIntervalMs(-1));
         assertEquals(
                 "pubsubReconciliationIntervalMs must be positive, got: -1", exception.getMessage());
+    }
+
+    @Test
+    public void testNodeDiscoveryModeDefault() {
+        GlideClientConfiguration config = GlideClientConfiguration.builder().build();
+        assertEquals(NodeDiscoveryMode.STANDARD, config.getNodeDiscoveryMode());
+    }
+
+    @Test
+    public void testNodeDiscoveryModeStatic() {
+        GlideClientConfiguration config =
+                GlideClientConfiguration.builder().nodeDiscoveryMode(NodeDiscoveryMode.STATIC).build();
+        assertEquals(NodeDiscoveryMode.STATIC, config.getNodeDiscoveryMode());
+    }
+
+    @Test
+    public void testNodeDiscoveryModeDiscoverAll() {
+        GlideClientConfiguration config =
+                GlideClientConfiguration.builder()
+                        .nodeDiscoveryMode(NodeDiscoveryMode.DISCOVER_ALL)
+                        .build();
+        assertEquals(NodeDiscoveryMode.DISCOVER_ALL, config.getNodeDiscoveryMode());
+    }
+
+    @Test
+    void testServerAssistedCacheConfig() {
+        ClientSideCache cache = ClientSideCache.builder().maxCacheKb(1024).serverAssisted(true).build();
+        assertTrue(cache.isServerAssisted());
+
+        ClientSideCache cacheDefault = ClientSideCache.builder().maxCacheKb(1024).build();
+        assertFalse(cacheDefault.isServerAssisted());
+    }
+
+    @Test
+    public void testRecoveryRequestsQueueSizeDefault() {
+        // recoveryRequestsQueueSize should default to null when not specified
+        GlideClusterClientConfiguration config =
+                GlideClusterClientConfiguration.builder()
+                        .address(NodeAddress.builder().host("localhost").port(7000).build())
+                        .build();
+        assertNull(config.getRecoveryRequestsQueueSize());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {1, 100, 500, 1000, 5000})
+    public void testRecoveryRequestsQueueSizeSetValue(int queueSize) {
+        // recoveryRequestsQueueSize should be stored on the cluster config
+        GlideClusterClientConfiguration config =
+                GlideClusterClientConfiguration.builder()
+                        .address(NodeAddress.builder().host("localhost").port(7000).build())
+                        .recoveryRequestsQueueSize(queueSize)
+                        .build();
+        assertEquals(queueSize, config.getRecoveryRequestsQueueSize());
     }
 }

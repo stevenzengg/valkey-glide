@@ -1,7 +1,17 @@
 # Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
-from typing import Dict, List, Mapping, Optional, Protocol, Set, Tuple, Union, cast
+from typing import (
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Set,
+    Tuple,
+    Union,
+    cast,
+)
 
-from glide.glide import ClusterScanCursor
+from glide._ffi_wrappers import ClusterScanCursor
 from glide_shared.commands.bitmap import (
     BitFieldGet,
     BitFieldSubCommands,
@@ -18,6 +28,7 @@ from glide_shared.commands.core_options import (
     ExpirySet,
     HashFieldConditionalChange,
     InsertPosition,
+    MigrateOptions,
     OnlyIfEqual,
     PubSubMsg,
     UpdateOptions,
@@ -60,40 +71,22 @@ from glide_shared.constants import (
     TXInfoStreamResponse,
 )
 from glide_shared.exceptions import RequestError
-from glide_shared.protobuf.command_request_pb2 import RequestType
+from glide_shared.protobuf.command_request_pb2 import CacheMetricsType
+from glide_shared.request_type import RequestType
 from glide_shared.routes import Route
-
-# PubSub constants for unsubscribing from all channels/patterns
-ALL_CHANNELS: Optional[Set[str]] = None
-"""
-Constant representing 'unsubscribe from all channels'.
-Pass this to unsubscribe() to unsubscribe from all channels.
-"""
-
-ALL_PATTERNS: Optional[Set[str]] = None
-"""
-Constant representing 'unsubscribe from all patterns'.
-Pass this to punsubscribe() to unsubscribe from all patterns.
-"""
-
-ALL_SHARDED_CHANNELS: Optional[Set[str]] = None
-"""
-Constant representing 'unsubscribe from all sharded channels'.
-Pass this to sunsubscribe() to unsubscribe from all sharded channels.
-"""
 
 
 class CoreCommands(Protocol):
     async def _execute_command(
         self,
-        request_type: RequestType.ValueType,
+        request_type: int,
         args: List[TEncodable],
         route: Optional[Route] = ...,
     ) -> TResult: ...
 
     async def _execute_batch(
         self,
-        commands: List[Tuple[RequestType.ValueType, List[TEncodable]]],
+        commands: List[Tuple[int, List[TEncodable]]],
         is_atomic: bool,
         raise_on_error: bool,
         retry_server_error: bool = False,
@@ -179,6 +172,112 @@ class CoreCommands(Protocol):
         """
         return cast(TOK, await self._refresh_iam_token())
 
+    def _get_cache_metrics(
+        self, metrics_type: CacheMetricsType.ValueType
+    ) -> TResult: ...
+
+    def get_cache_hit_rate(self) -> float:
+        """
+        Get the cache hit rate (hits / total requests).
+
+        Returns:
+            float: The cache hit rate as a float between 0.0 and 1.0.
+
+        Raises:
+            RequestError: If client-side caching is not enabled or metrics tracking is disabled.
+
+        Example:
+            >>> hit_rate = client.get_cache_hit_rate()
+            >>> print(f"Cache hit rate: {hit_rate:.2%}")
+            Cache hit rate: 85.50%
+        """
+        return cast(float, self._get_cache_metrics(CacheMetricsType.HitRate))
+
+    def get_cache_miss_rate(self) -> float:
+        """
+        Get the cache miss rate (misses / total requests).
+
+        Returns:
+            float: The cache miss rate as a float between 0.0 and 1.0.
+
+        Raises:
+            RequestError: If client-side caching is not enabled or metrics tracking is disabled.
+
+        Example:
+            >>> miss_rate = client.get_cache_miss_rate()
+            >>> print(f"Cache miss rate: {miss_rate:.2%}")
+            Cache miss rate: 14.50%
+        """
+        return cast(float, self._get_cache_metrics(CacheMetricsType.MissRate))
+
+    def get_cache_entry_count(self) -> int:
+        """
+        Get the current number of entries in the client-side cache.
+
+        Returns:
+            int: The number of entries in the cache.
+
+        Raises:
+            RequestError: If client-side caching is not enabled.
+
+        Example:
+            >>> entry_count = client.get_cache_entry_count()
+            >>> print(f"Cache entry count: {entry_count}")
+            Cache entry count: 1500
+        """
+        return cast(int, self._get_cache_metrics(CacheMetricsType.EntryCount))
+
+    def get_cache_evictions(self) -> int:
+        """
+        Get the total number of entries evicted from the client-side cache due to memory constraints.
+
+        Returns:
+            int: The number of evictions.
+
+        Raises:
+            RequestError: If client-side caching is not enabled or metrics tracking is disabled.
+
+        Example:
+            >>> evictions = client.get_cache_evictions()
+            >>> print(f"Cache evictions: {evictions}")
+            Cache evictions: 100
+        """
+        return cast(int, self._get_cache_metrics(CacheMetricsType.Evictions))
+
+    def get_cache_total_lookups(self) -> int:
+        """
+        Get the total number of cache lookups (hits + misses).
+
+        Returns:
+            int: The total number of cache lookups.
+
+        Raises:
+            RequestError: If client-side caching is not enabled or metrics tracking is disabled.
+
+        Example:
+            >>> total = client.get_cache_total_lookups()
+            >>> print(f"Total cache lookups: {total}")
+            Total cache lookups: 5000
+        """
+        return cast(int, self._get_cache_metrics(CacheMetricsType.TotalLookups))
+
+    def get_cache_expirations(self) -> int:
+        """
+        Get the total number of entries removed from the client-side cache due to TTL expiration.
+
+        Returns:
+            int: The number of expirations.
+
+        Raises:
+            RequestError: If client-side caching is not enabled or metrics tracking is disabled.
+
+        Example:
+            >>> expirations = client.get_cache_expirations()
+            >>> print(f"Cache expirations: {expirations}")
+            Cache expirations: 250
+        """
+        return cast(int, self._get_cache_metrics(CacheMetricsType.Expirations))
+
     async def set(
         self,
         key: TEncodable,
@@ -186,7 +285,7 @@ class CoreCommands(Protocol):
         conditional_set: Optional[Union[ConditionalChange, OnlyIfEqual]] = None,
         expiry: Optional[ExpirySet] = None,
         return_old_value: bool = False,
-    ) -> Optional[bytes]:
+    ) -> Optional[Union[TOK, bytes]]:
         """
         Set the given key with the given value. Return value is dependent on the passed options.
 
@@ -204,7 +303,7 @@ class CoreCommands(Protocol):
                 Equivalent to `GET` in the Valkey API. Defaults to False.
 
         Returns:
-            Optional[bytes]: If the value is successfully set, return OK.
+            Optional[Union[TOK, bytes]]: If the value is successfully set, return OK (a `str`).
 
             If value isn't set because of `only_if_exists` or `only_if_does_not_exist` conditions, return `None`.
 
@@ -255,7 +354,10 @@ class CoreCommands(Protocol):
             args.append("GET")
         if expiry is not None:
             args.extend(expiry.get_cmd_args())
-        return cast(Optional[bytes], await self._execute_command(RequestType.Set, args))
+        return cast(
+            Optional[Union[TOK, bytes]],
+            await self._execute_command(RequestType.Set, args),
+        )
 
     async def get(self, key: TEncodable) -> Optional[bytes]:
         """
@@ -1797,7 +1899,7 @@ class CoreCommands(Protocol):
         Note:
             1. When in cluster mode, all `keys` must map to the same hash slot.
             2. `BLPOP` is a client blocking command, see
-               [blocking commands](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands)
+               [blocking commands](https://glide.valkey.io/how-to/connection-management/#blocking-commands)
                for more details and best practices.
 
         Args:
@@ -1876,7 +1978,7 @@ class CoreCommands(Protocol):
         Note:
             1. When in cluster mode, all `keys` must map to the same hash slot.
             2. `BLMPOP` is a client blocking command, see
-               [blocking commands](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands)
+               [blocking commands](https://glide.valkey.io/how-to/connection-management/#blocking-commands)
                for more details and best practices.
 
         See [valkey.io](https://valkey.io/commands/blmpop/) for details.
@@ -2123,7 +2225,7 @@ class CoreCommands(Protocol):
         Notes:
             1. When in cluster mode, all `keys` must map to the same hash slot.
             2. `BRPOP` is a client blocking command, see
-               [blocking commands](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands)
+               [blocking commands](https://glide.valkey.io/how-to/connection-management/#blocking-commands)
                for more details and best practices.
 
         Args:
@@ -2249,7 +2351,7 @@ class CoreCommands(Protocol):
         Notes:
             1. When in cluster mode, both `source` and `destination` must map to the same hash slot.
             2. `BLMOVE` is a client blocking command, see
-               [blocking commands](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands)
+               [blocking commands](https://glide.valkey.io/how-to/connection-management/#blocking-commands)
                for more details and best practices.
 
         See [valkey.io](https://valkey.io/commands/blmove/) for details.
@@ -2323,6 +2425,17 @@ class CoreCommands(Protocol):
             A simple OK response.
         """
         return cast(TOK, await self._execute_command(RequestType.Select, [str(index)]))
+
+    async def reset(self) -> bytes:
+        """
+        Reset the connection state.
+
+        See [valkey.io](https://valkey.io/commands/reset/) for details.
+
+        Returns:
+            bytes: The string "RESET".
+        """
+        return cast(bytes, await self._execute_command(RequestType.Reset, []))
 
     async def srem(self, key: TEncodable, members: List[TEncodable]) -> int:
         """
@@ -5005,7 +5118,7 @@ class CoreCommands(Protocol):
             1. When in cluster mode, all keys must map to the same hash slot.
             2. `BZPOPMAX` is the blocking variant of `ZPOPMAX`.
             3. `BZPOPMAX` is a client blocking command, see
-               [blocking commands](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands)
+               [blocking commands](https://glide.valkey.io/how-to/connection-management/#blocking-commands)
                for more details and best practices.
 
         See [valkey.io](https://valkey.io/commands/bzpopmax) for more details.
@@ -5078,7 +5191,7 @@ class CoreCommands(Protocol):
             1. When in cluster mode, all keys must map to the same hash slot.
             2. `BZPOPMIN` is the blocking variant of `ZPOPMIN`.
             3. `BZPOPMIN` is a client blocking command, see
-               [blocking commands](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands)
+               [blocking commands](https://glide.valkey.io/how-to/connection-management/#blocking-commands)
                for more details and best practices.
 
         See [valkey.io](https://valkey.io/commands/bzpopmin) for more details.
@@ -6160,7 +6273,7 @@ class CoreCommands(Protocol):
         Notes:
             1. When in cluster mode, all `keys` must map to the same hash slot.
             2. `BZMPOP` is a client blocking command, see
-               [blocking commands](https://github.com/valkey-io/valkey-glide/wiki/General-Concepts#blocking-commands)
+               [blocking commands](https://glide.valkey.io/how-to/connection-management/#blocking-commands)
                for more details and best practices.
 
         Args:
@@ -6883,6 +6996,49 @@ class CoreCommands(Protocol):
         return cast(
             TOK,
             await self._execute_command(RequestType.Restore, args),
+        )
+
+    async def migrate(
+        self,
+        host: str,
+        port: int,
+        key: TEncodable,
+        destination_db: int,
+        timeout: int,
+        options: Optional[MigrateOptions] = None,
+    ) -> str:
+        """
+        Atomically transfers a key from a source Valkey instance to a destination Valkey instance.
+        On success, the key is deleted from the source instance.
+
+        See [valkey.io](https://valkey.io/commands/migrate/) for details.
+
+        Args:
+            host (str): The host of the destination Valkey instance.
+            port (int): The port of the destination Valkey instance.
+            key (TEncodable): The key to migrate.
+            destination_db (int): The database index on the destination instance.
+            timeout (int): The maximum idle time in milliseconds for the bulk-transfer.
+            options (Optional[MigrateOptions]): Additional migration options.
+
+        Returns:
+            str: "OK" on success, or "NOKEY" if the key was not found.
+
+        Examples:
+            >>> await client.migrate("127.0.0.1", 6380, "mykey", 0, 5000)
+        """
+        args: List[TEncodable] = [
+            host,
+            str(port),
+            key,
+            str(destination_db),
+            str(timeout),
+        ]
+        if options:
+            args.extend(options.to_args())
+        return cast(
+            str,
+            await self._execute_command(RequestType.Migrate, args),
         )
 
     async def sscan(

@@ -1,6 +1,9 @@
 /** Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0 */
 package glide.api.models;
 
+import glide.utils.Java8Utils;
+import glide.utils.Utf8Validator;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -34,7 +37,7 @@ public class GlideString implements Comparable<GlideString> {
 
     /** Create a GlideString using a {@link String}. */
     public static GlideString of(String string) {
-        var res = new GlideString();
+        GlideString res = new GlideString();
         res.string = string;
         res.bytes = string.getBytes(StandardCharsets.UTF_8);
         return res;
@@ -42,7 +45,7 @@ public class GlideString implements Comparable<GlideString> {
 
     /** Create a GlideString using a byte array. */
     public static GlideString of(byte[] bytes) {
-        var res = new GlideString();
+        GlideString res = new GlideString();
         res.bytes = bytes.clone();
         return res;
     }
@@ -56,7 +59,7 @@ public class GlideString implements Comparable<GlideString> {
         } else if (o instanceof String) {
             return GlideString.of((String) o);
         } else {
-            var res = new GlideString();
+            GlideString res = new GlideString();
             res.string = o.toString();
             res.bytes = res.string.getBytes(StandardCharsets.UTF_8);
             return res;
@@ -76,6 +79,11 @@ public class GlideString implements Comparable<GlideString> {
     /** Returns a copy of the underlying byte array to preserve immutability of the stored value. */
     public byte[] getBytes() {
         return bytes.clone();
+    }
+
+    /** Returns a read-only, zero-copy view of the underlying bytes. */
+    public ByteBuffer asReadOnlyByteBuffer() {
+        return ByteBuffer.wrap(bytes).asReadOnlyBuffer();
     }
 
     /** Converts stored data to a human-friendly {@link String} if it is possible. */
@@ -98,7 +106,7 @@ public class GlideString implements Comparable<GlideString> {
 
     /** Compare with another GlideString. */
     public int compareTo(GlideString o) {
-        return Arrays.compare(this.bytes, o.bytes);
+        return Java8Utils.compareByteArrays(this.bytes, o.bytes);
     }
 
     /** Check whether stored data could be converted to a {@link String}. */
@@ -116,15 +124,11 @@ public class GlideString implements Comparable<GlideString> {
                     return false;
                 } else {
                     try {
-                        // TODO find a better way to check this
-                        // Detect whether `bytes` could be represented by a `String` without data corruption
-                        var tmpStr = new String(bytes, StandardCharsets.UTF_8);
-                        if (Arrays.equals(bytes, tmpStr.getBytes(StandardCharsets.UTF_8))) {
-                            string = tmpStr;
+                        if (Utf8Validator.isWellFormed(bytes)) {
+                            string = new String(bytes, StandardCharsets.UTF_8);
                             return true;
-                        } else {
-                            return false;
                         }
+                        return false;
                     } finally {
                         conversionChecked.set(true);
                     }

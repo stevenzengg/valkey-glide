@@ -1,6 +1,26 @@
 // Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
 
+pub use redis::AddressResolver;
 pub use redis::{ErrorKind, ObjectType, PushKind, RedisError, RedisFuture, RedisResult, Value};
+
+#[derive(Clone, Default, PartialEq)]
+pub enum ProtocolVersion {
+    RESP2,
+    #[default]
+    RESP3,
+}
+
+pub struct RedisConnectionInfo {
+    pub db: i64,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub protocol: ProtocolVersion,
+    pub client_name: Option<String>,
+    pub lib_name: Option<String>,
+    pub server_assisted_cache: bool,
+    pub cache: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+}
+use std::sync::Arc;
 use telemetrylib::GlideSpan;
 
 pub mod cluster_routing;
@@ -10,6 +30,7 @@ pub use cluster_routing::*;
 pub use cluster_topology::*;
 
 pub use redis::ToRedisArgs;
+pub use redis::SHARED_ARG_INLINE_MAX;
 
 pub struct Cmd {
     command_bytes: Vec<u8>,
@@ -27,6 +48,10 @@ impl Routable for Cmd {}
 
 impl Cmd {
     pub fn arg<T: ToRedisArgs>(&mut self, _arg: T) -> &mut Cmd {
+        self
+    }
+
+    pub fn arg_shared(&mut self, _arg: bytes::Bytes) -> &mut Cmd {
         self
     }
 
@@ -66,6 +91,10 @@ impl Pipeline {
 
     pub fn span(&self) -> Option<GlideSpan> {
         Some(GlideSpan)
+    }
+
+    pub fn commands(&self) -> &[Arc<Cmd>] {
+        &[]
     }
 }
 
@@ -113,7 +142,6 @@ impl ClusterScanArgsBuilder {
     pub fn allow_non_covered_slots(self, _allow: bool) -> Self {
         self
     }
-
 }
 
 pub struct PushInfo {
@@ -126,5 +154,15 @@ pub struct PipelineRetryStrategy;
 impl PipelineRetryStrategy {
     pub fn new(_retry_server_error: bool, _retry_connection_error: bool) -> Self {
         PipelineRetryStrategy
+    }
+}
+
+pub fn parse_redis_url(input: &str) -> Option<url::Url> {
+    match url::Url::parse(input) {
+        Ok(result) => match result.scheme() {
+            "redis" | "rediss" | "redis+unix" | "unix" => Some(result),
+            _ => None,
+        },
+        Err(_) => None,
     }
 }

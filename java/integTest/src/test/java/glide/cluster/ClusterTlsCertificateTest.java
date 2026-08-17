@@ -1,6 +1,8 @@
 /** Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0 */
 package glide.cluster;
 
+import static glide.Constants.IP_ADDRESS_V4;
+import static glide.Constants.IP_ADDRESS_V6;
 import static glide.TestUtilities.getCaCertificate;
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -19,9 +21,12 @@ import java.security.KeyStore;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateFactory;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 public class ClusterTlsCertificateTest {
 
@@ -61,7 +66,9 @@ public class ClusterTlsCertificateTest {
         GlideClusterClientConfiguration config =
                 TestUtilities.createClusterConfigWithRootCert(caCert, clusterNodes);
 
-        TestUtilities.createAndTestClient(config);
+        try (GlideClusterClient client = GlideClusterClient.createClient(config).get()) {
+            TestUtilities.assertConnected(client);
+        }
     }
 
     @Test
@@ -72,7 +79,9 @@ public class ClusterTlsCertificateTest {
         GlideClusterClientConfiguration config =
                 TestUtilities.createClusterConfigWithRootCert(certBundle, clusterNodes);
 
-        TestUtilities.createAndTestClient(config);
+        try (GlideClusterClient client = GlideClusterClient.createClient(config).get()) {
+            TestUtilities.assertConnected(client);
+        }
     }
 
     @Test
@@ -100,6 +109,19 @@ public class ClusterTlsCertificateTest {
                 () -> {
                     GlideClusterClient.createClient(config).get();
                 });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {IP_ADDRESS_V4, IP_ADDRESS_V6})
+    void testClusterTlsWithIpAddressSucceeds(String ipAddress) throws Exception {
+        Integer port = clusterNodes.get(0).getPort();
+        NodeAddress address = NodeAddress.builder().host(ipAddress).port(port).build();
+        GlideClusterClientConfiguration config =
+                TestUtilities.createClusterConfigWithRootCert(caCert, Collections.singletonList(address));
+
+        try (GlideClusterClient client = GlideClusterClient.createClient(config).get()) {
+            TestUtilities.assertConnected(client);
+        }
     }
 
     @Test
@@ -134,7 +156,9 @@ public class ClusterTlsCertificateTest {
                             .advancedConfiguration(advancedConfig)
                             .build();
 
-            TestUtilities.createAndTestClient(config);
+            try (GlideClusterClient client = GlideClusterClient.createClient(config).get()) {
+                TestUtilities.assertConnected(client);
+            }
         } finally {
             Files.deleteIfExists(keyStorePath);
         }

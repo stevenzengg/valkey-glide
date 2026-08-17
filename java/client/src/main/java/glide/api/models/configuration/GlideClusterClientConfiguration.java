@@ -23,6 +23,8 @@ import lombok.experimental.SuperBuilder;
  *         .subscriptionConfiguration(subscriptionConfiguration)
  *         .reconnectStrategy(reconnectionConfiguration)
  *         .inflightRequestsLimit(1000)
+ *         .recoveryRequestsQueueSize(1000)
+ *         .clientSideCache(ClientSideCache.create(1024, 60000))
  *         .advancedConfiguration(AdvancedGlideClusterClientConfiguration.builder().connectionTimeout(500).build())
  *         .build();
  * }</pre>
@@ -31,6 +33,9 @@ import lombok.experimental.SuperBuilder;
 @Getter
 public class GlideClusterClientConfiguration extends BaseClientConfiguration {
 
+    /** Client-side cache configuration. If provided, enables caching for this client. */
+    private final ClientSideCache clientSideCache;
+
     /** Subscription configuration for the current client. */
     private final ClusterSubscriptionConfiguration subscriptionConfiguration;
 
@@ -38,4 +43,12 @@ public class GlideClusterClientConfiguration extends BaseClientConfiguration {
     @Builder.Default
     private final AdvancedGlideClusterClientConfiguration advancedConfiguration =
             AdvancedGlideClusterClientConfiguration.builder().build();
+
+    /**
+     * The maximum number of requests to buffer in the recovery queue when a cluster reconnect is in
+     * progress. Buffered requests are retried transparently after reconnection. Requests beyond this
+     * limit are failed immediately to provide bounded memory usage. If not set, a default value of
+     * 1000 will be used. Set to 0 to disable the recovery queue and restore fail-fast behaviour.
+     */
+    private final Integer recoveryRequestsQueueSize;
 }

@@ -32,7 +32,7 @@ GLIDE_HOME_DIR = os.getenv("GLIDE_HOME_DIR") or f"{__file__}/.."
 def _get_clusters_folder():
     if os.getenv("CLUSTERS_FOLDER"):
         return os.getenv("CLUSTERS_FOLDER")
-    
+
     # Check if running on Windows WSL
     try:
         with open("/proc/version", "r") as f:
@@ -40,7 +40,7 @@ def _get_clusters_folder():
                 return "/tmp/clusters"
     except (FileNotFoundError, PermissionError):
         pass
-    
+
     return os.path.abspath(f"{GLIDE_HOME_DIR}/clusters")
 
 CLUSTERS_FOLDER = _get_clusters_folder()
@@ -49,6 +49,12 @@ CA_CRT = f"{TLS_FOLDER}/ca.crt"
 SERVER_CRT = f"{TLS_FOLDER}/server.crt"
 SERVER_KEY = f"{TLS_FOLDER}/server.key"
 
+# Allowed hostname for TLS certificate.
+HOSTNAME_TLS: str = "valkey.glide.test.tls.com"
+
+# Default hosts (loopback addresses for IPv4 and IPv6)
+DEFAULT_HOST_IPV4: str = "127.0.0.1"
+DEFAULT_HOST_IPV6: str = "::1"
 
 def get_command(commands: List[str]) -> str:
     for command in commands:
@@ -135,7 +141,9 @@ def generate_tls_certs():
     ext_file = f"{TLS_FOLDER}/openssl.cnf"
 
     f = open(ext_file, "w")
-    f.write("keyUsage = digitalSignature, keyEncipherment\nsubjectAltName = IP:127.0.0.1,DNS:localhost")
+    f.write(
+        f"keyUsage = digitalSignature, keyEncipherment\nsubjectAltName = IP:{DEFAULT_HOST_IPV4},IP:{DEFAULT_HOST_IPV6},DNS:localhost,DNS:{HOSTNAME_TLS}"
+    )
     f.close()
 
     def make_key(name: str, size: int):
@@ -151,15 +159,23 @@ def generate_tls_certs():
             stderr=subprocess.PIPE,
             text=True,
         )
-        # ARM64 runners take longer to generate TLS certificates, and sometimes fail if the timeout shorter (10 seconds).
-        output, err = p.communicate(timeout=20)
+        # openssl genrsa can stall on low-entropy aarch64 runners. Time out here
+        # (inside cluster.py's 80s budget) and kill the child so it stops
+        # writing to the shared ca.key.
+        try:
+            output, err = p.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.communicate()
+            raise
         if p.returncode != 0:
             raise Exception(
                 f"Failed to make key for {name}. Executed: {str(p.args)}:\n{err}"
             )
 
     # Build CA key
-    make_key(ca_key, 4096)
+    # 2048-bit is enough for test certs and faster on low-entropy runners.
+    make_key(ca_key, 2048)
 
     # Build server key
     make_key(SERVER_KEY, 2048)
@@ -321,14 +337,23 @@ def next_free_port(
     min_port: int = 6379, max_port: int = 55535, timeout: int = 60
 ) -> int:
     tic = time.perf_counter()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
     timeout_start = time.time()
     while time.time() < timeout_start + timeout:
         try:
             port = random.randint(min_port, max_port)
-            logging.debug(f"Trying port {port}")
-            sock.bind(("127.0.0.1", port))
-            sock.close()
+
+            # Check IPv4 address.
+            sock4 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock4.bind((DEFAULT_HOST_IPV4, port))
+            sock4.close()
+
+            # Check IPv6 address.
+            sock6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            sock6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            sock6.bind((DEFAULT_HOST_IPV6, port))
+            sock6.close()
+
             toc = time.perf_counter()
             logging.debug(f"next_free_port() is {port} Elapsed time: {toc - tic:0.4f}")
             return port
@@ -337,6 +362,7 @@ def next_free_port(
             # Sleep so we won't spam the system with sockets
             time.sleep(random.randint(0, 9) / 10000 + 0.01)
             continue
+
     logging.error("Timeout Expired: No free port found")
     raise Exception("Timeout Expired: No free port found")
 
@@ -412,6 +438,19 @@ def start_server(
         "--save",
         "",
     ]
+
+    # Bind server to both IPv4 and IPv6 loopback addresses.
+    cmd_args.extend(["--bind", DEFAULT_HOST_IPV4, DEFAULT_HOST_IPV6])
+
+    # If host is a DNS hostname, set cluster-announce-hostname so
+    # the cluster topology reports DNS names instead of IP addresses.
+    if cluster_mode:
+        try:
+            import ipaddress
+            ipaddress.ip_address(host)
+        except ValueError:
+            cmd_args.extend(["--cluster-announce-hostname", host])
+
     if server_version >= (7, 0, 0):
         cmd_args.extend(["--enable-debug-command", "yes"])
     # Enable multi-database support in cluster mode for Valkey 9.0+
@@ -463,6 +502,7 @@ def create_servers(
     tls_cert_file: Optional[str] = None,
     tls_key_file: Optional[str] = None,
     tls_ca_cert_file: Optional[str] = None,
+    tls_auth_clients: bool = False,
 ) -> List[Server]:
     tic = time.perf_counter()
     logging.debug("## Creating servers")
@@ -474,11 +514,11 @@ def create_servers(
         cert_file = tls_cert_file or SERVER_CRT
         key_file = tls_key_file or SERVER_KEY
         ca_file = tls_ca_cert_file or CA_CRT
-        
+
         # Only generate default certs if using default paths and they don't exist
         if not tls_cert_file and should_generate_new_tls_certs():
             generate_tls_certs()
-            
+
         tls_args = [
             "--tls-cluster",
             "yes",
@@ -488,10 +528,9 @@ def create_servers(
             key_file,
             "--tls-ca-cert-file",
             ca_file,
-            "--tls-auth-clients",  # Make it so client doesn't have to send cert
-            "no",
-            "--bind",
-            host,
+            # When true, the server requires a client certificate on every TLS connection.
+            "--tls-auth-clients",
+            "yes" if tls_auth_clients else "no",
             "--port",
             "0",
         ]
@@ -866,7 +905,7 @@ def is_address_already_in_use(
         if not os.path.exists(log_file):
             time.sleep(0.1)
             continue
-        
+
         with open(log_file, "r") as f:
             server_log = f.read()
             # Check for known error message variants because different C libraries
@@ -899,6 +938,17 @@ def dir_path(path: str):
 
 def stop_server(server: Server, cluster_folder: str, use_tls: bool, auth: str):
     logging.debug(f"Stopping server {server}")
+    try:
+        ping = subprocess.run(
+            [get_cli_command(), "-h", server.host, "-p", str(server.port),
+             *get_cli_option_args(cluster_folder, use_tls, auth), "PING"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if ping.returncode != 0:
+            logging.info(f"Server {server} is already down, skipping shutdown")
+            return
+    except subprocess.TimeoutExpired:
+        logging.debug(f"Ping to {server} timed out, attempting shutdown anyway")
     cmd_args = [
         get_cli_command(),
         "-h",
@@ -921,6 +971,9 @@ def stop_server(server: Server, cluster_folder: str, use_tls: bool, auth: str):
                 text=True,
             )
             output, err = p.communicate(timeout=5)
+            if err and "Connection refused" in err:
+                logging.info(f"Server {server} is already down")
+                return
             if err and "Warning: Using a password with '-a'" not in err:
                 err_msg = (
                     f"Failed to shutdown host {server.host}:{server.port}:\n {err}"
@@ -1074,7 +1127,7 @@ def main():
         type=str,
         help="Host address (default: %(default)s)",
         required=False,
-        default="127.0.0.1",
+        default=DEFAULT_HOST_IPV4,
     )
 
     parser.add_argument(
@@ -1170,25 +1223,34 @@ def main():
         help="The paths of the server modules to load.",
         required=False,
     )
-    
+
     parser_start.add_argument(
         "--tls-cert-file",
         type=str,
         help="Path to TLS certificate file (default: uses generated certificates)",
         required=False,
     )
-    
+
     parser_start.add_argument(
         "--tls-key-file",
         type=str,
         help="Path to TLS key file (default: uses generated certificates)",
         required=False,
     )
-    
+
     parser_start.add_argument(
         "--tls-ca-cert-file",
         type=str,
         help="Path to TLS CA certificate file (default: uses generated certificates)",
+        required=False,
+    )
+
+    parser_start.add_argument(
+        "--tls-auth-clients",
+        action="store_true",
+        default=False,
+        help="Require a client certificate on every TLS connection, i.e. "
+        "--tls-auth-clients yes (default: %(default)s)",
         required=False,
     )
 
@@ -1279,6 +1341,7 @@ def main():
             getattr(args, 'tls_cert_file', None),
             getattr(args, 'tls_key_file', None),
             getattr(args, 'tls_ca_cert_file', None),
+            getattr(args, 'tls_auth_clients', False),
         )
         if args.cluster_mode:
             # Create a cluster
@@ -1317,14 +1380,15 @@ def main():
                 "One of following arguments is required: --cluster-folder or --prefix"
             )
         tic = time.perf_counter()
+        stop_prefix = f"tls-{args.prefix}" if args.tls and args.prefix else args.prefix
         logging.info(
-            f"{datetime.now(timezone.utc)} Stopping script for cluster/s {args.cluster_folder or f'{args.prefix}*'} in {args.folder_path}"
+            f"{datetime.now(timezone.utc)} Stopping script for cluster/s {args.cluster_folder or f'{stop_prefix}*'} in {args.folder_path}"
         )
 
         stop_clusters(
             args.host,
             args.folder_path,
-            args.prefix,
+            stop_prefix,
             args.cluster_folder,
             args.tls,
             args.auth,

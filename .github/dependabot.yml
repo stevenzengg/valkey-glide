@@ -18,7 +18,7 @@ updates:
                   - "minor"
       labels:
           - "dependencies"
-          - "npm"
+          - "node 🐢"
 
     # Enable version updates for npm (Node client)
     - package-ecosystem: "npm"
@@ -37,8 +37,7 @@ updates:
                   - "minor"
       labels:
           - "dependencies"
-          - "npm"
-          - "node"
+          - "node 🐢"
 
     # Enable version updates for Gradle (Java)
     - package-ecosystem: "gradle"
@@ -57,8 +56,7 @@ updates:
                   - "minor"
       labels:
           - "dependencies"
-          - "gradle"
-          - "java"
+          - "java ☕"
 
     # Enable version updates for Cargo (Rust - glide-core)
     - package-ecosystem: "cargo"
@@ -77,8 +75,7 @@ updates:
                   - "minor"
       labels:
           - "dependencies"
-          - "cargo"
-          - "rust"
+          - "Rust ⚙️"
 
     # Enable version updates for Cargo (Rust - Java wrapper)
     - package-ecosystem: "cargo"
@@ -97,13 +94,12 @@ updates:
                   - "minor"
       labels:
           - "dependencies"
-          - "cargo"
-          - "rust"
-          - "java"
+          - "Rust ⚙️"
+          - "java ☕"
 
-    # Enable version updates for Cargo (Rust - Python wrapper)
+    # Enable version updates for Cargo (Rust - Python async wrapper)
     - package-ecosystem: "cargo"
-      directory: "/python"
+      directory: "/python/glide-async"
       schedule:
           interval: "weekly"
           day: "monday"
@@ -118,9 +114,143 @@ updates:
                   - "minor"
       labels:
           - "dependencies"
-          - "cargo"
-          - "rust"
-          - "python"
+          - "Rust ⚙️"
+          - "python 🐍"
+
+    # Enable version updates for Cargo (Rust - Python shared)
+    - package-ecosystem: "cargo"
+      directory: "/python/glide-shared"
+      schedule:
+          interval: "weekly"
+          day: "monday"
+          time: "09:00"
+      open-pull-requests-limit: 10
+      groups:
+          patch-updates:
+              update-types:
+                  - "patch"
+          minor-updates:
+              update-types:
+                  - "minor"
+      labels:
+          - "dependencies"
+          - "Rust ⚙️"
+          - "python 🐍"
+
+    # Enable version updates for Cargo (Rust - Node client)
+    - package-ecosystem: "cargo"
+      directory: "/node/rust-client"
+      schedule:
+          interval: "weekly"
+          day: "monday"
+          time: "09:00"
+      open-pull-requests-limit: 10
+      groups:
+          patch-updates:
+              update-types:
+                  - "patch"
+          minor-updates:
+              update-types:
+                  - "minor"
+      labels:
+          - "dependencies"
+          - "Rust ⚙️"
+          - "node 🐢"
+
+    # Enable version updates for Cargo (Rust - FFI / Go & Python sync bindings)
+    - package-ecosystem: "cargo"
+      directory: "/ffi"
+      schedule:
+          interval: "weekly"
+          day: "monday"
+          time: "09:00"
+      open-pull-requests-limit: 10
+      groups:
+          patch-updates:
+              update-types:
+                  - "patch"
+          minor-updates:
+              update-types:
+                  - "minor"
+      labels:
+          - "dependencies"
+          - "Rust ⚙️"
+
+    # Enable version updates for Cargo (Rust - telemetry)
+    - package-ecosystem: "cargo"
+      directory: "/glide-core/telemetry"
+      schedule:
+          interval: "weekly"
+          day: "monday"
+          time: "09:00"
+      open-pull-requests-limit: 10
+      groups:
+          patch-updates:
+              update-types:
+                  - "patch"
+          minor-updates:
+              update-types:
+                  - "minor"
+      labels:
+          - "dependencies"
+          - "Rust ⚙️"
+
+    # Enable version updates for Cargo (Rust - redis-rs vendored fork)
+    - package-ecosystem: "cargo"
+      directory: "/glide-core/redis-rs"
+      schedule:
+          interval: "weekly"
+          day: "monday"
+          time: "09:00"
+      open-pull-requests-limit: 10
+      groups:
+          patch-updates:
+              update-types:
+                  - "patch"
+          minor-updates:
+              update-types:
+                  - "minor"
+      labels:
+          - "dependencies"
+          - "Rust ⚙️"
+
+    # Enable version updates for Cargo (Rust - benchmarks)
+    - package-ecosystem: "cargo"
+      directory: "/benchmarks/rust"
+      schedule:
+          interval: "weekly"
+          day: "monday"
+          time: "09:00"
+      open-pull-requests-limit: 10
+      groups:
+          patch-updates:
+              update-types:
+                  - "patch"
+          minor-updates:
+              update-types:
+                  - "minor"
+      labels:
+          - "dependencies"
+          - "Rust ⚙️"
+
+    # Enable version updates for Cargo (Rust - logger core)
+    - package-ecosystem: "cargo"
+      directory: "/logger_core"
+      schedule:
+          interval: "weekly"
+          day: "monday"
+          time: "09:00"
+      open-pull-requests-limit: 10
+      groups:
+          patch-updates:
+              update-types:
+                  - "patch"
+          minor-updates:
+              update-types:
+                  - "minor"
+      labels:
+          - "dependencies"
+          - "Rust ⚙️"
 
     # Enable version updates for Go modules
     - package-ecosystem: "gomod"
@@ -139,7 +269,7 @@ updates:
                   - "minor"
       labels:
           - "dependencies"
-          - "go"
+          - "go 🏃"
 
     # Enable version updates for pip (Python)
     - package-ecosystem: "pip"
@@ -158,8 +288,7 @@ updates:
                   - "minor"
       labels:
           - "dependencies"
-          - "pip"
-          - "python"
+          - "python 🐍"
 
     # Enable version updates for GitHub Actions
     - package-ecosystem: "github-actions"

@@ -1,6 +1,8 @@
 /** Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0 */
 package glide.internal;
 
+import glide.api.logging.Logger;
+import glide.api.models.exceptions.CircuitBreakerException;
 import glide.api.models.exceptions.ClosingException;
 import glide.api.models.exceptions.ExecAbortException;
 import glide.api.models.exceptions.RequestException;
@@ -11,6 +13,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -32,6 +35,21 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public final class AsyncRegistry {
 
+    /** Rate-limit interval for timeout/disconnect log messages (in nanoseconds) */
+    private static final long LOG_RATE_LIMIT_NS = 5_000_000_000L; // 5 seconds
+
+    /** Last log timestamp for timeout errors */
+    private static final AtomicLong lastTimeoutLogNs = new AtomicLong(0);
+
+    /** Last log timestamp for disconnect errors */
+    private static final AtomicLong lastDisconnectLogNs = new AtomicLong(0);
+
+    /** Suppressed timeout log count since last emitted log */
+    private static final AtomicLong suppressedTimeoutLogs = new AtomicLong(0);
+
+    /** Suppressed disconnect log count since last emitted log */
+    private static final AtomicLong suppressedDisconnectLogs = new AtomicLong(0);
+
     /** Thread-safe storage for active futures. Using ConcurrentHashMap for lock-free operations. */
     private static final ConcurrentHashMap<Long, CompletableFuture<Object>> activeFutures =
             new ConcurrentHashMap<>(estimateInitialCapacity());
@@ -50,6 +68,16 @@ public final class AsyncRegistry {
     /** Thread-safe ID generator for correlation IDs. */
     private static final AtomicLong nextId = new AtomicLong(1);
 
+    /** Registration timestamps for measuring elapsed time on errors. */
+    private static final ConcurrentHashMap<Long, Long> registrationTimestamps =
+            new ConcurrentHashMap<>();
+
+    /**
+     * Shutdown flag to prevent race conditions between register() and shutdown()/failAllWithError().
+     * Once set to true, register() will return pre-failed futures instead of adding to the registry.
+     */
+    private static final AtomicBoolean isShutdown = new AtomicBoolean(false);
+
     /**
      * Single-threaded scheduler for timeout tasks. Uses a daemon thread so it won't prevent JVM
      * shutdown. Tasks are cancellable via {@link ScheduledFuture#cancel(boolean)}.
@@ -63,12 +91,135 @@ public final class AsyncRegistry {
                     });
 
     private static final Thread shutdownHook =
-            new Thread(AsyncRegistry::shutdown, "AsyncRegistry-Shutdown");
+            new Thread(AsyncRegistry::handleJvmShutdown, "AsyncRegistry-Shutdown");
 
     static {
         if (!"false".equalsIgnoreCase(System.getProperty("glide.autoShutdownHook", "true"))) {
             Runtime.getRuntime().addShutdownHook(shutdownHook);
         }
+    }
+
+    /**
+     * Handler invoked by the automatic JVM shutdown hook.
+     *
+     * <p>This is intentionally non-destructive. When the JVM is exiting, all shutdown hooks (this one
+     * and any registered by the user) run concurrently, and the client must remain usable so that a
+     * user's own shutdown hook can still issue commands (e.g. to persist state before exit). Setting
+     * the {@link #isShutdown} gate or cancelling in-flight futures here would abort those legitimate
+     * requests and previously surfaced as {@code ClosingException: Client is shutting down} (see <a
+     * href="https://github.com/valkey-io/valkey-glide/issues/4809">#4809</a>).
+     *
+     * <p>Eager cleanup is unnecessary at JVM exit: all internal GLIDE threads (callback workers,
+     * tokio runtime, timeout scheduler, cleaner) are daemon threads, and native resources are
+     * reclaimed by the OS once the process terminates. Deterministic teardown remains available
+     * through the explicit {@link #shutdown()} method and {@link
+     * glide.internal.GlideCoreClient#close()}.
+     */
+    static void handleJvmShutdown() {
+        // Intentionally a no-op: keep the client usable for concurrent user shutdown hooks.
+    }
+
+    private static void logLifecycle(Logger.Level level, long correlationId, String event) {
+        Long startedAtNanos = registrationTimestamps.get(correlationId);
+        Logger.log(
+                level,
+                "glide_java_async_registry",
+                () ->
+                        "{"
+                                + "\"glide_structured\":true,"
+                                + "\"glide_event\":\"glide_java_async_registry_"
+                                + event
+                                + "\","
+                                + "\"correlation_id\":"
+                                + correlationId
+                                + ","
+                                + "\"active_future_count\":"
+                                + activeFutures.size()
+                                + ","
+                                + "\"pending_timeout_count\":"
+                                + timeoutTasks.size()
+                                + ","
+                                + "\"duration_ms\":"
+                                + durationMillis(startedAtNanos)
+                                + "}");
+    }
+
+    private static void logLifecycle(
+            Logger.Level level, long correlationId, String event, String extraJsonFields) {
+        Long startedAtNanos = registrationTimestamps.get(correlationId);
+        Logger.log(
+                level,
+                "glide_java_async_registry",
+                () ->
+                        "{"
+                                + "\"glide_structured\":true,"
+                                + "\"glide_event\":\"glide_java_async_registry_"
+                                + event
+                                + "\","
+                                + "\"correlation_id\":"
+                                + correlationId
+                                + ","
+                                + "\"active_future_count\":"
+                                + activeFutures.size()
+                                + ","
+                                + "\"pending_timeout_count\":"
+                                + timeoutTasks.size()
+                                + ","
+                                + "\"duration_ms\":"
+                                + durationMillis(startedAtNanos)
+                                + (extraJsonFields == null || extraJsonFields.trim().isEmpty()
+                                        ? ""
+                                        : "," + extraJsonFields)
+                                + "}");
+    }
+
+    private static long durationMillis(Long startedAtNanos) {
+        if (startedAtNanos == null) {
+            return -1L;
+        }
+        return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAtNanos);
+    }
+
+    private static String jsonString(String value) {
+        if (value == null) {
+            return "null";
+        }
+        StringBuilder escaped = new StringBuilder(value.length() + 2);
+        escaped.append('"');
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            switch (c) {
+                case '"':
+                    escaped.append("\\\"");
+                    break;
+                case '\\':
+                    escaped.append("\\\\");
+                    break;
+                case '\b':
+                    escaped.append("\\b");
+                    break;
+                case '\f':
+                    escaped.append("\\f");
+                    break;
+                case '\n':
+                    escaped.append("\\n");
+                    break;
+                case '\r':
+                    escaped.append("\\r");
+                    break;
+                case '\t':
+                    escaped.append("\\t");
+                    break;
+                default:
+                    if (c < 0x20) {
+                        escaped.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        escaped.append(c);
+                    }
+            }
+        }
+        escaped.append('"');
+        return escaped.toString();
     }
 
     /** Estimate initial capacity for the active futures map using inflight limit with margin. */
@@ -98,16 +249,28 @@ public final class AsyncRegistry {
      * Register future with client-specific inflight limit, client handle for per-client tracking, and
      * optional Java-side timeout.
      *
+     * <p>If the registry is shutting down, the future will be completed exceptionally with a
+     * ClosingException and a special correlation ID (0) will be returned to indicate the registration
+     * failed.
+     *
      * @param future the future to register
      * @param maxInflightRequests per-client limit (0 = no Java-side limit, defer to core)
      * @param clientHandle native client handle for tracking
      * @param timeoutMillis Java-side timeout in milliseconds (0 = use Rust default timeout)
-     * @return correlation ID for native callback
+     * @return correlation ID for native callback, or 0 if shutdown is in progress
      */
     public static <T> long register(
             CompletableFuture<T> future, int maxInflightRequests, long clientHandle, long timeoutMillis) {
         if (future == null) {
             throw new IllegalArgumentException("Future cannot be null");
+        }
+
+        // Check shutdown flag before registering to prevent race conditions
+        // This ensures no futures are added after shutdown() starts clearing
+        if (isShutdown.get()) {
+            future.completeExceptionally(
+                    new ClosingException("Client is shutting down, cannot register new requests"));
+            return 0L; // Special ID indicating registration failed
         }
 
         // Client-specific inflight limit check
@@ -124,6 +287,30 @@ public final class AsyncRegistry {
 
         // Store original future for completion by native code
         activeFutures.put(correlationId, originalFuture);
+        registrationTimestamps.put(correlationId, System.nanoTime());
+        logLifecycle(
+                Logger.Level.DEBUG,
+                correlationId,
+                "registered",
+                "\"client_handle\":"
+                        + clientHandle
+                        + ",\"max_inflight_requests\":"
+                        + maxInflightRequests
+                        + ",\"timeout_ms\":"
+                        + timeoutMillis);
+
+        // Double-check shutdown flag after insertion to handle race with shutdown()
+        // If shutdown started between our first check and the put(), clean up and fail
+        if (isShutdown.get()) {
+            activeFutures.remove(correlationId);
+            registrationTimestamps.remove(correlationId);
+            if (maxInflightRequests > 0) {
+                decrementInflightCount(clientHandle);
+            }
+            future.completeExceptionally(
+                    new ClosingException("Client is shutting down, cannot register new requests"));
+            return 0L;
+        }
 
         // Schedule Java-side timeout if configured (0 = defer to Rust core timeout)
         if (timeoutMillis > 0) {
@@ -162,7 +349,18 @@ public final class AsyncRegistry {
                         () -> {
                             timeoutTasks.remove(correlationId);
                             if (future.completeExceptionally(new TimeoutException("Request timed out"))) {
+                                logLifecycle(
+                                        Logger.Level.WARN,
+                                        correlationId,
+                                        "timed_out",
+                                        "\"timeout_ms\":" + timeoutMillis);
                                 GlideNativeBridge.markTimedOut(correlationId);
+                            } else {
+                                logLifecycle(
+                                        Logger.Level.DEBUG,
+                                        correlationId,
+                                        "timeout_skipped_already_completed",
+                                        "\"timeout_ms\":" + timeoutMillis);
                             }
                         },
                         timeoutMillis,
@@ -181,8 +379,20 @@ public final class AsyncRegistry {
             long clientHandle) {
         future.whenComplete(
                 (result, error) -> {
+                    logLifecycle(
+                            error == null ? Logger.Level.DEBUG : Logger.Level.WARN,
+                            correlationId,
+                            "cleanup",
+                            "\"completed_with_error\":"
+                                    + (error != null)
+                                    + ",\"error_type\":"
+                                    + jsonString(error == null ? null : error.getClass().getName())
+                                    + ",\"error_message\":"
+                                    + jsonString(error == null ? null : error.getMessage()));
+
                     // Atomic cleanup - no race conditions
                     activeFutures.remove(correlationId);
+                    registrationTimestamps.remove(correlationId);
 
                     // Cancel the timeout task if it hasn't fired yet
                     // Using cancel(false) to avoid interrupting the scheduler thread
@@ -220,10 +430,25 @@ public final class AsyncRegistry {
      */
     public static boolean completeCallback(long correlationId, Object result) {
         CompletableFuture<Object> future = activeFutures.get(correlationId);
+        if (future == null) {
+            logLifecycle(Logger.Level.WARN, correlationId, "complete_success_missing_future");
+            return false;
+        }
         // complete() returns false if already completed
         // This prevents IllegalStateException from completing twice
         // Note: cleanup happens automatically in whenComplete()
-        return future != null && future.complete(result);
+        logLifecycle(
+                Logger.Level.DEBUG,
+                correlationId,
+                "complete_success_attempt",
+                "\"result_type\":" + jsonString(result == null ? null : result.getClass().getName()));
+        boolean completed = future.complete(result);
+        logLifecycle(
+                completed ? Logger.Level.DEBUG : Logger.Level.WARN,
+                correlationId,
+                completed ? "complete_success" : "complete_success_already_completed",
+                "\"result_type\":" + jsonString(result == null ? null : result.getClass().getName()));
+        return completed;
     }
 
     /**
@@ -239,13 +464,46 @@ public final class AsyncRegistry {
             long correlationId, int errorTypeCode, String errorMessage) {
         CompletableFuture<Object> future = activeFutures.get(correlationId);
         if (future == null) {
+            logLifecycle(
+                    Logger.Level.WARN,
+                    correlationId,
+                    "complete_error_missing_future",
+                    "\"error_type_code\":"
+                            + errorTypeCode
+                            + ",\"error_message\":"
+                            + jsonString(errorMessage));
             return false;
         }
 
         String msg =
-                (errorMessage == null || errorMessage.isBlank())
+                (errorMessage == null || errorMessage.trim().isEmpty())
                         ? "Unknown error from native code"
                         : errorMessage;
+
+        // Log elapsed time for timeout and disconnect errors (rate-limited)
+        if (errorTypeCode == 2 || errorTypeCode == 3) {
+            Long registeredAt = registrationTimestamps.get(correlationId);
+            if (registeredAt != null) {
+                long elapsedMs = (System.nanoTime() - registeredAt) / 1_000_000;
+                boolean isTimeout = errorTypeCode == 2;
+                AtomicLong lastLogRef = isTimeout ? lastTimeoutLogNs : lastDisconnectLogNs;
+                AtomicLong suppressedRef = isTimeout ? suppressedTimeoutLogs : suppressedDisconnectLogs;
+                String errorTypeName = isTimeout ? "Timeout" : "Disconnect";
+
+                long now = System.nanoTime();
+                long lastLog = lastLogRef.get();
+                if (now - lastLog >= LOG_RATE_LIMIT_NS && lastLogRef.compareAndSet(lastLog, now)) {
+                    long suppressed = suppressedRef.getAndSet(0);
+                    String suffix = suppressed > 0 ? " (suppressed " + suppressed + " similar)" : "";
+                    Logger.log(
+                            Logger.Level.WARN,
+                            "AsyncRegistry",
+                            errorTypeName + " after " + elapsedMs + "ms: " + msg + suffix);
+                } else {
+                    suppressedRef.incrementAndGet();
+                }
+            }
+        }
 
         RuntimeException ex;
         switch (errorTypeCode) {
@@ -258,12 +516,36 @@ public final class AsyncRegistry {
             case 1:
                 ex = new ExecAbortException(msg);
                 break;
+            case 4:
+                ex = new CircuitBreakerException(msg);
+                break;
             default:
                 ex = new RequestException(msg);
                 break;
         }
 
-        return future.completeExceptionally(ex);
+        logLifecycle(
+                Logger.Level.WARN,
+                correlationId,
+                "complete_error_attempt",
+                "\"error_type_code\":"
+                        + errorTypeCode
+                        + ",\"exception_type\":"
+                        + jsonString(ex.getClass().getName())
+                        + ",\"error_message\":"
+                        + jsonString(msg));
+        boolean completed = future.completeExceptionally(ex);
+        logLifecycle(
+                Logger.Level.WARN,
+                correlationId,
+                completed ? "complete_error" : "complete_error_already_completed",
+                "\"error_type_code\":"
+                        + errorTypeCode
+                        + ",\"exception_type\":"
+                        + jsonString(ex.getClass().getName())
+                        + ",\"error_message\":"
+                        + jsonString(msg));
+        return completed;
     }
 
     /** Get current pending operation count. */
@@ -271,8 +553,19 @@ public final class AsyncRegistry {
         return activeFutures.size();
     }
 
-    /** Shutdown cleanup - cancel all pending operations during client shutdown. */
+    /**
+     * Explicit, destructive shutdown cleanup - cancel all pending operations and stop the timeout
+     * scheduler. Sets the {@link #isShutdown} gate so no new requests are accepted afterward.
+     *
+     * <p>This is <em>not</em> wired to the automatic JVM shutdown hook (that path is intentionally
+     * non-destructive; see {@link #handleJvmShutdown()}). Call this only when you want deterministic
+     * teardown of the registry.
+     */
     public static void shutdown() {
+        // Set shutdown flag first to prevent new registrations
+        // This must happen before any clearing to avoid race conditions
+        isShutdown.set(true);
+
         // Cancel timeout tasks without interrupting (they're just scheduled, not running)
         timeoutTasks.values().forEach(task -> task.cancel(false));
         timeoutTasks.clear();
@@ -280,10 +573,36 @@ public final class AsyncRegistry {
         // Cancel user futures with interrupt (may be blocked waiting)
         activeFutures.values().forEach(future -> future.cancel(true));
         activeFutures.clear();
+        registrationTimestamps.clear();
         clientInflightCounts.clear();
 
         // Shutdown the timeout scheduler
         timeoutScheduler.shutdownNow();
+    }
+
+    /**
+     * Fail all pending futures with a {@link ClosingException}. Called from the native layer when a
+     * fatal infrastructure failure is detected (e.g., callback worker threads terminated or native
+     * panic). This ensures no future is left dangling.
+     *
+     * @param errorMessage description of the failure cause
+     */
+    public static void failAllWithError(String errorMessage) {
+        // Set shutdown flag first to prevent new registrations
+        // This must happen before any clearing to avoid race conditions
+        isShutdown.set(true);
+
+        String msg =
+                (errorMessage == null || errorMessage.isEmpty())
+                        ? "Native callback infrastructure failed"
+                        : errorMessage;
+        activeFutures.forEach((id, future) -> future.completeExceptionally(new ClosingException(msg)));
+        activeFutures.clear();
+        registrationTimestamps.clear();
+
+        timeoutTasks.values().forEach(task -> task.cancel(false));
+        timeoutTasks.clear();
+        clientInflightCounts.clear();
     }
 
     /** Clean up per-client tracking when a client is closed. */
@@ -293,10 +612,14 @@ public final class AsyncRegistry {
 
     /** Reset all internal state. Intended for test isolation and client shutdown cleanup. */
     public static void reset() {
+        // Reset shutdown flag first to allow new registrations
+        isShutdown.set(false);
+
         // Cancel timeout tasks without interrupting
         timeoutTasks.values().forEach(task -> task.cancel(false));
         timeoutTasks.clear();
         activeFutures.clear();
+        registrationTimestamps.clear();
         clientInflightCounts.clear();
         nextId.set(1);
     }
@@ -319,6 +642,15 @@ public final class AsyncRegistry {
      */
     public static int getActiveFutureCount() {
         return activeFutures.size();
+    }
+
+    /**
+     * Returns whether the registry is in shutdown state. Intended for testing and diagnostics.
+     *
+     * @return true if shutdown() or failAllWithError() has been called
+     */
+    public static boolean isShutdown() {
+        return isShutdown.get();
     }
 
     /**

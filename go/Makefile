@@ -64,12 +64,12 @@ endif
 
 install-build-tools:
 	go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.33.0
-	cargo install cbindgen
+	cargo install --locked cbindgen
 
 install-dev-tools:
 	go install github.com/vakenbolt/go-test-report@v0.9.3
-	go install mvdan.cc/gofumpt@v0.6.0
-	go install github.com/segmentio/golines@v0.12.2
+	go install mvdan.cc/gofumpt@v0.9.1
+	go install github.com/segmentio/golines@v0.13.0
 	go install honnef.co/go/tools/cmd/staticcheck@latest
 
 install-tools: install-build-tools install-dev-tools
@@ -114,7 +114,11 @@ build-glide-ffi: libglide_ffi gen-c-bindings
 
 gen-c-bindings:
 	cd $(GLIDE_FFI_PATH) && \
-	cbindgen --config cbindgen.toml --crate glide-ffi --output $(GO_DIR)lib.h --lang c
+	cbindgen -q --config cbindgen.toml --crate glide-ffi --output $(GO_DIR)/lib.h --lang c
+	@# Add include guard to prevent multiple inclusion errors with CGo
+	@awk 'NR==1 {print; print "#pragma once"; next} {print}' \
+		$(GO_DIR)/lib.h > $(GO_DIR)/lib.h.new && \
+		mv $(GO_DIR)/lib.h.new $(GO_DIR)/lib.h
 
 generate-protobuf:
 	rm -rf internal/protobuf
@@ -154,7 +158,7 @@ format:
 unit-test:
 	mkdir -p reports
 	set -o pipefail; \
-	go test -v ./... -skip 'Example|TestGlideTestSuite' $(if $(test-filter), -run $(test-filter)) \
+	go test -v ./... -skip 'Example|TestGlideTestSuite|TestPool|TestScope' $(if $(test-filter), -run $(test-filter)) \
 	| tee >(go tool test2json -t -p github.com/valkey-io/valkey-glide/go/v2/internal/utils | go-test-report -o reports/unit-tests.html -t unit-test > /dev/null)
 
 # example tests - skip complete IT suite (including MT)
@@ -177,11 +181,11 @@ integ-test: export TEST_FILTER = -skip "TestGlideTestSuite/TestModule" $(if $(te
 integ-test: __it
 
 # modules tests - run substask with default filter
-modules-test: export TEST_FILTER = $(if $(test-filter), -run $(test-filter), -testify.m TestGlideTestSuite/TestModule)
+modules-test: export TEST_FILTER = $(if $(test-filter), -run $(test-filter), -testify.m TestModule)
 modules-test: __it
 
-# pubsub tests - run subtask with the pubsub flag enabled
-pubsub-test: export TEST_FILTER = -skip "TestGlideTestSuite/TestModule" -pubsub -testify.m TestPubSub
+# pubsub tests - run pubsub tests using testify filter
+pubsub-test: export TEST_FILTER = -skip "TestGlideTestSuite/TestModule" -testify.m TestPubSub
 pubsub-test: __it
 
 # long timeout tests - run subtask with the long timeout flag enabled

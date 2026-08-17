@@ -9,6 +9,7 @@ This is the Valkey GLIDE mono-repository containing a Rust core (`glide-core`) a
 **Primary Languages Present:** Rust, Java, Python, Node.js/TypeScript, Go
 
 **Key Components:**
+
 - `glide-core/` - Core Rust implementation with async client logic
 - `ffi/` - Foreign Function Interface layer for language interoperability
 - `java/` - Java client bindings with Gradle build system
@@ -27,7 +28,32 @@ This is the Valkey GLIDE mono-repository containing a Rust core (`glide-core`) a
 **Design Constraints:** Async-first APIs, cluster-aware routing, batching support, cross-AZ affinity
 **Key Features:** Multi-slot command handling, PubSub auto-reconnection, cluster scan, OpenTelemetry integration
 
+### Python Free-Threading (3.14t) Concurrency Rules
+
+The Python async client (`python/glide-async/python/glide/glide_client.py`) supports free-threaded CPython (`3.14t`, GIL disabled). The module declares `#[pymodule(gil_used = false)]` in `glide-async/src/lib.rs` and the `_FREE_THREADED` flag dispatches response parsing to a `ThreadPoolExecutor` so completions can arrive on a non-event-loop thread.
+
+Cross-thread wakeups are the sharp edge here. Under trio, `_CompatFuture` wraps a `trio.Event`, and trio synchronization primitives are **not thread-safe**: calling `.set()` from a foreign thread marks the event set but never reschedules the parked waiter, so the `await` hangs forever with no timeout firing (the main thread is stuck in native code where Python signal handlers, including pytest-timeout's, cannot run). Any object completed from the response thread pool must hop back to its owning loop/run: asyncio uses `loop.call_soon_threadsafe`, trio uses the `trio.lowlevel.TrioToken.run_sync_soon` captured at future-creation time. When touching future/event completion, verify the wake path for both asyncio and trio.
+
+To build and run the suite against free-threaded Python locally (fast iteration beats CI):
+
+```bash
+# Install the free-threaded interpreter (Homebrew: python-freethreading -> python3.14t)
+python3.14t -m venv python/.env   # dev.py reuses an existing python/.env
+cd python && python3 dev.py build
+python3 dev.py test --args tests/async_tests/test_async_client.py --async-backend=trio -k ""
+# Confirm no-GIL: .env/bin/python -c "import sys; print(sys._is_gil_enabled())"  # -> False
+```
+
+Reproduce a suspected hang with a stack dump: `kill -ABRT <pid>` (faulthandler prints the parked Python stack) since py-spy needs root on macOS.
+
+### RESP2/RESP3 Response Normalization
+
+Valkey supports two wire protocols (RESP2 and RESP3) that may return structurally different responses for the same commands. For example, RESP2 returns flat arrays where RESP3 returns maps, and RESP2 returns bulk strings where RESP3 returns typed doubles.
+
+The Rust core normalizes these differences in `glide-core/src/client/value_conversion.rs` so that language bindings receive a consistent data structure regardless of protocol version; language bindings should *not* need to handle RESP2/RESP3 differences themselves. When adding a new command whose RESP2 and RESP3 responses differ, add or reuse an `ExpectedReturnType` variant and implement the conversion logic in `convert_to_expected_type`.
+
 **Supported Engine Versions:**
+
 | Engine Type | 6.2 | 7.0 | 7.1 | 7.2 | 8.0 | 8.1 |
 |-------------|-----|-----|-----|-----|-----|-----|
 | Valkey      | -   | -   | -   | ✓   | ✓   | ✓   |
@@ -36,12 +62,13 @@ This is the Valkey GLIDE mono-repository containing a Rust core (`glide-core`) a
 ## Build and Test Rules (Agents)
 
 ### Preferred (Make Targets)
+
 ```bash
 # Build all language bindings
 make all
 
 # Individual language builds
-make java          # Build Java client (release mode)
+make java          # Build Java client
 make python        # Build Python async + sync clients (release mode)
 make node          # Build Node.js client (release mode)
 make go            # Build Go client
@@ -66,6 +93,7 @@ make help          # List available targets
 ### Raw Equivalents Per Stack
 
 **Rust (glide-core):**
+
 ```bash
 cd glide-core
 cargo build --release
@@ -76,31 +104,71 @@ cargo fmt
 ```
 
 **Java:**
+
 ```bash
 cd java
-./gradlew :client:buildAllRelease
-./gradlew :integTest:test
+
+./gradlew :client:cleanRust
+./gradlew :client:clean
+./gradlew :client:buildRust
+./gradlew :client:buildAll
 ./gradlew :spotlessApply
+
+# Unit tests
+./gradlew :client:test                             # Run all unit tests
+./gradlew :client:test --tests 'BatchTests'        # Run unit tests from a class
+./gradlew :client:test --tests '*.latencyHistory'  # Run unit tests with a pattern
+
+# Integration tests
+./gradlew :integTest:test                               # Run all integration tests
+./gradlew :integTest:test --tests 'SharedCommandTests'  # Run integration tests from a class
+./gradlew :integTest:test --tests '*.latencyHistory'    # Run integration tests with a pattern
 ```
 
 **Python:**
+
 ```bash
 cd python
-python3 dev.py build --mode release
-python3 dev.py test
-python3 dev.py lint
+
+# Build
+python3 dev.py build --mode release               # Build both clients in release mode
+python3 dev.py build --client async --mode debug  # Build async client only in debug node (faster)
+
+# Lint (isort, black, flake8, mypy)
+python3 dev.py lint          # Fix formatting
+python3 dev.py lint --check  # Check only
+
+# Integration tests
+python3 dev.py test                          # Run all tests
+python3 dev.py test --args -k "test_memory"  # Run all tests matching a pattern
+
+# Clean (Rust and Python artifacts)
+python3 dev.py clean                 # Clean both client artifacts
+python3 dev.py clean --client async  # Clean shared and async client artifacts
+
 ```
 
 **Node.js/TypeScript:**
+
 ```bash
 cd node
-npm install
-npm run build:release
-npm test
-npx run lint:fix
+
+# Install and build
+npm ci
+npm run build:release  # Build Rust and TypeScript (slow)
+npm run build:ts       # Build TypeScript only (fast)
+
+# Lint
+npm run lint:fix
+
+# Integration tests
+npm test                                     # Run all tests
+npm test -- --testNamePattern='memoryStats'  # Run tests matching a pattern
+npm test -- --testPathPattern='GlideClient'  # Run tests from a specific file
 ```
 
 **Go:**
+
 ```bash
 cd go
 make build
@@ -111,6 +179,7 @@ go test ./...
 ```
 
 **Benchmarks:**
+
 ```bash
 # Rust benchmarks
 cd glide-core && cargo bench
@@ -147,7 +216,7 @@ git rebase -i HEAD~n --signoff
 
 Use conventional commit format for all commit messages:
 
-```
+```text
 <type>(<scope>): <description>
 
 [optional body]
@@ -162,6 +231,7 @@ Use conventional commit format for all commit messages:
 ## Guardrails & Policies
 
 ### Generated Outputs (Never Commit)
+
 - `target/` - Rust build artifacts
 - `node_modules/` - Node.js dependencies
 - `.build/` - Make build cache
@@ -173,10 +243,12 @@ Use conventional commit format for all commit messages:
 - Language-specific build directories per `.gitignore`
 
 ### Cross-Language Changes
+
 - Follow semantic versioning for breaking changes
 - Test changes across affected language bindings
 
 ### Security & Code Quality
+
 - Never commit secrets, credentials, or API keys
 - Follow SECURITY.md for vulnerability reporting
 - Run lint/format targets before committing
@@ -185,7 +257,7 @@ Use conventional commit format for all commit messages:
 
 ## Project Structure (Essential)
 
-```
+```text
 valkey-glide/
 ├── glide-core/          # Core Rust implementation
 ├── ffi/                 # Foreign Function Interface layer
@@ -224,7 +296,7 @@ valkey-glide/
 
 - **Getting Started:** [README.md](./README.md)
 - **Contributing:** [CONTRIBUTING.md](./CONTRIBUTING.md)
-- **Security:** [SECURITY.md](./SECURITY.md)
+- **Security:** [SECURITY.md](https://github.com/valkey-io/.github/blob/main/SECURITY.md)
 - **Documentation:** [docs/README.md](./docs/README.md)
 - **Examples:** [examples/](./examples/)
 - **Language-Specific Guides:**

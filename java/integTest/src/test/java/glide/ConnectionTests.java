@@ -7,6 +7,7 @@ import static glide.TestConfiguration.STANDALONE_HOSTS;
 import static glide.TestUtilities.*;
 import static glide.api.BaseClient.OK;
 import static glide.api.models.configuration.RequestRoutingConfiguration.SimpleMultiNodeRoute.ALL_NODES;
+import static glide.api.models.configuration.RequestRoutingConfiguration.SimpleMultiNodeRoute.ALL_PRIMARIES;
 import static glide.api.models.configuration.RequestRoutingConfiguration.SlotType.PRIMARY;
 import static glide.api.models.configuration.RequestRoutingConfiguration.SlotType.REPLICA;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -20,12 +21,31 @@ import glide.api.BaseClient;
 import glide.api.GlideClient;
 import glide.api.GlideClusterClient;
 import glide.api.models.ClusterValue;
+import glide.api.models.commands.ClientPauseMode;
 import glide.api.models.commands.InfoOptions;
-import glide.api.models.configuration.*;
+import glide.api.models.configuration.AddressResolver;
+import glide.api.models.configuration.AdvancedGlideClientConfiguration;
+import glide.api.models.configuration.AdvancedGlideClusterClientConfiguration;
+import glide.api.models.configuration.BackoffStrategy;
+import glide.api.models.configuration.ClientCircuitBreakerConfiguration;
+import glide.api.models.configuration.GlideClientConfiguration;
+import glide.api.models.configuration.GlideClusterClientConfiguration;
+import glide.api.models.configuration.NodeAddress;
+import glide.api.models.configuration.PeriodicChecksManualInterval;
+import glide.api.models.configuration.PeriodicChecksStatus;
+import glide.api.models.configuration.ProtocolVersion;
+import glide.api.models.configuration.ReadFrom;
+import glide.api.models.configuration.RequestRoutingConfiguration;
+import glide.api.models.configuration.ResolvedAddress;
+import glide.api.models.configuration.TlsAdvancedConfiguration;
 import glide.api.models.exceptions.ClosingException;
 import glide.cluster.ValkeyCluster;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -45,7 +65,7 @@ public class ConnectionTests {
     @EnumSource(ProtocolVersion.class)
     @SneakyThrows
     public void basic_client(ProtocolVersion protocol) {
-        var regularClient =
+        GlideClient regularClient =
                 GlideClient.createClient(commonClientConfig().protocol(protocol).build()).get();
         regularClient.close();
     }
@@ -54,7 +74,7 @@ public class ConnectionTests {
     @EnumSource(ProtocolVersion.class)
     @SneakyThrows
     public void cluster_client(ProtocolVersion protocol) {
-        var clusterClient =
+        GlideClusterClient clusterClient =
                 GlideClusterClient.createClient(commonClusterClientConfig().protocol(protocol).build())
                         .get();
         clusterClient.close();
@@ -83,7 +103,7 @@ public class ConnectionTests {
             int requestTimeout,
             BackoffStrategy backoffStrategy) {
         if (clusterMode) {
-            var advancedConfiguration =
+            AdvancedGlideClusterClientConfiguration advancedConfiguration =
                     AdvancedGlideClusterClientConfiguration.builder()
                             .connectionTimeout(connectionTimeout)
                             .build();
@@ -94,7 +114,7 @@ public class ConnectionTests {
                                     .build())
                     .get();
         }
-        var advancedConfiguration =
+        AdvancedGlideClientConfiguration advancedConfiguration =
                 AdvancedGlideClientConfiguration.builder().connectionTimeout(connectionTimeout).build();
         return GlideClient.createClient(
                         commonClientConfig()
@@ -108,7 +128,7 @@ public class ConnectionTests {
     @SneakyThrows
     public BaseClient createClientWithTLSMode(boolean isCluster, boolean useInsecureTLS) {
         if (isCluster) {
-            var advancedConfiguration =
+            AdvancedGlideClusterClientConfiguration advancedConfiguration =
                     AdvancedGlideClusterClientConfiguration.builder()
                             .tlsAdvancedConfiguration(
                                     TlsAdvancedConfiguration.builder().useInsecureTLS(useInsecureTLS).build())
@@ -117,7 +137,7 @@ public class ConnectionTests {
                             commonClusterClientConfig().advancedConfiguration(advancedConfiguration).build())
                     .get();
         }
-        var advancedConfiguration =
+        AdvancedGlideClientConfiguration advancedConfiguration =
                 AdvancedGlideClientConfiguration.builder()
                         .tlsAdvancedConfiguration(
                                 TlsAdvancedConfiguration.builder().useInsecureTLS(useInsecureTLS).build())
@@ -135,6 +155,11 @@ public class ConnectionTests {
     @Test
     public void test_routing_by_slot_to_replica_with_az_affinity_strategy_to_all_replicas() {
         assumeTrue(SERVER_VERSION.isGreaterThanOrEqualTo("8.0.0"), "Skip for versions below 8");
+        // Windows integration tests has replicas set to zero due to resource limitations
+        // on Github Action using Windows runner with WSL
+        // TODO: Remove the skip after fixing Windows Replicas issues
+        // https://github.com/valkey-io/valkey-glide/issues/5210
+        assumeTrue(!isWindows(), "Skip on Windows");
 
         String az = "us-east-1a";
 
@@ -144,25 +169,14 @@ public class ConnectionTests {
         assertEquals(configSetClient.configResetStat().get(), OK);
 
         // Get Replica Count for current cluster
-        var clusterInfo =
-                configSetClient
-                        .customCommand(
-                                new String[] {"INFO", "REPLICATION"},
-                                new RequestRoutingConfiguration.SlotKeyRoute("key", PRIMARY))
-                        .get();
         long nReplicas =
-                Long.parseLong(
-                        Stream.of(((String) clusterInfo.getSingleValue()).split("\\R"))
-                                .map(line -> line.split(":", 2))
-                                .filter(parts -> parts.length == 2 && parts[0].trim().equals("connected_slaves"))
-                                .map(parts -> parts[1].trim())
-                                .findFirst()
-                                .get());
+                getReplicaCount(
+                        configSetClient, new RequestRoutingConfiguration.SlotKeyRoute("key", PRIMARY));
         long nGetCalls = 3 * nReplicas;
         String getCmdstat = String.format("cmdstat_get:calls=%d", 3);
 
         // Setting AZ for all Nodes
-        configSetClient.configSet(Map.of("availability-zone", az), ALL_NODES).get();
+        configSetClient.configSet(Collections.singletonMap("availability-zone", az), ALL_NODES).get();
         configSetClient.close();
 
         // Creating Client with AZ configuration for testing
@@ -172,7 +186,7 @@ public class ConnectionTests {
         Map<String, Map<String, String>> azData = azGetResult.getMultiValue();
 
         // Check that all replicas have the availability zone set to the az
-        for (var entry : azData.entrySet()) {
+        for (Map.Entry<String, Map<String, String>> entry : azData.entrySet()) {
             assertEquals(az, entry.getValue().get("availability-zone"));
         }
 
@@ -211,7 +225,7 @@ public class ConnectionTests {
                 GlideClusterClient.createClient(azClusterClientConfig().requestTimeout(2000).build()).get();
 
         // reset availability zone for all nodes
-        configSetClient.configSet(Map.of("availability-zone", ""), ALL_NODES).get();
+        configSetClient.configSet(Collections.singletonMap("availability-zone", ""), ALL_NODES).get();
         assertEquals(configSetClient.configResetStat().get(), OK);
 
         Long fooSlotKey =
@@ -223,7 +237,7 @@ public class ConnectionTests {
         int convertedKey = Integer.parseInt(fooSlotKey.toString());
         configSetClient
                 .configSet(
-                        Map.of("availability-zone", az),
+                        Collections.singletonMap("availability-zone", az),
                         new RequestRoutingConfiguration.SlotIdRoute(convertedKey, REPLICA))
                 .get();
         configSetClient.close();
@@ -289,9 +303,9 @@ public class ConnectionTests {
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
     public void test_connection_timeout(boolean clusterMode) {
-        var backoffStrategy =
+        BackoffStrategy backoffStrategy =
                 BackoffStrategy.builder().exponentBase(2).factor(100).numOfRetries(1).build();
-        var client = createConnectionTimeoutClient(clusterMode, 250, 20000, backoffStrategy);
+        BaseClient client = createConnectionTimeoutClient(clusterMode, 250, 20000, backoffStrategy);
 
         // Runnable for long-running DEBUG SLEEP command
         Runnable debugSleepTask =
@@ -331,7 +345,7 @@ public class ConnectionTests {
                 () -> {
                     try {
                         Thread.sleep(1000); // Wait to ensure the debug sleep command is running
-                        var timeoutClient =
+                        BaseClient timeoutClient =
                                 createConnectionTimeoutClient(clusterMode, 10000, 250, backoffStrategy);
                         assertEquals(timeoutClient.set("key", "value").get(), "OK");
                         timeoutClient.close();
@@ -344,7 +358,7 @@ public class ConnectionTests {
         ExecutorService executorService = Executors.newFixedThreadPool(3);
         try {
             executorService.invokeAll(
-                    List.of(
+                    Arrays.asList(
                             Executors.callable(debugSleepTask),
                             Executors.callable(failToConnectTask),
                             Executors.callable(connectToClientTask)));
@@ -361,6 +375,11 @@ public class ConnectionTests {
     @Test
     public void test_az_affinity_replicas_and_primary_routes_to_primary() {
         assumeTrue(SERVER_VERSION.isGreaterThanOrEqualTo("8.0.0"), "Skip for versions below 8");
+        // Windows integration tests has replicas set to zero due to resource limitations
+        // on Github Action using Windows runner with WSL
+        // TODO: Remove the skip after fixing Windows Replicas issues
+        // https://github.com/valkey-io/valkey-glide/issues/5210
+        assumeTrue(!isWindows(), "Skip on Windows");
 
         String az = "us-east-1a";
         String otherAz = "us-east-1b";
@@ -373,12 +392,14 @@ public class ConnectionTests {
 
         // Reset stats and set all nodes to other_az
         assertEquals(configSetClient.configResetStat().get(), OK);
-        configSetClient.configSet(Map.of("availability-zone", otherAz), ALL_NODES).get();
+        configSetClient
+                .configSet(Collections.singletonMap("availability-zone", otherAz), ALL_NODES)
+                .get();
 
         // Set primary for slot 12182 to az
         configSetClient
                 .configSet(
-                        Map.of("availability-zone", az),
+                        Collections.singletonMap("availability-zone", az),
                         new RequestRoutingConfiguration.SlotIdRoute(12182, PRIMARY))
                 .get();
 
@@ -445,6 +466,98 @@ public class ConnectionTests {
 
     @SneakyThrows
     @Test
+    public void test_all_nodes_routes_to_primary_and_replicas() {
+        assumeTrue(SERVER_VERSION.isGreaterThanOrEqualTo("8.0.0"), "Skip for versions below 8");
+        // Windows integration tests has replicas set to zero due to resource limitations
+        // on Github Action using Windows runner with WSL
+        // TODO: Remove the skip after fixing Windows Replicas issues
+        // https://github.com/valkey-io/valkey-glide/issues/5210
+        assumeTrue(!isWindows(), "Skip on Windows");
+
+        // Use more calls to ensure statistical significance for round-robin distribution
+        int nGetCalls = 60;
+
+        try (GlideClusterClient client =
+                GlideClusterClient.createClient(
+                                commonClusterClientConfig()
+                                        .readFrom(ReadFrom.ALL_NODES)
+                                        .requestTimeout(2000)
+                                        .build())
+                        .get()) {
+            assertEquals(client.configResetStat(ALL_NODES).get(), OK);
+
+            // Execute GET commands for key "foo" asynchronously
+            List<CompletableFuture<String>> futures = new ArrayList<>();
+            for (int i = 0; i < nGetCalls; i++) {
+                futures.add(client.get("foo"));
+            }
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get();
+
+            ClusterValue<String> infoResult =
+                    client.info(new InfoOptions.Section[] {InfoOptions.Section.ALL}, ALL_NODES).get();
+            Map<String, String> infoData = infoResult.getMultiValue();
+
+            // Get replica count for the slot that handles key "foo"
+            ClusterValue<Object> clusterInfo =
+                    client
+                            .customCommand(
+                                    new String[] {"INFO", "REPLICATION"},
+                                    new RequestRoutingConfiguration.SlotKeyRoute("foo", PRIMARY))
+                            .get();
+            long nReplicas =
+                    Long.parseLong(
+                            Stream.of(((String) clusterInfo.getSingleValue()).split("\\R"))
+                                    .map(line -> line.split(":", 2))
+                                    .filter(parts -> parts.length == 2 && parts[0].trim().equals("connected_slaves"))
+                                    .map(parts -> parts[1].trim())
+                                    .findFirst()
+                                    .get());
+
+            // Count nodes that received GET calls
+            long nodesWithCalls =
+                    infoData.values().stream().filter(value -> value.contains("cmdstat_get:calls=")).count();
+
+            // Verify that primary + replicas for this slot received calls (slot-based routing)
+            assertEquals(
+                    nReplicas + 1,
+                    nodesWithCalls,
+                    "ALL_NODES should route to primary and all replicas for the slot. Expected "
+                            + (nReplicas + 1)
+                            + " nodes, got "
+                            + nodesWithCalls);
+
+            // Verify both primary and replicas received calls
+            long primaryCalls =
+                    infoData.values().stream()
+                            .filter(
+                                    value -> value.contains("cmdstat_get:calls=") && value.contains("role:master"))
+                            .count();
+            long replicaCalls =
+                    infoData.values().stream()
+                            .filter(value -> value.contains("cmdstat_get:calls=") && value.contains("role:slave"))
+                            .count();
+
+            assertTrue(primaryCalls > 0, "Primary should receive calls with ALL_NODES strategy");
+            assertTrue(replicaCalls > 0, "Replicas should receive calls with ALL_NODES strategy");
+
+            // Verify total GET calls
+            long totalGetCalls =
+                    infoData.values().stream()
+                            .filter(value -> value.contains("cmdstat_get:calls="))
+                            .mapToInt(
+                                    value -> {
+                                        int startIndex =
+                                                value.indexOf("cmdstat_get:calls=") + "cmdstat_get:calls=".length();
+                                        int endIndex = value.indexOf(",", startIndex);
+                                        return Integer.parseInt(value.substring(startIndex, endIndex));
+                                    })
+                            .sum();
+            assertEquals(nGetCalls, totalGetCalls, "Total GET calls mismatch");
+        }
+    }
+
+    @SneakyThrows
+    @Test
     public void test_az_affinity_replicas_and_primary_prioritizes_replicas_over_primary() {
         assumeTrue(SERVER_VERSION.isGreaterThanOrEqualTo("8.0.0"), "Skip for versions below 8");
         // Windows integration tests has replicas set to zero. This is set because of the resource
@@ -469,12 +582,14 @@ public class ConnectionTests {
         assertEquals(configSetClient.configResetStat().get(), OK);
 
         // Set ALL nodes to otherAz (us-east-1a)
-        configSetClient.configSet(Map.of("availability-zone", otherAz), ALL_NODES).get();
+        configSetClient
+                .configSet(Collections.singletonMap("availability-zone", otherAz), ALL_NODES)
+                .get();
 
         // Set REPLICA for slot to clientAz (us-east-1b)
         configSetClient
                 .configSet(
-                        Map.of("availability-zone", clientAz),
+                        Collections.singletonMap("availability-zone", clientAz),
                         new RequestRoutingConfiguration.SlotIdRoute(slot, REPLICA))
                 .get();
 
@@ -620,6 +735,7 @@ public class ConnectionTests {
 
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
+    @Timeout(30)
     public void test_lazy_connection_establishes_on_first_command(boolean clusterMode)
             throws Exception {
         BaseClient monitoringClient = null;
@@ -772,10 +888,12 @@ public class ConnectionTests {
     @Test
     public void test_tcp_nodelay_default_value() {
         // Verify default is null (not set)
-        var standaloneConfig = AdvancedGlideClientConfiguration.builder().build();
+        AdvancedGlideClientConfiguration standaloneConfig =
+                AdvancedGlideClientConfiguration.builder().build();
         assertEquals(null, standaloneConfig.getTcpNoDelay());
 
-        var clusterConfig = AdvancedGlideClusterClientConfiguration.builder().build();
+        AdvancedGlideClusterClientConfiguration clusterConfig =
+                AdvancedGlideClusterClientConfiguration.builder().build();
         assertEquals(null, clusterConfig.getTcpNoDelay());
     }
 
@@ -800,7 +918,7 @@ public class ConnectionTests {
         // Test explicit true
         BaseClient clientTrue;
         if (clusterMode) {
-            var advancedConfig =
+            AdvancedGlideClusterClientConfiguration advancedConfig =
                     AdvancedGlideClusterClientConfiguration.builder().tcpNoDelay(true).build();
             clientTrue =
                     GlideClusterClient.createClient(
@@ -808,7 +926,8 @@ public class ConnectionTests {
                             .get();
             assertEquals("PONG", ((GlideClusterClient) clientTrue).ping().get());
         } else {
-            var advancedConfig = AdvancedGlideClientConfiguration.builder().tcpNoDelay(true).build();
+            AdvancedGlideClientConfiguration advancedConfig =
+                    AdvancedGlideClientConfiguration.builder().tcpNoDelay(true).build();
             clientTrue =
                     GlideClient.createClient(
                                     commonClientConfig().advancedConfiguration(advancedConfig).build())
@@ -822,7 +941,7 @@ public class ConnectionTests {
         // Test explicit false
         BaseClient clientFalse;
         if (clusterMode) {
-            var advancedConfig =
+            AdvancedGlideClusterClientConfiguration advancedConfig =
                     AdvancedGlideClusterClientConfiguration.builder().tcpNoDelay(false).build();
             clientFalse =
                     GlideClusterClient.createClient(
@@ -830,7 +949,8 @@ public class ConnectionTests {
                             .get();
             assertEquals("PONG", ((GlideClusterClient) clientFalse).ping().get());
         } else {
-            var advancedConfig = AdvancedGlideClientConfiguration.builder().tcpNoDelay(false).build();
+            AdvancedGlideClientConfiguration advancedConfig =
+                    AdvancedGlideClientConfiguration.builder().tcpNoDelay(false).build();
             clientFalse =
                     GlideClient.createClient(
                                     commonClientConfig().advancedConfiguration(advancedConfig).build())
@@ -867,7 +987,7 @@ public class ConnectionTests {
 
         // Configure client with fake address - connection should succeed because
         // resolver translates it to the real address
-        var client =
+        GlideClient client =
                 GlideClient.createClient(
                                 GlideClientConfiguration.builder()
                                         .address(NodeAddress.builder().host(fakeHost).port(fakePort).build())
@@ -908,7 +1028,7 @@ public class ConnectionTests {
 
         // Configure client with fake address - connection should succeed because
         // resolver translates it to the real address
-        var client =
+        GlideClusterClient client =
                 GlideClusterClient.createClient(
                                 GlideClusterClientConfiguration.builder()
                                         .address(NodeAddress.builder().host(fakeHost).port(fakePort).build())
@@ -923,5 +1043,151 @@ public class ConnectionTests {
         assertEquals("cluster_resolver_test_value", client.get("cluster_resolver_test_key").get());
 
         client.close();
+    }
+
+    @Test
+    @SneakyThrows
+    public void test_address_resolver_cluster_client_throws_exception() {
+        // Get the actual server address from test configuration
+        String[] actualHostParts = CLUSTER_HOSTS[0].split(":");
+        String actualHost = actualHostParts[0];
+        int actualPort = Integer.parseInt(actualHostParts[1]);
+
+        AddressResolver resolver =
+                (host, port) -> {
+                    throw new RuntimeException("test-exception");
+                };
+
+        GlideClusterClient client =
+                GlideClusterClient.createClient(
+                                GlideClusterClientConfiguration.builder()
+                                        .address(NodeAddress.builder().host(actualHost).port(actualPort).build())
+                                        .addressResolver(resolver)
+                                        .build())
+                        .get();
+
+        // Connection still goes through, as the fallback is to use the original address if resolver
+        // throws an exception
+        assertEquals("PONG", client.ping().get());
+        assertEquals(
+                "OK", client.set("cluster_resolver_test_key", "cluster_resolver_test_value").get());
+        assertEquals("cluster_resolver_test_value", client.get("cluster_resolver_test_key").get());
+
+        client.close();
+    }
+
+    @Test
+    @SneakyThrows
+    public void test_address_resolver_cluster_client_returns_null() {
+        // Get the actual server address from test configuration
+        String[] actualHostParts = CLUSTER_HOSTS[0].split(":");
+        String actualHost = actualHostParts[0];
+        int actualPort = Integer.parseInt(actualHostParts[1]);
+
+        AddressResolver resolver = (host, port) -> null;
+
+        GlideClusterClient client =
+                GlideClusterClient.createClient(
+                                GlideClusterClientConfiguration.builder()
+                                        .address(NodeAddress.builder().host(actualHost).port(actualPort).build())
+                                        .addressResolver(resolver)
+                                        .build())
+                        .get();
+
+        // Connection still goes through, as the fallback is to use the original address if resolver
+        // returns null
+        assertEquals("PONG", client.ping().get());
+        assertEquals(
+                "OK", client.set("cluster_resolver_test_key", "cluster_resolver_test_value").get());
+        assertEquals("cluster_resolver_test_value", client.get("cluster_resolver_test_key").get());
+
+        client.close();
+    }
+
+    @ParameterizedTest
+    @EnumSource(ProtocolVersion.class)
+    @SneakyThrows
+    public void test_client_pause_and_unpause_standalone(ProtocolVersion protocol) {
+        try (GlideClient client =
+                GlideClient.createClient(commonClientConfig().protocol(protocol).build()).get()) {
+
+            // pause with default mode (ALL implied by server)
+            assertEquals(OK, client.clientPause(100).get());
+            assertEquals(OK, client.clientUnpause().get());
+
+            // pause with explicit WRITE mode
+            assertEquals(OK, client.clientPause(100, ClientPauseMode.WRITE).get());
+            assertEquals(OK, client.clientUnpause().get());
+
+            // pause with explicit ALL mode
+            assertEquals(OK, client.clientPause(100, ClientPauseMode.ALL).get());
+            assertEquals(OK, client.clientUnpause().get());
+
+            // zero timeout: immediately unpauses, subsequent command must succeed
+            assertEquals(OK, client.clientPause(0).get());
+            assertEquals("PONG", client.ping().get());
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(ProtocolVersion.class)
+    @SneakyThrows
+    public void test_client_pause_and_unpause_cluster(ProtocolVersion protocol) {
+        try (GlideClusterClient client =
+                GlideClusterClient.createClient(commonClusterClientConfig().protocol(protocol).build())
+                        .get()) {
+
+            // default route (ALL_PRIMARIES)
+            assertEquals(OK, client.clientPause(100).get());
+            assertEquals(OK, client.clientUnpause().get());
+
+            // explicit ALL_PRIMARIES route
+            assertEquals(OK, client.clientPause(100, ALL_PRIMARIES).get());
+            assertEquals(OK, client.clientUnpause(ALL_PRIMARIES).get());
+
+            // with WRITE mode, default route
+            assertEquals(OK, client.clientPause(100, ClientPauseMode.WRITE).get());
+            assertEquals(OK, client.clientUnpause().get());
+
+            // with WRITE mode, explicit route
+            assertEquals(OK, client.clientPause(100, ClientPauseMode.WRITE, ALL_PRIMARIES).get());
+            assertEquals(OK, client.clientUnpause(ALL_PRIMARIES).get());
+
+            // zero timeout + verify cluster still responsive
+            assertEquals(OK, client.clientPause(0).get());
+            assertEquals("PONG", client.ping().get());
+        }
+    }
+
+    @SneakyThrows
+    @Test
+    public void test_client_circuit_breaker_config_connects_successfully() {
+        // Verify client connects and operates normally with CB enabled
+        GlideClusterClient clusterClient =
+                GlideClusterClient.createClient(
+                                commonClusterClientConfig()
+                                        .clientCircuitBreakerConfiguration(
+                                                ClientCircuitBreakerConfiguration.builder()
+                                                        .windowSizeMs(10000)
+                                                        .failureRateThreshold(0.5f)
+                                                        .minErrors(50)
+                                                        .openTimeoutMs(5000)
+                                                        .countTimeouts(false)
+                                                        .consecutiveSuccesses(3)
+                                                        .build())
+                                        .build())
+                        .get();
+        assertEquals("PONG", clusterClient.ping().get());
+        clusterClient.close();
+
+        GlideClient standaloneClient =
+                GlideClient.createClient(
+                                commonClientConfig()
+                                        .clientCircuitBreakerConfiguration(
+                                                ClientCircuitBreakerConfiguration.builder().build())
+                                        .build())
+                        .get();
+        assertEquals("PONG", standaloneClient.ping().get());
+        standaloneClient.close();
     }
 }

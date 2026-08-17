@@ -25,7 +25,9 @@ import lombok.experimental.SuperBuilder;
  *         .clientName("GLIDE")
  *         .subscriptionConfiguration(subscriptionConfiguration)
  *         .inflightRequestsLimit(1000)
+ *         .clientSideCache(ClientSideCache.create(1024, 60000))
  *         .advancedConfiguration(AdvancedGlideClientConfiguration.builder().connectionTimeout(500).build())
+ *         .readOnly(true)
  *         .build();
  * }</pre>
  */
@@ -34,6 +36,9 @@ import lombok.experimental.SuperBuilder;
 @ToString
 public class GlideClientConfiguration extends BaseClientConfiguration {
 
+    /** Client-side cache configuration. If provided, enables caching for this client. */
+    private final ClientSideCache clientSideCache;
+
     /** Subscription configuration for the current client. */
     private final StandaloneSubscriptionConfiguration subscriptionConfiguration;
 
@@ -41,4 +46,30 @@ public class GlideClientConfiguration extends BaseClientConfiguration {
     @Builder.Default
     private final AdvancedGlideClientConfiguration advancedConfiguration =
             AdvancedGlideClientConfiguration.builder().build();
+
+    /**
+     * When true, enables read-only mode for the standalone client. In read-only mode:
+     *
+     * <ul>
+     *   <li>The client skips primary node detection (INFO REPLICATION command)
+     *   <li>All connected nodes are treated as valid read targets
+     *   <li>Write commands are blocked and will return an error
+     *   <li>The default ReadFrom strategy becomes PREFER_REPLICA if not explicitly set
+     * </ul>
+     *
+     * <p>This is useful for connecting to replica-only deployments or when you want to prevent
+     * accidental write operations.
+     *
+     * <p>Note: read-only mode is not compatible with AZ_AFFINITY or AZ_AFFINITY_REPLICAS_AND_PRIMARY
+     * read strategies.
+     *
+     * <p>Defaults to false.
+     */
+    @Builder.Default private final boolean readOnly = false;
+
+    /**
+     * Controls how the client discovers node roles and topology in standalone mode. Defaults to
+     * {@link NodeDiscoveryMode#STANDARD}.
+     */
+    @Builder.Default private final NodeDiscoveryMode nodeDiscoveryMode = NodeDiscoveryMode.STANDARD;
 }

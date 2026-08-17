@@ -5,6 +5,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"time"
 
@@ -16,6 +17,10 @@ const (
 	DefaultHost = "localhost"
 	DefaultPort = 6379
 )
+
+// MaxUint32 is the largest value that fits in an unsigned 32-bit protobuf field.
+// Reused by validators that need to bound a value to the uint32 wire range.
+const MaxUint32 = math.MaxUint32
 
 // NodeAddress represents the host address and port of a node in the cluster.
 type NodeAddress struct {
@@ -167,6 +172,8 @@ const (
 	// robin manner, prioritizing local replicas, then the local primary, and falling back to any
 	// replica or the primary if needed.
 	AzAffinityReplicaAndPrimary
+	// ReadFromAllNodes - Spread the read requests between all nodes (primary and replicas) in a round-robin manner.
+	ReadFromAllNodes
 )
 
 func mapReadFrom(readFrom ReadFrom) protobuf.ReadFrom {
@@ -182,20 +189,59 @@ func mapReadFrom(readFrom ReadFrom) protobuf.ReadFrom {
 		return protobuf.ReadFrom_AZAffinityReplicasAndPrimary
 	}
 
+	if readFrom == ReadFromAllNodes {
+		return protobuf.ReadFrom_AllNodes
+	}
+
 	return protobuf.ReadFrom_Primary
 }
 
+// NodeDiscoveryMode controls how the client discovers node roles and topology in standalone mode.
+type NodeDiscoveryMode int32
+
+const (
+	// NodeDiscoveryModeStandard verifies node roles via INFO REPLICATION, uses only provided addresses.
+	NodeDiscoveryModeStandard NodeDiscoveryMode = 0
+	// NodeDiscoveryModeStatic skips role detection. Trusts provided addresses as-is; first is primary.
+	// Use when connecting through a proxy (e.g., Envoy) or when the topology is known and static.
+	// Note: Do not set clientName when using this mode with a proxy.
+	NodeDiscoveryModeStatic NodeDiscoveryMode = 1
+	// NodeDiscoveryModeDiscoverAll discovers full topology (primary + all replicas) from any starting node.
+	// Provide any single node address and the client will find and connect to all other nodes.
+	NodeDiscoveryModeDiscoverAll NodeDiscoveryMode = 2
+)
+
+// AddressResolver is a callback interface for resolving server addresses before connection.
+//
+// When provided to a client configuration, this callback is invoked for each configured address
+// during connection establishment and during cluster topology refreshes. The callback receives
+// the configured host and port, and should return the actual host and port to use for the connection.
+//
+// Use cases:
+//   - Custom DNS resolution for service discovery
+//   - Address translation for proxy setups
+//   - Dynamic endpoint resolution for cloud environments
+//
+// The resolver must be safe for concurrent use, as it may be called from multiple goroutines
+// during connection and topology refresh.
+type AddressResolver func(host string, port int) (string, int)
+
 type baseClientConfiguration struct {
-	addresses         []NodeAddress
-	useTLS            bool
-	credentials       *ServerCredentials
-	readFrom          ReadFrom
-	requestTimeout    time.Duration
-	clientName        string
-	clientAZ          string
-	reconnectStrategy *BackoffStrategy
-	lazyConnect       bool
-	DatabaseId        *int `json:"database_id,omitempty"`
+	addresses             []NodeAddress
+	useTLS                bool
+	credentials           *ServerCredentials
+	readFrom              ReadFrom
+	requestTimeout        time.Duration
+	clientName            string
+	clientAZ              string
+	reconnectStrategy     *BackoffStrategy
+	lazyConnect           bool
+	DatabaseId            *int `json:"database_id,omitempty"`
+	compressionConfig     *CompressionConfiguration
+	clientSideCache       *ClientSideCache
+	addressResolver       AddressResolver
+	inflightRequestsLimit uint32
+	clientCircuitBreaker  *ClientCircuitBreakerConfiguration
 }
 
 func (config *baseClientConfiguration) toProtobuf() (*protobuf.ConnectionRequest, error) {
@@ -248,6 +294,30 @@ func (config *baseClientConfiguration) toProtobuf() (*protobuf.ConnectionRequest
 
 	if config.DatabaseId != nil {
 		request.DatabaseId = uint32(*config.DatabaseId)
+	}
+
+	if config.compressionConfig != nil {
+		compressionPb, err := config.compressionConfig.toProtobuf()
+		if err != nil {
+			return nil, fmt.Errorf("invalid compression configuration: %w", err)
+		}
+		request.CompressionConfig = compressionPb
+	}
+
+	if config.clientSideCache != nil {
+		request.ClientSideCache = config.clientSideCache.toProtobuf()
+	}
+
+	if config.clientCircuitBreaker != nil {
+		cbPb, err := config.clientCircuitBreaker.toProtobuf()
+		if err != nil {
+			return nil, fmt.Errorf("invalid circuit breaker configuration: %w", err)
+		}
+		request.ClientCircuitBreaker = cbPb
+	}
+
+	if config.inflightRequestsLimit != 0 {
+		request.InflightRequestsLimit = config.inflightRequestsLimit
 	}
 
 	return &request, nil
@@ -314,6 +384,11 @@ type ClientConfiguration struct {
 	baseClientConfiguration
 	subscriptionConfig *StandaloneSubscriptionConfig
 	AdvancedClientConfiguration
+	// readOnly enables read-only mode for the standalone client.
+	// When enabled, the client will skip primary node detection during connection initialization
+	// and will reject write commands. This is useful for connecting to replica-only deployments.
+	readOnly          bool
+	nodeDiscoveryMode NodeDiscoveryMode
 }
 
 // NewClientConfiguration returns a [ClientConfiguration] with default configuration settings. For further
@@ -322,12 +397,83 @@ func NewClientConfiguration() *ClientConfiguration {
 	return &ClientConfiguration{}
 }
 
+// applyClientCertAndKey copies mTLS client cert/key state from tlsConfig onto request.
+// The WithMutualTLS* methods validate their inputs, so this function trusts them:
+// at most one of (bytes, paths) is set, and byte pairs are never empty.
+//
+// Byte mode sets request.ClientCert and ClientKey (proto fields 22/23).
+// Path mode sets request.ClientCertPath and ClientKeyPath (fields 31/32) plus
+// request.CertReload with Enabled=true and an optional IntervalSeconds (field 33).
+func applyClientCertAndKey(tlsConfig *TlsConfiguration, request *protobuf.ConnectionRequest) {
+	if len(tlsConfig.clientCertificate) > 0 {
+		request.ClientCert = tlsConfig.clientCertificate
+		request.ClientKey = tlsConfig.clientKey
+		return
+	}
+
+	if len(tlsConfig.clientCertPath) > 0 {
+		certPath := tlsConfig.clientCertPath
+		keyPath := tlsConfig.clientKeyPath
+		request.ClientCertPath = &certPath
+		request.ClientKeyPath = &keyPath
+
+		reload := &protobuf.ClientCertReloadConfig{Enabled: true}
+		if tlsConfig.certReloadInterval > 0 {
+			// certReloadInterval is a uint32 seconds value validated by
+			// WithMutualTLSFromFiles; forward it straight to the wire field.
+			s := tlsConfig.certReloadInterval
+			reload.IntervalSeconds = &s
+		}
+		request.CertReload = reload
+	}
+}
+
+// applyTlsConfig copies TLS state onto request: insecure-TLS mode, root certificates,
+// and (through applyClientCertAndKey) the mTLS client cert/key. Both ToProtobuf sites
+// call it, so the standalone and cluster paths stay in sync.
+func applyTlsConfig(tlsConfig *TlsConfiguration, request *protobuf.ConnectionRequest) error {
+	// Handle insecure TLS mode
+	if tlsConfig.UseInsecureTLS {
+		if request.TlsMode == protobuf.TlsMode_NoTls {
+			return errors.New("UseInsecureTLS cannot be enabled when UseTLS is disabled")
+		}
+		// Override SecureTls mode to InsecureTls when user explicitly requests it
+		request.TlsMode = protobuf.TlsMode_InsecureTls
+	}
+
+	// Handle root certificates
+	if tlsConfig.RootCertificates != nil {
+		if len(tlsConfig.RootCertificates) == 0 {
+			return errors.New("root certificates cannot be an empty byte array; use nil to use platform verifier")
+		}
+		request.RootCerts = [][]byte{tlsConfig.RootCertificates}
+	}
+
+	// Handle client certificate and key for mutual TLS
+	applyClientCertAndKey(tlsConfig, request)
+	return nil
+}
+
 func (config *ClientConfiguration) ToProtobuf() (*protobuf.ConnectionRequest, error) {
 	request, err := config.baseClientConfiguration.toProtobuf()
 	if err != nil {
 		return nil, err
 	}
 	request.ClusterModeEnabled = false
+
+	// Handle read-only mode validation and configuration
+	if config.readOnly {
+		// Validate that read-only mode is not combined with AZAffinity strategies
+		if request.ReadFrom == protobuf.ReadFrom_AZAffinity ||
+			request.ReadFrom == protobuf.ReadFrom_AZAffinityReplicasAndPrimary {
+			return nil, errors.New("read-only mode is not compatible with AZAffinity strategies")
+		}
+		request.ReadOnly = &config.readOnly
+	}
+
+	if config.nodeDiscoveryMode != NodeDiscoveryModeStandard {
+		request.NodeDiscoveryMode = protobuf.NodeDiscoveryMode(config.nodeDiscoveryMode)
+	}
 
 	if config.subscriptionConfig != nil {
 		request.PubsubSubscriptions = config.subscriptionConfig.toProtobuf()
@@ -354,23 +500,8 @@ func (config *ClientConfiguration) ToProtobuf() (*protobuf.ConnectionRequest, er
 
 	// Handle TLS configuration
 	if config.AdvancedClientConfiguration.tlsConfig != nil {
-		tlsConfig := config.AdvancedClientConfiguration.tlsConfig
-
-		// Handle insecure TLS mode
-		if tlsConfig.UseInsecureTLS {
-			if request.TlsMode == protobuf.TlsMode_NoTls {
-				return nil, errors.New("UseInsecureTLS cannot be enabled when UseTLS is disabled")
-			}
-			// Override SecureTls mode to InsecureTls when user explicitly requests it
-			request.TlsMode = protobuf.TlsMode_InsecureTls
-		}
-
-		// Handle root certificates
-		if tlsConfig.RootCertificates != nil {
-			if len(tlsConfig.RootCertificates) == 0 {
-				return nil, errors.New("root certificates cannot be an empty byte array; use nil to use platform verifier")
-			}
-			request.RootCerts = [][]byte{tlsConfig.RootCertificates}
+		if err := applyTlsConfig(config.AdvancedClientConfiguration.tlsConfig, request); err != nil {
+			return nil, err
 		}
 	}
 
@@ -461,6 +592,16 @@ func (config *ClientConfiguration) WithDatabaseId(id int) *ClientConfiguration {
 	return config
 }
 
+// WithCompressionConfiguration sets the compression configuration for the client.
+// When configured, values sent to the server will be automatically compressed if they
+// meet the minimum size threshold.
+func (config *ClientConfiguration) WithCompressionConfiguration(
+	compressionConfig *CompressionConfiguration,
+) *ClientConfiguration {
+	config.compressionConfig = compressionConfig
+	return config
+}
+
 // WithAdvancedConfiguration sets the advanced configuration settings for the client.
 func (config *ClientConfiguration) WithAdvancedConfiguration(
 	advancedConfig *AdvancedClientConfiguration,
@@ -475,6 +616,63 @@ func (config *ClientConfiguration) WithSubscriptionConfig(
 ) *ClientConfiguration {
 	config.subscriptionConfig = subscriptionConfig
 	return config
+}
+
+// WithReadOnly enables read-only mode for the standalone client.
+// When enabled, the client will skip primary node detection during connection initialization
+// and will reject write commands. This is useful for connecting to replica-only deployments.
+//
+// Note: Read-only mode is not compatible with AZAffinity or AZAffinityReplicasAndPrimary
+// read strategies. Attempting to use these combinations will result in an error during
+// client creation.
+func (config *ClientConfiguration) WithReadOnly(readOnly bool) *ClientConfiguration {
+	config.readOnly = readOnly
+	return config
+}
+
+// WithClientSideCache sets the client-side cache configuration for the client.
+// When provided, the client will use local caching to reduce network round-trips
+// and server load for cacheable read commands.
+func (config *ClientConfiguration) WithClientSideCache(
+	clientSideCache *ClientSideCache,
+) *ClientConfiguration {
+	config.clientSideCache = clientSideCache
+	return config
+}
+
+// WithNodeDiscoveryMode sets the node discovery mode for the standalone client.
+// See [NodeDiscoveryMode] for available modes.
+func (config *ClientConfiguration) WithNodeDiscoveryMode(mode NodeDiscoveryMode) *ClientConfiguration {
+	config.nodeDiscoveryMode = mode
+	return config
+}
+
+// WithAddressResolver sets a custom address resolver for the standalone client.
+// The resolver is called during connection establishment and topology refresh to translate
+// addresses before connecting. Return the original host and port to use them unchanged.
+func (config *ClientConfiguration) WithAddressResolver(resolver AddressResolver) *ClientConfiguration {
+	config.addressResolver = resolver
+	return config
+}
+
+// WithClientCircuitBreaker sets the client-wide circuit breaker configuration.
+func (config *ClientConfiguration) WithClientCircuitBreaker(
+	cb *ClientCircuitBreakerConfiguration,
+) *ClientConfiguration {
+	config.clientCircuitBreaker = cb
+	return config
+}
+
+// WithInflightRequestsLimit sets the maximum number of concurrent requests allowed to be in-flight (sent but not yet
+// completed). This limit is used to control memory usage and prevent the client from overwhelming the server or getting
+// stuck in case of a queue backlog. If not set, a default value of 1000 will be used.
+func (config *ClientConfiguration) WithInflightRequestsLimit(limit uint32) *ClientConfiguration {
+	config.inflightRequestsLimit = limit
+	return config
+}
+
+func (config *ClientConfiguration) GetAddressResolver() AddressResolver {
+	return config.addressResolver
 }
 
 func (config *ClientConfiguration) HasSubscription() bool {
@@ -493,7 +691,8 @@ func (config *ClientConfiguration) GetSubscription() *StandaloneSubscriptionConf
 // used.
 type ClusterClientConfiguration struct {
 	baseClientConfiguration
-	subscriptionConfig *ClusterSubscriptionConfig
+	subscriptionConfig        *ClusterSubscriptionConfig
+	recoveryRequestsQueueSize *uint32
 	AdvancedClusterClientConfiguration
 }
 
@@ -513,7 +712,7 @@ func (config *ClusterClientConfiguration) ToProtobuf() (*protobuf.ConnectionRequ
 	}
 
 	request.ClusterModeEnabled = true
-	if (config.AdvancedClusterClientConfiguration.connectionTimeout) != 0 {
+	if config.AdvancedClusterClientConfiguration.connectionTimeout != 0 {
 		connectionTimeout, err := utils.DurationToMilliseconds(config.AdvancedClusterClientConfiguration.connectionTimeout)
 		if err != nil {
 			return nil, fmt.Errorf("setting connection timeout returned an error: %w", err)
@@ -524,6 +723,24 @@ func (config *ClusterClientConfiguration) ToProtobuf() (*protobuf.ConnectionRequ
 		request.PubsubSubscriptions = config.subscriptionConfig.toProtobuf()
 	}
 	request.RefreshTopologyFromInitialNodes = config.AdvancedClusterClientConfiguration.refreshTopologyFromInitialNodes
+
+	// Handle periodic topology checks configuration
+	if config.AdvancedClusterClientConfiguration.periodicChecks != nil {
+		switch v := config.AdvancedClusterClientConfiguration.periodicChecks.(type) {
+		case PeriodicChecksDisabled:
+			request.PeriodicChecks = &protobuf.ConnectionRequest_PeriodicChecksDisabled{
+				PeriodicChecksDisabled: &protobuf.PeriodicChecksDisabled{},
+			}
+		case PeriodicChecksManualInterval:
+			request.PeriodicChecks = &protobuf.ConnectionRequest_PeriodicChecksManualInterval{
+				PeriodicChecksManualInterval: &protobuf.PeriodicChecksManualInterval{
+					DurationInSec: v.DurationInSec,
+				},
+			}
+		case PeriodicChecksEnabled:
+			// Default behavior - no need to set anything in protobuf
+		}
+	}
 
 	// Handle TCP_NODELAY configuration
 	if config.AdvancedClusterClientConfiguration.tcpNoDelay != nil {
@@ -538,24 +755,13 @@ func (config *ClusterClientConfiguration) ToProtobuf() (*protobuf.ConnectionRequ
 
 	// Handle TLS configuration
 	if config.AdvancedClusterClientConfiguration.tlsConfig != nil {
-		tlsConfig := config.AdvancedClusterClientConfiguration.tlsConfig
-
-		// Handle insecure TLS mode
-		if tlsConfig.UseInsecureTLS {
-			if request.TlsMode == protobuf.TlsMode_NoTls {
-				return nil, errors.New("UseInsecureTLS cannot be enabled when UseTLS is disabled")
-			}
-			// Override SecureTls mode to InsecureTls when user explicitly requests it
-			request.TlsMode = protobuf.TlsMode_InsecureTls
+		if err := applyTlsConfig(config.AdvancedClusterClientConfiguration.tlsConfig, request); err != nil {
+			return nil, err
 		}
+	}
 
-		// Handle root certificates
-		if tlsConfig.RootCertificates != nil {
-			if len(tlsConfig.RootCertificates) == 0 {
-				return nil, errors.New("root certificates cannot be an empty byte array; use nil to use platform verifier")
-			}
-			request.RootCerts = [][]byte{tlsConfig.RootCertificates}
-		}
+	if config.recoveryRequestsQueueSize != nil {
+		request.RecoveryRequestsQueueSize = config.recoveryRequestsQueueSize
 	}
 
 	return request, nil
@@ -649,6 +855,16 @@ func (config *ClusterClientConfiguration) WithDatabaseId(id int) *ClusterClientC
 	return config
 }
 
+// WithCompressionConfiguration sets the compression configuration for the cluster client.
+// When configured, values sent to the server will be automatically compressed if they
+// meet the minimum size threshold.
+func (config *ClusterClientConfiguration) WithCompressionConfiguration(
+	compressionConfig *CompressionConfiguration,
+) *ClusterClientConfiguration {
+	config.compressionConfig = compressionConfig
+	return config
+}
+
 // WithAdvancedConfiguration sets the advanced configuration settings for the client.
 func (config *ClusterClientConfiguration) WithAdvancedConfiguration(
 	advancedConfig *AdvancedClusterClientConfiguration,
@@ -665,8 +881,56 @@ func (config *ClusterClientConfiguration) WithSubscriptionConfig(
 	return config
 }
 
+// WithClientSideCache sets the client-side cache configuration for the cluster client.
+// When provided, the client will use local caching to reduce network round-trips
+// and server load for cacheable read commands.
+func (config *ClusterClientConfiguration) WithClientSideCache(
+	clientSideCache *ClientSideCache,
+) *ClusterClientConfiguration {
+	config.clientSideCache = clientSideCache
+	return config
+}
+
+// WithAddressResolver sets a custom address resolver for the cluster client.
+// The resolver is called during connection establishment and topology refresh to translate
+// addresses before connecting. Return the original host and port to use them unchanged.
+func (config *ClusterClientConfiguration) WithAddressResolver(resolver AddressResolver) *ClusterClientConfiguration {
+	config.addressResolver = resolver
+	return config
+}
+
+// WithClientCircuitBreaker sets the client-wide circuit breaker configuration.
+func (config *ClusterClientConfiguration) WithClientCircuitBreaker(
+	cb *ClientCircuitBreakerConfiguration,
+) *ClusterClientConfiguration {
+	config.clientCircuitBreaker = cb
+	return config
+}
+
+// WithInflightRequestsLimit sets the maximum number of concurrent requests allowed to be in-flight (sent but not yet
+// completed). This limit is used to control memory usage and prevent the client from overwhelming the server or getting
+// stuck in case of a queue backlog. If not set, a default value of 1000 will be used.
+func (config *ClusterClientConfiguration) WithInflightRequestsLimit(limit uint32) *ClusterClientConfiguration {
+	config.inflightRequestsLimit = limit
+	return config
+}
+
+// WithRecoveryRequestsQueueSize sets the maximum number of requests to buffer in the
+// recovery queue when a cluster reconnect is in progress. Buffered requests are retried
+// transparently after reconnection. Requests beyond this limit are failed immediately.
+// Set to 0 to disable the recovery queue and use fail-fast behavior.
+// If not set, a default value of 1000 will be used.
+func (config *ClusterClientConfiguration) WithRecoveryRequestsQueueSize(size uint32) *ClusterClientConfiguration {
+	config.recoveryRequestsQueueSize = &size
+	return config
+}
+
 func (config *ClusterClientConfiguration) HasSubscription() bool {
 	return config.subscriptionConfig != nil
+}
+
+func (config *ClusterClientConfiguration) GetAddressResolver() AddressResolver {
+	return config.addressResolver
 }
 
 func (config *ClusterClientConfiguration) GetSubscription() *ClusterSubscriptionConfig {
@@ -676,7 +940,71 @@ func (config *ClusterClientConfiguration) GetSubscription() *ClusterSubscription
 	return nil
 }
 
+// ClientCircuitBreakerConfiguration configures the client-wide circuit breaker.
+// The circuit breaker detects sustained error rates and rejects requests before they enter the core.
+type ClientCircuitBreakerConfiguration struct {
+	// Sliding window duration in milliseconds for error rate calculation. Default: 10000.
+	WindowSizeMs uint32
+	// Error rate (0.0-1.0) within the window to trip the breaker. Default: 0.5.
+	FailureRateThreshold float32
+	// Minimum errors within window before rate is evaluated. Default: 50.
+	MinErrors uint32
+	// Time in milliseconds in Open state before allowing a probe. Default: 5000.
+	OpenTimeoutMs uint32
+	// Whether timeouts count toward tripping. Default: false.
+	CountTimeouts bool
+	// Consecutive successful probes needed before closing. Default: 3.
+	ConsecutiveSuccesses uint32
+}
+
+func (config *ClientCircuitBreakerConfiguration) toProtobuf() (*protobuf.ClientCircuitBreakerConfig, error) {
+	if config.FailureRateThreshold != 0 && (config.FailureRateThreshold <= 0.0 || config.FailureRateThreshold > 1.0) {
+		return nil, errors.New("FailureRateThreshold must be between 0.0 (exclusive) and 1.0 (inclusive)")
+	}
+	return &protobuf.ClientCircuitBreakerConfig{
+		WindowSizeMs:         config.WindowSizeMs,
+		FailureRateThreshold: config.FailureRateThreshold,
+		MinErrors:            config.MinErrors,
+		OpenTimeoutMs:        config.OpenTimeoutMs,
+		CountTimeouts:        config.CountTimeouts,
+		ConsecutiveSuccesses: config.ConsecutiveSuccesses,
+	}, nil
+}
+
 // TlsConfiguration represents TLS-specific configuration settings.
+//
+// Use RootCertificates and UseInsecureTLS to control server verification.
+//
+// For mutual TLS, pick one of [TlsConfiguration.WithMutualTLS] (in-memory PEM
+// bytes) or [TlsConfiguration.WithMutualTLSFromFiles] (paths on disk; the GLIDE
+// core re-reads them periodically to pick up rotated material).
+//
+// Example: static byte-based mTLS loaded once at startup.
+//
+//	cert, key, err := config.LoadClientCertificateAndKeyFromFile(
+//	    "/etc/glide/client.pem", "/etc/glide/client.key")
+//	if err != nil {
+//	    return err
+//	}
+//	tls, err := config.NewTlsConfiguration().WithMutualTLS(cert, key)
+//	if err != nil {
+//	    return err
+//	}
+//	advCfg := config.NewAdvancedClientConfiguration().WithTlsConfiguration(tls)
+//	cfg := config.NewClientConfiguration().
+//	    WithAddress(&config.NodeAddress{Host: "cache.example", Port: 6379}).
+//	    WithUseTLS(true).
+//	    WithAdvancedConfiguration(advCfg)
+//	client, err := glide.NewClient(cfg)
+//
+// Example: path-based mTLS with automatic reload every 60 seconds.
+//
+//	tls, err := config.NewTlsConfiguration().WithMutualTLSFromFiles(
+//	    "/etc/glide/client.pem", "/etc/glide/client.key",
+//	    config.WithReloadInterval(60))
+//	if err != nil {
+//	    return err
+//	}
 type TlsConfiguration struct {
 	// RootCertificates contains custom root certificate data for TLS connections in PEM format.
 	//
@@ -701,6 +1029,21 @@ type TlsConfiguration struct {
 	//
 	// Default: false (verification is enforced).
 	UseInsecureTLS bool
+
+	// Unexported mTLS state. Only the WithMutualTLS* methods write these fields, and
+	// each writes a consistent pair, so callers cannot reach an invalid combination.
+	//
+	// State 1 (no mTLS): all five fields zero.
+	// State 2 (static bytes): clientCertificate and clientKey are non-nil and non-empty;
+	//                         path fields empty; certReloadInterval zero.
+	// State 3 (path + reload): clientCertPath and clientKeyPath non-empty; byte fields nil;
+	//                          certReloadInterval is zero (core default cadence) or a
+	//                          positive uint32 seconds value from WithReloadInterval.
+	clientCertificate  []byte
+	clientKey          []byte
+	clientCertPath     string
+	clientKeyPath      string
+	certReloadInterval uint32
 }
 
 // NewTlsConfiguration returns a new [TlsConfiguration] with default settings (uses platform verifier).
@@ -731,6 +1074,129 @@ func (config *TlsConfiguration) WithInsecureTLS(insecure bool) *TlsConfiguration
 	return config
 }
 
+// MutualTLSOption is an optional argument to [TlsConfiguration.WithMutualTLSFromFiles].
+// Options are variadic and applied in order.
+//
+// The only way to get one is through the exported constructors (currently
+// [WithReloadInterval]). applyMutualTLS is unexported, so packages outside
+// this one cannot implement the interface.
+type MutualTLSOption interface {
+	applyMutualTLS(*mtlsSettings)
+}
+
+// mtlsSettings collects option values before they are validated and applied
+// to the TlsConfiguration.
+type mtlsSettings struct {
+	// reloadInterval is a pointer so we can tell "option not passed" (nil,
+	// use the core default cadence) apart from an explicit
+	// WithReloadInterval(0) (a value we then validate and reject).
+	reloadInterval *uint32
+}
+
+// reloadIntervalOption is the concrete option produced by [WithReloadInterval].
+type reloadIntervalOption struct{ interval uint32 }
+
+func (o reloadIntervalOption) applyMutualTLS(s *mtlsSettings) {
+	d := o.interval
+	s.reloadInterval = &d
+}
+
+// WithReloadInterval overrides the cert reload cadence for
+// [TlsConfiguration.WithMutualTLSFromFiles]. The value is a whole number of
+// seconds and must be positive; WithMutualTLSFromFiles rejects zero.
+//
+// The protobuf field is uint32 seconds, so the parameter is uint32. That
+// removes any risk of rounding or truncation at the API boundary and makes
+// the [MaxUint32] upper bound and non-negativity guaranteed by the type.
+func WithReloadInterval(seconds uint32) MutualTLSOption {
+	return reloadIntervalOption{interval: seconds}
+}
+
+// WithMutualTLS enables mutual TLS with an in-memory PEM cert and key loaded
+// once at connection time. The material is static; nothing is reloaded later.
+// For automatic rotation of on-disk material, use
+// [TlsConfiguration.WithMutualTLSFromFiles].
+//
+// Both clientCert and clientKey must be non-empty PEM byte slices. If either
+// is nil or empty, this returns an error and leaves the receiver unchanged.
+//
+// Use [LoadClientCertificateAndKeyFromFile] to read PEM material off disk:
+//
+//	cert, key, err := config.LoadClientCertificateAndKeyFromFile(
+//	    "/path/to/client-cert.pem", "/path/to/client-key.pem")
+//	if err != nil {
+//	    return err
+//	}
+//	tls, err := config.NewTlsConfiguration().WithMutualTLS(cert, key)
+//	if err != nil {
+//	    return err
+//	}
+//
+// Calling this after [TlsConfiguration.WithMutualTLSFromFiles] replaces the
+// path-based state with the new byte-based state.
+func (config *TlsConfiguration) WithMutualTLS(clientCert, clientKey []byte) (*TlsConfiguration, error) {
+	if len(clientCert) == 0 {
+		return nil, fmt.Errorf("WithMutualTLS: clientCert must be non-empty; got %d-byte slice", len(clientCert))
+	}
+	if len(clientKey) == 0 {
+		return nil, fmt.Errorf("WithMutualTLS: clientKey must be non-empty; got %d-byte slice", len(clientKey))
+	}
+	config.clientCertificate = clientCert
+	config.clientKey = clientKey
+	config.clientCertPath = ""
+	config.clientKeyPath = ""
+	config.certReloadInterval = 0
+	return config, nil
+}
+
+// WithMutualTLSFromFiles enables mutual TLS by pointing at cert and key files
+// on disk. The GLIDE core reads them at connect time and re-reads them
+// periodically so rotated material is picked up. If no [WithReloadInterval]
+// option is passed, the cadence is the core's default (currently 300 seconds).
+// Pass [WithReloadInterval](seconds) to override it.
+//
+// Both certPath and keyPath must be non-empty. A reload interval, if passed,
+// must be positive. The value is uint32 seconds; the underlying protobuf field
+// cannot represent sub-second cadences.
+//
+// Calling this after [TlsConfiguration.WithMutualTLS] replaces the byte-based
+// state with the new path-based state.
+func (config *TlsConfiguration) WithMutualTLSFromFiles(
+	certPath, keyPath string, opts ...MutualTLSOption,
+) (*TlsConfiguration, error) {
+	if len(certPath) == 0 {
+		return nil, fmt.Errorf("WithMutualTLSFromFiles: certPath must be non-empty; got %q", certPath)
+	}
+	if len(keyPath) == 0 {
+		return nil, fmt.Errorf("WithMutualTLSFromFiles: keyPath must be non-empty; got %q", keyPath)
+	}
+
+	var settings mtlsSettings
+	for _, opt := range opts {
+		opt.applyMutualTLS(&settings)
+	}
+
+	// interval is zero when the caller did not pass WithReloadInterval; any
+	// user-supplied value is validated to be positive.
+	// applyClientCertAndKey relies on that: it treats certReloadInterval == 0
+	// as "not specified" and only emits IntervalSeconds when the value is > 0.
+	var interval uint32
+	if settings.reloadInterval != nil {
+		if *settings.reloadInterval == 0 {
+			return nil, fmt.Errorf(
+				"WithMutualTLSFromFiles: reload interval must be positive; got 0")
+		}
+		interval = *settings.reloadInterval
+	}
+
+	config.clientCertificate = nil
+	config.clientKey = nil
+	config.clientCertPath = certPath
+	config.clientKeyPath = keyPath
+	config.certReloadInterval = interval
+	return config, nil
+}
+
 // LoadRootCertificatesFromFile reads a PEM-encoded certificate file and returns its contents as a byte array.
 // This is a convenience function for loading custom root certificates from disk.
 //
@@ -750,16 +1216,54 @@ func (config *TlsConfiguration) WithInsecureTLS(insecure bool) *TlsConfiguration
 //	tlsConfig := config.NewTlsConfiguration().WithRootCertificates(certs)
 //	advancedConfig := config.NewAdvancedClientConfiguration().WithTlsConfiguration(tlsConfig)
 func LoadRootCertificatesFromFile(path string) ([]byte, error) {
+	return loadPEMFile(path, "certificate")
+}
+
+// loadPEMFile reads a PEM-encoded file and returns its contents. label is used
+// in error messages ("certificate", "client certificate", "client key") so
+// callers can report which file failed.
+func loadPEMFile(path, label string) ([]byte, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read certificate file: %w", err)
+		return nil, fmt.Errorf("failed to read %s file: %w", label, err)
 	}
 
 	if len(data) == 0 {
-		return nil, fmt.Errorf("certificate file is empty: %s", path)
+		return nil, fmt.Errorf("%s file is empty: %s", label, path)
 	}
 
 	return data, nil
+}
+
+// LoadClientCertificateAndKeyFromFile reads PEM-encoded client cert and key
+// files and returns their contents as byte slices, ready to pass to
+// [TlsConfiguration.WithMutualTLS]. It mirrors [crypto/tls.LoadX509KeyPair]:
+// one call reads both files with a single error path.
+//
+// If either file is missing, unreadable, or empty, both return slices are nil
+// and the error names the file that failed.
+//
+// Example:
+//
+//	cert, key, err := config.LoadClientCertificateAndKeyFromFile(
+//	    "/path/to/client-cert.pem", "/path/to/client-key.pem")
+//	if err != nil {
+//	    return err
+//	}
+//	tlsConfig, err := config.NewTlsConfiguration().WithMutualTLS(cert, key)
+//	if err != nil {
+//	    return err
+//	}
+func LoadClientCertificateAndKeyFromFile(certPath, keyPath string) (cert, key []byte, err error) {
+	cert, err = loadPEMFile(certPath, "client certificate")
+	if err != nil {
+		return nil, nil, err
+	}
+	key, err = loadPEMFile(keyPath, "client key")
+	if err != nil {
+		return nil, nil, err
+	}
+	return cert, key, nil
 }
 
 // Represents advanced configuration settings for a Standalone client used in [ClientConfiguration].
@@ -822,11 +1326,38 @@ func (config *AdvancedClientConfiguration) WithPubSubReconciliationIntervalMs(
 	return config
 }
 
+// PeriodicChecksConfig is an interface implemented by [PeriodicChecksEnabled],
+// [PeriodicChecksDisabled], and [PeriodicChecksManualInterval] to configure
+// periodic topology checks for cluster clients.
+type PeriodicChecksConfig interface {
+	isPeriodicChecksConfig()
+}
+
+// PeriodicChecksEnabled enables periodic topology checks with the default interval.
+// This is the default behavior when no periodic checks configuration is set.
+type PeriodicChecksEnabled struct{}
+
+func (PeriodicChecksEnabled) isPeriodicChecksConfig() {}
+
+// PeriodicChecksDisabled disables periodic topology checks.
+type PeriodicChecksDisabled struct{}
+
+func (PeriodicChecksDisabled) isPeriodicChecksConfig() {}
+
+// PeriodicChecksManualInterval configures periodic topology checks with a custom interval.
+type PeriodicChecksManualInterval struct {
+	// DurationInSec is the interval in seconds between periodic topology checks.
+	DurationInSec uint32
+}
+
+func (PeriodicChecksManualInterval) isPeriodicChecksConfig() {}
+
 // Represents advanced configuration settings for a Cluster client used in
 // [ClusterClientConfiguration].
 type AdvancedClusterClientConfiguration struct {
 	connectionTimeout               time.Duration
 	refreshTopologyFromInitialNodes bool
+	periodicChecks                  PeriodicChecksConfig
 	tlsConfig                       *TlsConfiguration
 	tcpNoDelay                      *bool
 	pubsubReconciliationIntervalMs  *int
@@ -859,6 +1390,23 @@ func (config *AdvancedClusterClientConfiguration) WithRefreshTopologyFromInitial
 	refreshTopologyFromInitialNodes bool,
 ) *AdvancedClusterClientConfiguration {
 	config.refreshTopologyFromInitialNodes = refreshTopologyFromInitialNodes
+	return config
+}
+
+// WithPeriodicChecks configures the periodic topology checks for the cluster client.
+// These checks evaluate changes in the cluster's topology, triggering a slot refresh when detected.
+// Periodic checks ensure a quick and efficient process by querying a limited number of nodes.
+//
+// Accepted values:
+//   - [PeriodicChecksEnabled]: Enables periodic checks with the default interval (this is the default).
+//   - [PeriodicChecksDisabled]: Disables periodic topology checks.
+//   - [PeriodicChecksManualInterval]: Enables periodic checks with a custom interval in seconds.
+//
+// If not set, defaults to enabled with the default interval.
+func (config *AdvancedClusterClientConfiguration) WithPeriodicChecks(
+	periodicChecks PeriodicChecksConfig,
+) *AdvancedClusterClientConfiguration {
+	config.periodicChecks = periodicChecks
 	return config
 }
 

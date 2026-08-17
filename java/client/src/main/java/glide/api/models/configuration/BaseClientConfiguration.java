@@ -2,6 +2,8 @@
 package glide.api.models.configuration;
 
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import lombok.AccessLevel;
@@ -31,6 +33,9 @@ public abstract class BaseClientConfiguration {
     @Getter(AccessLevel.NONE)
     @Singular
     private final List<NodeAddress> addresses;
+
+    /** Client-side cache configuration. If provided, enables caching for this client. */
+    public abstract ClientSideCache getClientSideCache();
 
     /**
      * True if communication with the cluster should use Transport Level Security.
@@ -79,7 +84,11 @@ public abstract class BaseClientConfiguration {
      */
     private final ProtocolVersion protocol;
 
+    /** Returns the subscription configuration for the client. */
     public abstract BaseSubscriptionConfiguration getSubscriptionConfiguration();
+
+    /** Returns the advanced configuration settings for the client. */
+    public abstract AdvancedBaseClientConfiguration getAdvancedConfiguration();
 
     /**
      * The maximum number of concurrent requests allowed to be in-flight (sent but not yet completed).
@@ -88,6 +97,14 @@ public abstract class BaseClientConfiguration {
      * used.
      */
     private final Integer inflightRequestsLimit;
+
+    /**
+     * Configuration for the client-wide circuit breaker. When set, enables the circuit breaker which
+     * detects sustained error rates and rejects requests at the FFI boundary before threads park.
+     *
+     * <p>If null (default), the circuit breaker is disabled.
+     */
+    private final ClientCircuitBreakerConfiguration clientCircuitBreakerConfiguration;
 
     /**
      * Availability Zone of the client. If ReadFrom strategy is AZAffinity or
@@ -161,8 +178,20 @@ public abstract class BaseClientConfiguration {
      */
     private final AddressResolver addressResolver;
 
+    /*
+     * Configuration for automatic transparent compression of values.
+     *
+     * <p>When set, values sent to the server will be compressed using the specified backend if they
+     * meet the minimum size threshold. Compressed values are automatically decompressed on retrieval.
+     *
+     * <p><b>Note:</b> This feature is experimental. Currently only applies to GET and SET commands.
+     *
+     * @see CompressionConfiguration
+     */
+    private final CompressionConfiguration compressionConfiguration;
+
     public List<NodeAddress> getAddresses() {
-        return List.copyOf(addresses);
+        return Collections.unmodifiableList(new ArrayList<>(addresses));
     }
 
     /**

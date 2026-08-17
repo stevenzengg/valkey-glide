@@ -3,8 +3,13 @@
 import os
 import sys
 import threading
-from typing import Any, List, Optional, Tuple, Union
+from types import TracebackType
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
+if TYPE_CHECKING:
+    from .isolated_scope import IsolatedScope
+
+from glide_shared._fast_response import parse_response as _fast_parse_response
 from glide_shared.commands.command_args import ObjectType
 from glide_shared.commands.core_options import PubSubMsg
 from glide_shared.config import (
@@ -31,8 +36,8 @@ from glide_shared.routes import (
     SlotType,
     build_protobuf_route,
 )
+from glide_sync._ffi_instance import _SYNC_FFI
 
-from ._glide_ffi import _GlideFFI
 from .logger import Level, Logger
 from .sync_commands.cluster_commands import ClusterCommands
 from .sync_commands.cluster_scan_cursor import ClusterScanCursor
@@ -44,6 +49,12 @@ if sys.version_info >= (3, 11):
 else:
     from typing_extensions import Self
 
+# Pre-allocated null-terminated span name for the EVALSHA (`_execute_script`)
+# path. Kept at module scope so we do not re-allocate a `char[]` per sampled
+# call. `_SYNC_FFI.ffi` is a process-wide singleton so this buffer is safe to
+# share across clients.
+_EVALSHA_SPAN_NAME = _SYNC_FFI.ffi.new("char[]", b"EVALSHA")
+
 ENCODING = "utf-8"
 
 
@@ -53,13 +64,37 @@ class FFIClientTypeEnum:
     Sync = 1
 
 
+def _slot_for_key(key: bytes) -> int:
+    """Compute the Redis cluster hash slot for a key (CRC16 mod 16384).
+
+    Handles hash tags: if the key contains {...}, only the content between the
+    first { and first } after it is hashed.
+    """
+    start = key.find(b"{")
+    if start != -1:
+        end = key.find(b"}", start + 1)
+        if end != -1 and end != start + 1:
+            key = key[start + 1 : end]
+
+    crc = 0
+    for b in key:
+        crc ^= b << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = (crc << 1) ^ 0x1021
+            else:
+                crc <<= 1
+            crc &= 0xFFFF
+    return crc % 16384
+
+
 class BaseClient(CoreCommands):
 
     def __init__(self, config: BaseClientConfiguration):
         """
         To create a new client, use the `create` classmethod
         """
-        _glide_ffi = _GlideFFI()
+        _glide_ffi = _SYNC_FFI
         self._ffi = _glide_ffi.ffi
         self._lib = _glide_ffi.lib
         self._config: BaseClientConfiguration = config
@@ -67,6 +102,10 @@ class BaseClient(CoreCommands):
         self._pubsub_lock = threading.Lock()
         self._pubsub_condition = threading.Condition(self._pubsub_lock)
         self._pubsub_callback_ref = None  # Keep callback alive
+        # Lock protecting _core_client and _is_closed for free-threading safety.
+        # Under GIL builds this is a no-op (GIL serializes access).
+        # Under free-threaded builds this prevents use-after-free on concurrent close.
+        self._client_lock = threading.Lock()
 
         self._is_closed: bool = False
 
@@ -97,7 +136,16 @@ class BaseClient(CoreCommands):
         conn_req = self._config._create_a_protobuf_conn_request(
             cluster_mode=type(self._config) is GlideClusterClientConfiguration
         )
+        # Preserve a user-configured lib_name; otherwise fall back to the sync default.
+        if not conn_req.lib_name:
+            conn_req.lib_name = "GlidePySync"
+        # Optionally append a client info tag, preserving the library identity
+        # (e.g. "GlidePySync(my-framework:1.2.3)").
+        if self._config.client_info_tag:
+            conn_req.lib_name = f"{conn_req.lib_name}({self._config.client_info_tag})"
         conn_req_bytes = conn_req.SerializeToString()
+        # Store for scoped_connection
+        self._conn_req_bytes = conn_req_bytes
         client_type = self._ffi.new(
             "ClientType*",
             {
@@ -105,22 +153,53 @@ class BaseClient(CoreCommands):
             },
         )
 
-        if self._config._is_pubsub_configured():
-            # If in subscribed mode, create a callback that will be called by the FFI layer
-            # for handling push notifications. This callback would either call the user callback (if provided),
-            # or append the messaged to the the `_pubsub_queue`
-            python_callback = self._create_push_handle_callback()
-            pubsub_callback = self._ffi.callback("PubSubCallback", python_callback)
+        # Always create pubsub callback to support dynamic subscriptions
+        # This ensures messages are always handled by the wrapper, whether they originate
+        # from configured subscriptions or from dynamic subscriptions added at runtime
+        python_callback = self._create_push_handle_callback()
+        pubsub_callback = self._ffi.callback("PubSubCallback", python_callback)
+        # Store reference to prevent garbage collection
+        self._pubsub_callback_ref = pubsub_callback
+
+        # Create address resolver callback if configured
+        address_resolver_callback = self._ffi.NULL
+        if self._config.address_resolver is not None:
+            resolver_fn = self._config.address_resolver
+
+            def _address_resolver_callback(
+                client_id,
+                host_ptr,
+                host_len,
+                port,
+                resolved_host_buf,
+                resolved_host_buf_len,
+                resolved_host_len_ptr,
+            ):
+                try:
+                    host = self._ffi.buffer(host_ptr, host_len)[:].decode("utf-8")
+                    resolved_host, resolved_port = resolver_fn(host, port)
+                    encoded_host = resolved_host.encode("utf-8")
+                    write_len = min(len(encoded_host), resolved_host_buf_len)
+                    self._ffi.memmove(resolved_host_buf, encoded_host, write_len)
+                    resolved_host_len_ptr[0] = write_len
+                    return resolved_port
+                except Exception:
+                    # On error, return 0 to signal fallback to original address
+                    return 0
+
+            address_resolver_callback = self._ffi.callback(
+                "AddressResolverCallback", _address_resolver_callback
+            )
             # Store reference to prevent garbage collection
-            self._pubsub_callback_ref = pubsub_callback
-        else:
-            pubsub_callback = self._ffi.cast("PubSubCallback", 0)
+            self._address_resolver_callback_ref = address_resolver_callback
 
         client_response_ptr = self._lib.create_client(
             conn_req_bytes,
             len(conn_req_bytes),
             client_type,
             pubsub_callback,
+            address_resolver_callback,
+            0,  # client_id is not used by the Python client
         )
 
         Logger.log(Level.INFO, "connection info", "new connection established")
@@ -144,6 +223,10 @@ class BaseClient(CoreCommands):
 
             # Free the connection response to avoid memory leaks
             self._lib.free_connection_response(client_response_ptr)
+
+            # Note: scope prewarm is deferred to first scoped_connection() call
+            # to avoid creating extra connections at client startup (which breaks
+            # lazy connection tests and connection count assertions).
         else:
             raise ClosingError("Failed to create client, response pointer is NULL.")
 
@@ -236,16 +319,10 @@ class BaseClient(CoreCommands):
     def _handle_response(self, message):
         if message == self._ffi.NULL:
             raise RequestError("Received NULL message.")
-
-        message_type = self._ffi.typeof(message).cname
-        if message_type == "CommandResponse *":
-            message = message[0]
-            message_type = self._ffi.typeof(message).cname
-
-        if message_type != "CommandResponse":
-            raise RequestError(f"Unexpected message type = {message_type}")
-
-        return self._handle_command_response(message)
+        addr = int(self._ffi.cast("uintptr_t", message))
+        result, _arena_ptr = _fast_parse_response(addr)
+        # Arena is freed by free_command_result in _handle_cmd_result's finally block
+        return result
 
     def _handle_command_response(self, msg):
         """Handle a CommandResponse message based on its response type."""
@@ -337,7 +414,7 @@ class BaseClient(CoreCommands):
         for arg in args:
             if isinstance(arg, str):
                 arg_bytes = arg.encode(ENCODING)
-            elif isinstance(arg, bytes):
+            elif isinstance(arg, (bytes, bytearray, memoryview)):
                 arg_bytes = arg
             else:
                 raise TypeError(f"Unsupported argument type: {type(arg)}")
@@ -390,11 +467,22 @@ class BaseClient(CoreCommands):
         finally:
             self._lib.free_command_result(command_result)
 
+    @staticmethod
+    def _validate_response_buffers(response_buffers: List[memoryview]) -> None:
+        """Each buffer for a multi-value read must be writable and contiguous."""
+        for mv in response_buffers:
+            if mv.readonly:
+                raise TypeError("response_buffers entries must be writable")
+            if not mv.c_contiguous:
+                raise TypeError("response_buffers entries must be C-contiguous")
+
     def _execute_command(
         self,
-        request_type: RequestType.ValueType,
+        request_type: RequestType.ValueType,  # type: ignore[override]
         args: List[TEncodable],
         route: Optional[Route] = None,
+        response_buffer: Optional[memoryview] = None,
+        response_buffers: Optional[List[memoryview]] = None,
     ) -> TResult:
         if self._is_closed:
             raise ClosingError(
@@ -403,6 +491,13 @@ class BaseClient(CoreCommands):
         client_adapter_ptr = self._core_client
         if client_adapter_ptr == self._ffi.NULL:
             raise ValueError("Invalid client pointer.")
+        if response_buffer:
+            if response_buffer.readonly:
+                raise TypeError("response_buffer must be writable")
+            if not response_buffer.c_contiguous:
+                raise TypeError("response_buffer must be C-contiguous")
+        if response_buffers is not None:
+            self._validate_response_buffers(response_buffers)
 
         # Create span if OpenTelemetry is configured and sampling indicates we should trace
         from .opentelemetry import OpenTelemetry
@@ -423,17 +518,53 @@ class BaseClient(CoreCommands):
             # Route bytes should be kept alive in the scope of the FFI call
             route_ptr, route_len, route_bytes = self._to_c_route_ptr_and_len(route)
 
-            result = self._lib.command(
-                client_adapter_ptr,  # Pointer to the ClientAdapter from create_client()
-                0,  # Request ID - placeholder for sync clients (used for async callbacks)
-                request_type,  # Request type (e.g., GET or SET)
-                len(args),  # Number of arguments
-                c_args,  # Array of argument pointers
-                c_lengths,  # Array of argument lengths
-                route_ptr,  # Pointer to protobuf-encoded routing information (NULL if no routing)
-                route_len,  # Length of the routing data in bytes (0 if no routing)
-                span,  # Span pointer for tracing
-            )
+            if response_buffers is not None:
+                # One writable buffer per top-level array element (e.g. mget):
+                # each value is copied straight into its caller-owned buffer.
+                # The from_buffer cdata must stay alive for the call, so keep
+                # the list referenced until command_with_buffers returns.
+                target_ptrs = [self._ffi.from_buffer(mv) for mv in response_buffers]
+                target_bufs = self._ffi.new("uint8_t*[]", target_ptrs)
+                target_lens = self._ffi.new(
+                    "size_t[]", [mv.nbytes for mv in response_buffers]
+                )
+                result = self._lib.command_with_buffers(
+                    client_adapter_ptr,
+                    0,
+                    request_type,
+                    len(args),
+                    c_args,
+                    c_lengths,
+                    route_ptr,
+                    route_len,
+                    target_bufs,
+                    target_lens,
+                    len(response_buffers),
+                    span,
+                )
+            else:
+                buf_ptr = (
+                    self._ffi.from_buffer(response_buffer)
+                    if response_buffer
+                    else self._ffi.NULL
+                )
+                # Capacity must be expressed in bytes, not elements. ``len()`` on
+                # a memoryview returns the element count (``shape[0]``), which
+                # equals the byte count only for itemsize-1 formats (e.g. "B").
+                buf_len = response_buffer.nbytes if response_buffer else 0
+                result = self._lib.command_with_buffer(
+                    client_adapter_ptr,
+                    0,
+                    request_type,
+                    len(args),
+                    c_args,
+                    c_lengths,
+                    route_ptr,
+                    route_len,
+                    buf_ptr,
+                    buf_len,
+                    span,
+                )
         finally:
             # Drop span if it was created
             if span != 0:
@@ -496,7 +627,7 @@ class BaseClient(CoreCommands):
 
     def _execute_batch(
         self,
-        commands: List[Tuple[RequestType.ValueType, List[TEncodable]]],
+        commands: List[Tuple[RequestType.ValueType, List[TEncodable]]],  # type: ignore[override]
         is_atomic: bool,
         raise_on_error: bool,
         retry_server_error: bool = False,
@@ -581,7 +712,7 @@ class BaseClient(CoreCommands):
             for arg in args:
                 if isinstance(arg, str):
                     arg_bytes = arg.encode(ENCODING)
-                elif isinstance(arg, bytes):
+                elif isinstance(arg, (bytes, bytearray, memoryview)):
                     arg_bytes = arg
                 else:
                     raise TypeError(f"Unsupported argument type: {type(arg)}")
@@ -747,31 +878,38 @@ class BaseClient(CoreCommands):
         # Route bytes should be kept alive in the scope of the FFI call
         route_ptr, route_len, route_bytes = self._to_c_route_ptr_and_len(route)
 
-        result = self._lib.invoke_script(
-            client_adapter_ptr,  # Pointer to the ClientAdapter from create_client()
-            0,  # Request ID - placeholder for sync clients (used for async callbacks)
-            hash_buffer,  # Pointer to the script's SHA1 hash string
-            len(keys),  # num of keys
-            keys_c_args,  # keys (array of pointers)
-            keys_c_lengths,  # keys_len (array of lengths)
-            len(args),  # args_count
-            args_c_args,  # args (array of pointers)
-            args_c_lengths,  # args_len (array of lengths)
-            route_ptr,  # Pointer to protobuf-encoded routing information (NULL if no routing)
-            route_len,  # Length of the routing data in bytes (0 if no routing)
-        )
-        return self._handle_cmd_result(result)
+        # Create span if OpenTelemetry is configured and sampling
+        from .opentelemetry import OpenTelemetry
+
+        span = 0
+        if OpenTelemetry.should_sample():
+            span = self._lib.create_named_otel_span(_EVALSHA_SPAN_NAME)
+
+        try:
+            result = self._lib.invoke_script(
+                client_adapter_ptr,
+                0,  # Request ID - placeholder for sync clients
+                hash_buffer,
+                len(keys),
+                keys_c_args,
+                keys_c_lengths,
+                len(args),
+                args_c_args,
+                args_c_lengths,
+                route_ptr,
+                route_len,
+                span,
+            )
+            return self._handle_cmd_result(result)
+        finally:
+            if span != 0:
+                self._lib.drop_otel_span(span)
 
     def try_get_pubsub_message(self) -> Optional[PubSubMsg]:
         """Try to get a pubsub message without blocking"""
         if self._is_closed:
             raise ClosingError(
                 "Unable to execute requests; the client is closed. Please create a new client."
-            )
-
-        if not self._config._is_pubsub_configured():
-            raise ConfigurationError(
-                "The operation will never succeed since there was no pubsbub subscriptions applied to the client."
             )
 
         if self._config._get_pubsub_callback_and_context()[0] is not None:
@@ -791,9 +929,6 @@ class BaseClient(CoreCommands):
             raise ClosingError(
                 "Unable to execute requests; the client is closed. Please create a new client."
             )
-
-        if not self._config._is_pubsub_configured():
-            raise ConfigurationError("No pubsub subscriptions configured")
 
         if self._config._get_pubsub_callback_and_context()[0] is not None:
             raise ConfigurationError(
@@ -899,21 +1034,186 @@ class BaseClient(CoreCommands):
             actual_subscriptions=actual_subscriptions,
         )
 
-    def close(self):
-        if not self._is_closed:
-            self._is_closed = True
-            with self._pubsub_condition:
-                self._pubsub_condition.notify_all()
-            self._lib.close_client(self._core_client)
-            self._core_client = self._ffi.NULL
-            self._pubsub_callback_ref = None
+    def _get_cache_metrics(self, metrics_type: int) -> TResult:
+        """
+        Get cache metrics.
+
+        Args:
+            metrics_type: Type of metric to retrieve (e.g., hit rate, miss rate).
+
+        Returns:
+            The requested cache metric.
+
+        Raises:
+            RequestError: If client-side caching is not enabled or metrics tracking is disabled.
+        """
+        if self._is_closed:
+            raise ClosingError("Client is closed.")
+        client_adapter_ptr = self._core_client
+        if client_adapter_ptr == self._ffi.NULL:
+            raise ValueError("Invalid client pointer.")
+
+        result = self._lib.get_cache_metrics(
+            client_adapter_ptr,
+            0,  # Request ID (0 for sync use)
+            metrics_type,
+        )
+        return self._handle_cmd_result(result)
+
+    def close(self) -> None:
+        with self._client_lock:
+            if not self._is_closed:
+                self._is_closed = True
+                with self._pubsub_condition:
+                    self._pubsub_condition.notify_all()
+                self._lib.close_client(self._core_client)
+                self._core_client = self._ffi.NULL
+                self._pubsub_callback_ref = None
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc: Optional[BaseException],
+        tb: Optional[TracebackType],
+    ) -> None:
+        self.close()
+
+    def scoped_connection(
+        self, timeout: float = 5.0, routing_key: Optional[str] = None
+    ) -> "IsolatedScope":
+        """
+        Acquire an isolated execution scope — a dedicated connection for operations
+        requiring per-connection state (WATCH/MULTI/EXEC, CLIENT TRACKING, blocking
+        commands).
+
+        The scope bypasses the multiplexer, executing commands on its own TCP
+        connection. Use as a context manager for automatic release:
+
+            with client.scoped_connection(routing_key="my-key") as scope:
+                scope.watch("my-key")
+                val = scope.get("my-key")
+                scope.multi()
+                scope.set("my-key", str(int(val or "0") + 1))
+                result = scope.exec()
+
+        Args:
+            timeout: Maximum seconds to wait for a scope connection (default 5.0).
+            routing_key: In cluster mode, the key whose hash slot determines which
+                node the scope connects to. All keys used in the scope must hash to
+                the same slot. If None, defaults to slot 0.
+
+        Returns:
+            An IsolatedScope instance.
+
+        Raises:
+            TimeoutError: If no scope is available within the timeout.
+            ClosingError: If the client is closed.
+        """
+        import time
+
+        from .isolated_scope import IsolatedScope
+
+        if self._is_closed:
+            raise ClosingError("Client is closed.")
+
+        # Use the pointer address as client_id for the scope pool
+        client_id = int(self._ffi.cast("uintptr_t", self._core_client))
+        conn_req_bytes = self._conn_req_bytes
+
+        # Compute routing slot from key
+        if routing_key is not None:
+            routing_slot = _slot_for_key(routing_key.encode("utf-8"))
+        else:
+            routing_slot = 0
+
+        deadline = time.monotonic() + timeout
+        backoff = 0.01  # Start at 10ms (first scope needs ~500ms for TCP connect)
+
+        while True:
+            buf = self._ffi.from_buffer(conn_req_bytes)
+            scope_id = self._lib.glide_scope_try_acquire(
+                client_id,
+                self._ffi.cast("const uint8_t*", buf),
+                len(conn_req_bytes),
+                routing_slot,
+            )
+
+            if scope_id >= 0:
+                return IsolatedScope(
+                    scope_id,
+                    client_id,
+                    _SYNC_FFI,
+                    self._parse_scope_response,
+                )
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "Timed out waiting for isolated scope (pool exhausted)"
+                )
+
+            time.sleep(min(backoff, remaining))
+            backoff = min(backoff * 2, 0.5)  # Cap at 500ms
+
+    def _parse_scope_response(self, response_ptr) -> Optional[str]:  # noqa: C901
+        """Parse a CommandResponse pointer from a scope execution into a Python string."""
+        if response_ptr == self._ffi.NULL:
+            return None
+
+        resp = response_ptr
+        resp_type = resp.response_type
+
+        # Null response
+        if resp_type == 0:  # ResponseType::Null
+            return None
+        # Int
+        elif resp_type == 1:  # ResponseType::Int
+            return str(resp.int_value)
+        # Float
+        elif resp_type == 2:  # ResponseType::Float
+            return str(resp.float_value)
+        # Bool
+        elif resp_type == 3:  # ResponseType::Bool
+            return str(resp.bool_value)
+        # String
+        elif resp_type == 4:  # ResponseType::String
+            if resp.string_value == self._ffi.NULL:
+                return None
+            return self._ffi.buffer(resp.string_value, resp.string_value_len)[:].decode(
+                "utf-8"
+            )
+        # Array (for EXEC results, LRANGE, etc.)
+        elif resp_type == 5:  # ResponseType::Array
+            if resp.array_value == self._ffi.NULL or resp.array_value_len == 0:
+                return None
+            # For simple scope usage, return a string repr
+            results = []
+            for i in range(resp.array_value_len):
+                elem = self._parse_scope_response(resp.array_value + i)
+                results.append(elem)
+            return str(results)
+        # Ok
+        elif resp_type == 8:  # ResponseType::Ok
+            return "OK"
+        # Error
+        elif resp_type == 9:  # ResponseType::Error
+            if resp.string_value != self._ffi.NULL:
+                msg = self._ffi.string(resp.string_value).decode("utf-8")
+                raise RuntimeError(f"Server error: {msg}")
+            raise RuntimeError("Server error (unknown)")
+        else:
+            # Fallback for Map, Sets, etc.
+            return None
 
 
 class GlideClusterClient(BaseClient, ClusterCommands):
     """
     Client used for connection to cluster servers.
     For full documentation, see
-    https://github.com/valkey-io/valkey-glide/wiki/Python-wrapper#cluster
+    https://glide.valkey.io/how-to/client-initialization/#cluster
     """
 
     def _build_cluster_scan_args(self, match, count, type, allow_non_covered_slots):
@@ -1001,8 +1301,10 @@ class GlideClient(BaseClient, StandaloneCommands):
     """
     Client used for connection to standalone servers.
     For full documentation, see
-    https://github.com/valkey-io/valkey-glide/wiki/Python-wrapper#standalone
+    https://glide.valkey.io/how-to/client-initialization/#standalone
     """
+
+    pass
 
 
 TGlideClient = Union[GlideClient, GlideClusterClient]

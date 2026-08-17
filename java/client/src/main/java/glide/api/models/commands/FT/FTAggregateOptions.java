@@ -9,6 +9,7 @@ import glide.api.BaseClient;
 import glide.api.commands.servermodules.FT;
 import glide.api.models.GlideString;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -31,16 +32,35 @@ public class FTAggregateOptions {
 
     private final List<FTAggregateClause> clauses;
 
+    // 1.2 options
+    @Builder.Default private final boolean verbatim = false;
+
+    @Builder.Default private final boolean inorder = false;
+
+    private final Integer slop;
+
+    private final Integer dialect;
+
     /** Convert to module API. */
     public GlideString[] toArgs() {
-        var args = new ArrayList<GlideString>();
+        ArrayList<GlideString> args = new ArrayList<GlideString>();
+        if (verbatim) {
+            args.add(gs("VERBATIM"));
+        }
+        if (inorder) {
+            args.add(gs("INORDER"));
+        }
+        if (slop != null) {
+            args.add(gs("SLOP"));
+            args.add(gs(slop.toString()));
+        }
         if (loadAll) {
             args.add(gs("LOAD"));
             args.add(gs("*"));
         } else if (loadFields != null) {
             args.add(gs("LOAD"));
             args.add(gs(Integer.toString(loadFields.length)));
-            args.addAll(List.of(loadFields));
+            args.addAll(Arrays.asList(loadFields));
         }
         if (timeout != null) {
             args.add(gs("TIMEOUT"));
@@ -56,11 +76,15 @@ public class FTAggregateOptions {
                     });
         }
         if (clauses != null) {
-            for (var expression : clauses) {
-                args.addAll(List.of(expression.toArgs()));
+            for (FTAggregateClause expression : clauses) {
+                args.addAll(Arrays.asList(expression.toArgs()));
             }
         }
-        return args.toArray(GlideString[]::new);
+        if (dialect != null) {
+            args.add(gs("DIALECT"));
+            args.add(gs(dialect.toString()));
+        }
+        return args.toArray(new GlideString[0]);
     }
 
     /**
@@ -74,6 +98,10 @@ public class FTAggregateOptions {
         void loadAll(boolean loadAll) {}
 
         void expressions(List<FTAggregateClause> expressions) {}
+
+        void verbatim(boolean verbatim) {}
+
+        void inorder(boolean inorder) {}
 
         /** Load all fields declared in the index. */
         public FTAggregateOptionsBuilder loadAll() {
@@ -104,6 +132,40 @@ public class FTAggregateOptions {
         public FTAggregateOptionsBuilder addClause(@NonNull FTAggregateClause clause) {
             if (clauses == null) clauses = new ArrayList<>();
             clauses.add(clause);
+            return this;
+        }
+
+        /** If set, stemming is not applied to term searches. */
+        public FTAggregateOptionsBuilder verbatim() {
+            this.verbatim$value = true;
+            this.verbatim$set = true;
+            return this;
+        }
+
+        /** If set, proximity matching of terms must be in order. */
+        public FTAggregateOptionsBuilder inorder() {
+            this.inorder$value = true;
+            this.inorder$set = true;
+            return this;
+        }
+
+        /**
+         * Set the slop value for proximity matching of terms.
+         *
+         * @param slop The maximum number of intervening terms allowed between query terms.
+         */
+        public FTAggregateOptionsBuilder slop(int slop) {
+            this.slop = slop;
+            return this;
+        }
+
+        /**
+         * Set the query dialect version.
+         *
+         * @param dialect The dialect version.
+         */
+        public FTAggregateOptionsBuilder dialect(int dialect) {
+            this.dialect = dialect;
             return this;
         }
     }
@@ -224,7 +286,10 @@ public class FTAggregateOptions {
                         gs(ClauseType.GROUPBY.toString()), gs(Integer.toString(properties.length))
                     },
                     properties,
-                    Stream.of(reducers).map(Reducer::toArgs).flatMap(Stream::of).toArray(GlideString[]::new));
+                    Stream.of(reducers)
+                            .map(Reducer::toArgs)
+                            .flatMap(Stream::of)
+                            .toArray(size -> new GlideString[size]));
         }
 
         /**
@@ -334,7 +399,7 @@ public class FTAggregateOptions {
                     Stream.of(properties)
                             .map(SortProperty::toArgs)
                             .flatMap(Stream::of)
-                            .toArray(GlideString[]::new),
+                            .toArray(size -> new GlideString[size]),
                     max == null ? new GlideString[0] : new GlideString[] {gs("MAX"), gs(max.toString())});
         }
 

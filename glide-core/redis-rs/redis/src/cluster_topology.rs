@@ -202,8 +202,10 @@ pub(crate) fn parse_and_count_slots(
                                     metadata_ip =
                                         String::from_utf8_lossy(value_bytes).parse::<IpAddr>().ok();
                                 } else if key_str == "hostname" {
-                                    metadata_hostname =
-                                        Some(String::from_utf8_lossy(value_bytes).into_owned());
+                                    let h = String::from_utf8_lossy(value_bytes);
+                                    if !h.is_empty() {
+                                        metadata_hostname = Some(h.into_owned());
+                                    }
                                 }
                                 // Other keys are ignored - we only need ip and hostname
                             };
@@ -427,7 +429,7 @@ mod tests {
             .iter()
             .map(|(host, port)| {
                 Value::Array(vec![
-                    Value::BulkString(host.as_bytes().to_vec()),
+                    Value::BulkString(host.as_bytes().to_vec().into()),
                     Value::Int(*port as i64),
                 ])
             })
@@ -453,9 +455,9 @@ mod tests {
             .iter()
             .map(|(host, port, metadata)| {
                 let mut node_vec = vec![
-                    Value::BulkString(host.as_bytes().to_vec()),
+                    Value::BulkString(host.as_bytes().to_vec().into()),
                     Value::Int(*port as i64),
-                    Value::BulkString(b"node-id-placeholder".to_vec()), // node ID
+                    Value::BulkString(b"node-id-placeholder".to_vec().into()), // node ID
                 ];
 
                 if let Some(meta) = metadata {
@@ -465,8 +467,8 @@ mod tests {
                                 .iter()
                                 .flat_map(|(k, v)| {
                                     vec![
-                                        Value::BulkString(k.as_bytes().to_vec()),
-                                        Value::BulkString(v.as_bytes().to_vec()),
+                                        Value::BulkString(k.as_bytes().to_vec().into()),
+                                        Value::BulkString(v.as_bytes().to_vec().into()),
                                     ]
                                 })
                                 .collect();
@@ -477,8 +479,8 @@ mod tests {
                                 .iter()
                                 .map(|(k, v)| {
                                     (
-                                        Value::BulkString(k.as_bytes().to_vec()),
-                                        Value::BulkString(v.as_bytes().to_vec()),
+                                        Value::BulkString(k.as_bytes().to_vec().into()),
+                                        Value::BulkString(v.as_bytes().to_vec().into()),
                                     )
                                 })
                                 .collect();
@@ -949,6 +951,46 @@ mod tests {
         });
     }
 
+    #[test]
+    fn parse_slots_empty_hostname_in_metadata_falls_back_to_ip() {
+        // ElastiCache (plaintext, cluster mode) returns hostname: "" (empty string)
+        // in CLUSTER SLOTS metadata. The parser should treat this as absent and
+        // fall back to the IP address from the primary identifier.
+        run_with_both_formats(|format| {
+            let view = Value::Array(vec![slot_value_with_metadata(
+                0,
+                16383,
+                vec![
+                    ("172.20.43.71", 6379, Some(vec![("hostname", "")])),
+                    ("172.20.78.117", 6379, Some(vec![("hostname", "")])),
+                ],
+                format,
+            )]);
+
+            let ParsedSlotsResult {
+                slots_count,
+                slots,
+                address_to_ip_map,
+            } = parse_and_count_slots(&view, None, "fallback", None).unwrap();
+
+            assert_eq!(slots_count, 16384);
+            assert_eq!(slots.len(), 1);
+            // Should use the IP as the address, not the empty hostname
+            assert_eq!(slots[0].master(), "172.20.43.71:6379");
+            assert_eq!(slots[0].replicas(), vec!["172.20.78.117:6379".to_string()]);
+
+            assert_eq!(address_to_ip_map.len(), 2);
+            assert_eq!(
+                address_to_ip_map.get("172.20.43.71:6379"),
+                Some(&"172.20.43.71".parse().unwrap())
+            );
+            assert_eq!(
+                address_to_ip_map.get("172.20.78.117:6379"),
+                Some(&"172.20.78.117".parse().unwrap())
+            );
+        });
+    }
+
     enum ViewType {
         SingleNodeViewFullCoverage,
         SingleNodeViewMissingSlots,
@@ -1166,8 +1208,7 @@ mod tests {
     #[test]
     fn parse_slots_with_address_resolver_transforms_addresses() {
         // Create a resolver that appends ".resolved" to all hostnames
-        let resolver: Arc<dyn crate::types::AddressResolver> =
-            Arc::new(TestAddressResolver::new("resolved."));
+        let resolver = TestAddressResolver::new("resolved.");
 
         // Create slot data with a primary and replica
         let view = Value::Array(vec![slot_value_with_replicas(

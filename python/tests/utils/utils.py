@@ -3,9 +3,9 @@ import random
 import string
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from enum import IntEnum
 from typing import (
     Any,
+    Awaitable,
     Callable,
     Dict,
     List,
@@ -17,10 +17,10 @@ from typing import (
     cast,
 )
 
-import anyio
 import pytest
 from glide.glide_client import GlideClient, GlideClusterClient, TGlideClient
 from glide.logger import Level as logLevel
+from glide_shared.cache import ClientSideCache
 from glide_shared.commands.batch import Batch, ClusterBatch
 from glide_shared.commands.bitmap import (
     BitFieldGet,
@@ -40,8 +40,8 @@ from glide_shared.commands.core_options import (
     FlushMode,
     InfoSection,
     InsertPosition,
-    PubSubMsg,
 )
+from glide_shared.commands.memory import MemoryStats, MemoryStatsDb
 from glide_shared.commands.sorted_set import (
     AggregationType,
     GeoSearchByBox,
@@ -91,7 +91,8 @@ from glide_shared.constants import (
     TFunctionStatsSingleNodeResponse,
     TResult,
 )
-from glide_shared.routes import AllNodes
+from glide_shared.exceptions import TimeoutError as GlideTimeoutError
+from glide_shared.routes import AllNodes, SlotKeyRoute, SlotType
 from glide_sync import GlideClient as SyncGlideClient
 from glide_sync import GlideClusterClient as SyncGlideClusterClient
 from glide_sync import TGlideClient as TSyncGlideClient
@@ -155,6 +156,71 @@ def get_first_result(
     return cast(bytes, res)
 
 
+def flatten_cluster_response_lists(response) -> list:
+    """Flatten a cluster response of lists."""
+    if isinstance(response, dict):
+        return [e for entries in response.values() for e in entries]
+    return response
+
+
+async def get_unix_seconds(glide_client: TGlideClient) -> int:
+    """Returns the current server time as a Unix timestamp in seconds."""
+    # TODO #6166: Use a base client method to call time() directly.
+    return int((await glide_client.time())[0])
+
+
+def get_unix_seconds_sync(glide_client: TSyncGlideClient) -> int:
+    """Returns the current server time as a Unix timestamp in seconds."""
+    # TODO #6166: Use a base client method to call time() directly.
+    return int(glide_client.time()[0])
+
+
+async def trigger_latency_spike(glide_client: TGlideClient) -> None:
+    """Triggers a latency spike for the "command" event."""
+
+    # Resets any existing latency data first so the spike is recorded against a clean baseline,
+    # then enables the server-side latency monitor, triggers a latency spike for the "command"
+    # event, and finally restores the original latency monitoring threshold.
+    await glide_client.latency_reset()
+
+    # Save the current threshold so we can restore it after the spike.
+    prev = await glide_client.config_get(["latency-monitor-threshold"])
+    prev_threshold = prev.get(b"latency-monitor-threshold", b"0").decode()
+
+    await glide_client.config_set({"latency-monitor-threshold": "1"})
+
+    debug_sleep_args = ["DEBUG", "SLEEP", "0.05"]
+    if isinstance(glide_client, GlideClusterClient):
+        await glide_client.custom_command(debug_sleep_args, AllNodes())
+    else:
+        await glide_client.custom_command(debug_sleep_args)
+
+    await glide_client.config_set({"latency-monitor-threshold": prev_threshold})
+
+
+def trigger_latency_spike_sync(glide_client: TSyncGlideClient) -> None:
+    """Triggers a latency spike for the "command" event."""
+
+    # Resets any existing latency data first so the spike is recorded against a clean baseline,
+    # then enables the server-side latency monitor, triggers a latency spike for the "command"
+    # event, and finally restores the original latency monitoring threshold.
+    glide_client.latency_reset()
+
+    # Save the current threshold so we can restore it after the spike.
+    prev = glide_client.config_get(["latency-monitor-threshold"])
+    prev_threshold = prev.get(b"latency-monitor-threshold", b"0").decode()
+
+    glide_client.config_set({"latency-monitor-threshold": "1"})
+
+    debug_sleep_args = ["DEBUG", "SLEEP", "0.05"]
+    if isinstance(glide_client, SyncGlideClusterClient):
+        glide_client.custom_command(debug_sleep_args, AllNodes())
+    else:
+        glide_client.custom_command(debug_sleep_args)
+
+    glide_client.config_set({"latency-monitor-threshold": prev_threshold})
+
+
 def parse_info_response(res: Union[bytes, Dict[bytes, bytes]]) -> Dict[str, str]:
     res_first = get_first_result(res)
     res_decoded = res_first.decode() if isinstance(res_first, bytes) else res_first
@@ -201,8 +267,132 @@ def sync_get_version(client: TSyncGlideClient) -> str:
     return info.get("valkey_version") or info.get("redis_version")  # type: ignore
 
 
+# Expected server responses for BGSAVE/BGSAVE SCHEDULE.
+BGSAVE_RESPONSES = {
+    "Background saving started",
+    "Background saving scheduled",
+}
+
+# Expected server responses for BGREWRITEAOF.
+BGREWRITEAOF_RESPONSES = {
+    "Background append only file rewriting started",
+    "Background append only file rewriting scheduled",
+}
+
+# Expected server error response for BGSAVE CANCEL when no save is in progress.
+BGSAVE_NOT_CANCELLED_RESPONSE = (
+    "Background saving is currently not in progress or scheduled"
+)
+
+# Route for routing to a single primary node by slot key.
+PRIMARY_SLOT_ROUTE = SlotKeyRoute(SlotType.PRIMARY, "1")
+
+# Timeout and interval between retries while waiting for a condition to be met.
+_WAIT_FOR_TIMEOUT_SEC = 10.0
+_WAIT_FOR_INTERVAL_SEC = 0.1
+
+
+async def wait_for(
+    condition: Callable[[], Awaitable[bool]],
+    failure: str,
+    timeout: float = _WAIT_FOR_TIMEOUT_SEC,
+) -> None:
+    """Waits until a condition is met.
+
+    Args:
+        condition: Async callable that returns True when the condition is met.
+        failure: Error message raised if the condition is not met within timeout.
+        timeout: Maximum time to wait for the condition to be met, in seconds.
+    Raises:
+        TimeoutError: If the condition is not met within the timeout.
+    """
+    import time as _time
+
+    import anyio
+
+    deadline = _time.monotonic() + timeout
+
+    while _time.monotonic() < deadline:
+        if await condition():
+            return
+        await anyio.sleep(_WAIT_FOR_INTERVAL_SEC)
+
+    raise TimeoutError(failure)
+
+
+def sync_wait_for(
+    condition: Callable[[], bool],
+    failure: str,
+    timeout: float = _WAIT_FOR_TIMEOUT_SEC,
+) -> None:
+    """Waits until a condition is met.
+
+    Args:
+        condition: Callable that returns True when the condition is met.
+        failure: Error message raised if the condition is not met within timeout.
+        timeout: Maximum time to wait for the condition to be met, in seconds.
+
+    Raises:
+        TimeoutError: If the condition is not met within the timeout.
+    """
+    import time as _time
+
+    deadline = _time.monotonic() + timeout
+
+    while _time.monotonic() < deadline:
+        if condition():
+            return
+        _time.sleep(_WAIT_FOR_INTERVAL_SEC)
+
+    raise TimeoutError(failure)
+
+
+async def wait_for_save_not_in_progress(client: TGlideClient) -> None:
+    """Waits until no save (RDB save or AOF rewrite) is in progress."""
+
+    async def _check() -> bool:
+        return not _is_save_in_progress(await client.info([InfoSection.PERSISTENCE]))
+
+    await wait_for(_check, "Timed out waiting for save to complete")
+
+
+def sync_wait_for_save_not_in_progress(client: TSyncGlideClient) -> None:
+    """Waits until no save (RDB save or AOF rewrite) is in progress."""
+
+    def _check() -> bool:
+        return not _is_save_in_progress(client.info([InfoSection.PERSISTENCE]))
+
+    sync_wait_for(_check, "Timed out waiting for save to complete")
+
+
+def _is_save_in_progress(result: Union[bytes, Dict[bytes, bytes]]) -> bool:
+    """Returns True if any node has a save (RDB or AOF rewrite) in progress."""
+    if isinstance(result, dict):
+        infos = [v.decode() if isinstance(v, bytes) else v for v in result.values()]
+    else:
+        infos = [result.decode() if isinstance(result, bytes) else result]
+    return any(
+        "rdb_bgsave_in_progress:1" in info or "aof_rewrite_in_progress:1" in info
+        for info in infos
+    )
+
+
 def check_version_lt(version_str: str, min_version: str) -> bool:
     return version.parse(version_str) < version.parse(min_version)
+
+
+def assert_responses_in(
+    result: Union[str, Dict[bytes, str]],
+    expected: Set[str],
+) -> None:
+    """Asserts that a response contains only expected values."""
+    if isinstance(result, dict):
+        for value in result.values():
+            decoded = value.decode() if isinstance(value, bytes) else value
+            assert decoded in expected, f"Unexpected response: {decoded}"
+    else:
+        decoded = result.decode() if isinstance(result, bytes) else result
+        assert decoded in expected, f"Unexpected response: {decoded}"
 
 
 def compare_maps(
@@ -529,8 +719,8 @@ def delete_acl_username_and_password(client: TAnyGlideClient, username: str):
 
 
 def create_client_config(
-    request,
-    cluster_mode: bool,
+    request=None,
+    cluster_mode: bool = False,
     credentials: Optional[ServerCredentials] = None,
     database_id: int = 0,
     addresses: Optional[List[NodeAddress]] = None,
@@ -554,19 +744,33 @@ def create_client_config(
     lazy_connect: Optional[bool] = False,
     enable_compression: Optional[bool] = None,
     reconciliation_interval_ms: Optional[int] = None,
+    root_pem_cacerts: Optional[bytes] = None,
+    client_cert_pem: Optional[bytes] = None,
+    client_key_pem: Optional[bytes] = None,
+    read_only: bool = False,
+    cache: Optional[ClientSideCache] = None,
+    lib_name: Optional[str] = None,
+    client_info_tag: Optional[str] = None,
 ) -> Union[GlideClusterClientConfiguration, GlideClientConfiguration]:
     if use_tls is not None:
         use_tls = use_tls
     else:
-        use_tls = request.config.getoption("--tls")
-    tls_adv_conf = TlsAdvancedConfiguration(use_insecure_tls=tls_insecure)
+        use_tls = request.config.getoption("--tls") if request else False
+    tls_adv_conf = TlsAdvancedConfiguration(
+        use_insecure_tls=tls_insecure,
+        root_pem_cacerts=root_pem_cacerts,
+        client_cert_pem=client_cert_pem,
+        client_key_pem=client_key_pem,
+    )
 
     # Create compression configuration if enabled
     compression_config = None
     if enable_compression is not None:
         use_compression = enable_compression
     else:
-        use_compression = request.config.getoption("--compression")
+        use_compression = (
+            request.config.getoption("--compression") if request else False
+        )
 
     if use_compression:
         compression_config = CompressionConfiguration(
@@ -576,7 +780,9 @@ def create_client_config(
             min_compression_size=64,  # Only compress values >= 64 bytes
         )
     if cluster_mode:
-        valkey_cluster = valkey_cluster or pytest.valkey_cluster  # type: ignore
+        if valkey_cluster is None:
+            valkey_cluster = pytest.valkey_tls_cluster if use_tls else pytest.valkey_cluster  # type: ignore[attr-defined]
+
         assert type(valkey_cluster) is ValkeyCluster
         k = min(3, len(valkey_cluster.nodes_addr))
         seed_nodes = random.sample(valkey_cluster.nodes_addr, k=k)
@@ -586,6 +792,8 @@ def create_client_config(
             credentials=credentials,
             database_id=database_id,
             client_name=client_name,
+            lib_name=lib_name,
+            client_info_tag=client_info_tag,
             protocol=protocol,
             request_timeout=request_timeout,
             pubsub_subscriptions=cluster_mode_pubsub,
@@ -597,11 +805,15 @@ def create_client_config(
                 tls_config=tls_adv_conf,
                 pubsub_reconciliation_interval=reconciliation_interval_ms,
             ),
+            reconnect_strategy=reconnect_strategy,
             lazy_connect=lazy_connect,
             compression=compression_config,
+            client_side_cache=cache,
         )
     else:
-        valkey_cluster = valkey_cluster or pytest.standalone_cluster  # type: ignore
+        if valkey_cluster is None:
+            valkey_cluster = pytest.standalone_tls_cluster if use_tls else pytest.standalone_cluster  # type: ignore[attr-defined]
+
         assert type(valkey_cluster) is ValkeyCluster
         return GlideClientConfiguration(
             addresses=(valkey_cluster.nodes_addr if addresses is None else addresses),
@@ -609,6 +821,8 @@ def create_client_config(
             credentials=credentials,
             database_id=database_id,
             client_name=client_name,
+            lib_name=lib_name,
+            client_info_tag=client_info_tag,
             protocol=protocol,
             request_timeout=request_timeout,
             pubsub_subscriptions=standalone_mode_pubsub,
@@ -623,12 +837,14 @@ def create_client_config(
             reconnect_strategy=reconnect_strategy,
             lazy_connect=lazy_connect,
             compression=compression_config,
+            read_only=read_only,
+            client_side_cache=cache,
         )
 
 
 def create_sync_client_config(
-    request,
-    cluster_mode: bool,
+    request=None,
+    cluster_mode: bool = False,
     credentials: Optional[ServerCredentials] = None,
     database_id: int = 0,
     addresses: Optional[List[NodeAddress]] = None,
@@ -651,19 +867,34 @@ def create_sync_client_config(
     lazy_connect: Optional[bool] = False,
     enable_compression: Optional[bool] = None,
     inflight_requests_limit: Optional[int] = None,
+    reconciliation_interval_ms: Optional[int] = None,
+    root_pem_cacerts: Optional[bytes] = None,
+    client_cert_pem: Optional[bytes] = None,
+    client_key_pem: Optional[bytes] = None,
+    read_only: bool = False,
+    cache: Optional[ClientSideCache] = None,
+    lib_name: Optional[str] = None,
+    client_info_tag: Optional[str] = None,
 ) -> Union[SyncGlideClusterClientConfiguration, SyncGlideClientConfiguration]:
     if use_tls is not None:
         use_tls = use_tls
     else:
-        use_tls = request.config.getoption("--tls")
-    tls_adv_conf = TlsAdvancedConfiguration(use_insecure_tls=tls_insecure)
+        use_tls = request.config.getoption("--tls") if request else False
+    tls_adv_conf = TlsAdvancedConfiguration(
+        use_insecure_tls=tls_insecure,
+        root_pem_cacerts=root_pem_cacerts,
+        client_cert_pem=client_cert_pem,
+        client_key_pem=client_key_pem,
+    )
 
     # Create compression configuration if enabled
     compression_config = None
     if enable_compression is not None:
         use_compression = enable_compression
     else:
-        use_compression = request.config.getoption("--compression")
+        use_compression = (
+            request.config.getoption("--compression") if request else False
+        )
 
     if use_compression:
         compression_config = CompressionConfiguration(
@@ -674,7 +905,8 @@ def create_sync_client_config(
         )
 
     if cluster_mode:
-        valkey_cluster = valkey_cluster or pytest.valkey_cluster  # type: ignore
+        if valkey_cluster is None:
+            valkey_cluster = pytest.valkey_tls_cluster if use_tls else pytest.valkey_cluster  # type: ignore[attr-defined]
         assert type(valkey_cluster) is ValkeyCluster
         k = min(3, len(valkey_cluster.nodes_addr))
         seed_nodes = random.sample(valkey_cluster.nodes_addr, k=k)
@@ -684,6 +916,8 @@ def create_sync_client_config(
             credentials=credentials,
             database_id=database_id,
             client_name=client_name,
+            lib_name=lib_name,
+            client_info_tag=client_info_tag,
             protocol=protocol,
             request_timeout=request_timeout,
             pubsub_subscriptions=cluster_mode_pubsub,
@@ -691,13 +925,18 @@ def create_sync_client_config(
             client_az=client_az,
             inflight_requests_limit=inflight_requests_limit,
             advanced_config=AdvancedGlideClusterClientConfiguration(
-                connection_timeout, tls_config=tls_adv_conf
+                connection_timeout,
+                tls_config=tls_adv_conf,
+                pubsub_reconciliation_interval=reconciliation_interval_ms,
             ),
+            reconnect_strategy=reconnect_strategy,
             lazy_connect=lazy_connect,
             compression=compression_config,
+            client_side_cache=cache,
         )
     else:
-        valkey_cluster = valkey_cluster or pytest.standalone_cluster  # type: ignore
+        if valkey_cluster is None:
+            valkey_cluster = pytest.standalone_tls_cluster if use_tls else pytest.standalone_cluster  # type: ignore[attr-defined]
         assert type(valkey_cluster) is ValkeyCluster
         return SyncGlideClientConfiguration(
             addresses=(valkey_cluster.nodes_addr if addresses is None else addresses),
@@ -705,6 +944,8 @@ def create_sync_client_config(
             credentials=credentials,
             database_id=database_id,
             client_name=client_name,
+            lib_name=lib_name,
+            client_info_tag=client_info_tag,
             protocol=protocol,
             request_timeout=request_timeout,
             pubsub_subscriptions=standalone_mode_pubsub,
@@ -712,11 +953,15 @@ def create_sync_client_config(
             client_az=client_az,
             inflight_requests_limit=inflight_requests_limit,
             advanced_config=AdvancedGlideClientConfiguration(
-                connection_timeout, tls_config=tls_adv_conf
+                connection_timeout,
+                tls_config=tls_adv_conf,
+                pubsub_reconciliation_interval=reconciliation_interval_ms,
             ),
             reconnect_strategy=reconnect_strategy,
             lazy_connect=lazy_connect,
             compression=compression_config,
+            read_only=read_only,
+            client_side_cache=cache,
         )
 
 
@@ -792,6 +1037,44 @@ def kill_connections(
         return client.custom_command(cmd)
     elif isinstance(client, (GlideClusterClient, SyncGlideClusterClient)):
         return client.custom_command(cmd, route=AllNodes())
+
+
+# Tolerance for the fire-and-forget CLIENT KILL that reconnect tests issue to
+# force a disconnect. Under heavy full-matrix CI contention the kill command can
+# time out even though it reached the server: in cluster mode it is fanned over
+# AllNodes and can sever the caller's own connections to the non-executing nodes
+# before their responses arrive, and even a standalone kill can outlast a loaded
+# runner's request budget. That timeout is a benign outcome - the disconnect is
+# the whole point of the call, and every caller separately verifies that the
+# client recovers afterward - so we tolerate a GLIDE TimeoutError and let any
+# other error propagate as a real failure.
+async def kill_connections_tolerant(
+    client: TAnyGlideClient,
+    kill_type: Optional[str] = "normal",
+    skip_me: str = "yes",
+) -> None:
+    """Async: kill connections, tolerating a GLIDE TimeoutError from the kill.
+
+    The CLIENT KILL severs the connections even when the client's own response
+    times out under load, so a ``TimeoutError`` is an acceptable outcome here -
+    the caller's reconnect check is the real gate. Any other error propagates.
+    """
+    try:
+        await kill_connections(client, kill_type=kill_type, skip_me=skip_me)
+    except GlideTimeoutError:
+        pass
+
+
+def sync_kill_connections_tolerant(
+    client: TAnyGlideClient,
+    kill_type: Optional[str] = "normal",
+    skip_me: str = "yes",
+) -> None:
+    """Sync counterpart of :func:`kill_connections_tolerant`."""
+    try:
+        kill_connections(client, kill_type=kill_type, skip_me=skip_me)
+    except GlideTimeoutError:
+        pass
 
 
 def generate_key(keyslot: Optional[str], is_atomic: bool) -> str:
@@ -1791,589 +2074,175 @@ async def create_client_with_retry(config, max_retries: int = 3):
             time.sleep(base_delay + jitter)
 
 
-class SubscriptionMethod(IntEnum):
+def create_sync_client_with_retry(config, max_retries: int = 3):
     """
-    Enumeration for specifying how subscriptions are established.
-    """
-
-    Config = 0
-    "Subscriptions set in client configuration at creation time."
-    Lazy = 1
-    "Non-blocking subscription using *_lazy methods."
-    Blocking = 2
-    "Blocking subscription with timeout."
-
-
-class MessageReadMethod(IntEnum):
-    """
-    Enumeration for specifying the method of reading PUBSUB messages.
-    """
-
-    Async = 0
-    "Uses asynchronous get_pubsub_message() method."
-    Sync = 1
-    "Uses synchronous try_get_pubsub_message() method."
-    Callback = 2
-    "Uses callback-based subscription method."
-
-
-# Type alias for PubSubChannelModes
-ClusterPubSubModes = GlideClusterClientConfiguration.PubSubChannelModes
-StandalonePubSubModes = GlideClientConfiguration.PubSubChannelModes
-
-
-def get_pubsub_modes(
-    client: TGlideClient,
-) -> Any:
-    """Get the appropriate PubSubChannelModes enum for the client type."""
-    if isinstance(client, GlideClusterClient):
-        return GlideClusterClientConfiguration.PubSubChannelModes
-    return GlideClientConfiguration.PubSubChannelModes
-
-
-def create_pubsub_subscription(
-    cluster_mode: bool,
-    cluster_channels_and_patterns: Dict[ClusterPubSubModes, Set[str]],
-    standalone_channels_and_patterns: Dict[StandalonePubSubModes, Set[str]],
-    callback: Optional[Callable[[PubSubMsg, Any], None]] = None,
-    context: Optional[Any] = None,
-) -> Union[
-    GlideClusterClientConfiguration.PubSubSubscriptions,
-    GlideClientConfiguration.PubSubSubscriptions,
-]:
-    """Create a PubSubSubscriptions object for the given mode."""
-    if cluster_mode:
-        return GlideClusterClientConfiguration.PubSubSubscriptions(
-            channels_and_patterns=cluster_channels_and_patterns,
-            callback=callback,
-            context=context,
-        )
-    return GlideClientConfiguration.PubSubSubscriptions(
-        channels_and_patterns=standalone_channels_and_patterns,
-        callback=callback,
-        context=context,
-    )
-
-
-async def create_pubsub_client(
-    request,
-    cluster_mode: bool,
-    channels: Optional[Set[str]] = None,
-    patterns: Optional[Set[str]] = None,
-    sharded_channels: Optional[Set[str]] = None,
-    callback: Optional[Callable[[PubSubMsg, Any], None]] = None,
-    context: Optional[Any] = None,
-    protocol: ProtocolVersion = ProtocolVersion.RESP3,
-    timeout: Optional[int] = None,
-    lazy_connect: bool = False,
-    reconciliation_interval_ms: Optional[int] = None,
-) -> TGlideClient:
-    from tests.async_tests.conftest import create_client
-
-    has_subscriptions = channels or patterns or sharded_channels
-    has_callback = callback is not None
-
-    if has_subscriptions or has_callback:
-        # Build channels_and_patterns dict
-        if cluster_mode:
-            PubSubModes = GlideClusterClientConfiguration.PubSubChannelModes
-
-            channels_and_patterns: Dict[ClusterPubSubModes, Set[str]] = {}
-            if channels:
-                channels_and_patterns[PubSubModes.Exact] = channels
-            if patterns:
-                channels_and_patterns[PubSubModes.Pattern] = patterns
-            if sharded_channels:
-                channels_and_patterns[PubSubModes.Sharded] = sharded_channels
-
-            pub_sub: Union[
-                GlideClusterClientConfiguration.PubSubSubscriptions,
-                GlideClientConfiguration.PubSubSubscriptions,
-            ] = GlideClusterClientConfiguration.PubSubSubscriptions(
-                channels_and_patterns=channels_and_patterns,
-                callback=callback,
-                context=context,
-            )
-
-            client = await create_client(
-                request,
-                cluster_mode=cluster_mode,
-                cluster_mode_pubsub=pub_sub,  # type: ignore[arg-type]
-                standalone_mode_pubsub=None,
-                protocol=protocol,
-                request_timeout=timeout,
-                lazy_connect=lazy_connect,
-                reconciliation_interval_ms=reconciliation_interval_ms,
-            )
-        else:
-            PubSubModes = GlideClientConfiguration.PubSubChannelModes  # type: ignore[assignment]
-
-            standalone_channels_and_patterns: Dict[StandalonePubSubModes, Set[str]] = {}
-            if channels:
-                standalone_channels_and_patterns[PubSubModes.Exact] = channels  # type: ignore[index]
-            if patterns:
-                standalone_channels_and_patterns[PubSubModes.Pattern] = patterns  # type: ignore[index]
-
-            pub_sub = GlideClientConfiguration.PubSubSubscriptions(
-                channels_and_patterns=standalone_channels_and_patterns,
-                callback=callback,
-                context=context,
-            )
-
-            client = await create_client(
-                request,
-                cluster_mode=cluster_mode,
-                cluster_mode_pubsub=None,
-                standalone_mode_pubsub=pub_sub,  # type: ignore[arg-type]
-                protocol=protocol,
-                request_timeout=timeout,
-                lazy_connect=lazy_connect,
-                reconciliation_interval_ms=reconciliation_interval_ms,
-            )
-    else:
-        client = await create_client(
-            request,
-            cluster_mode=cluster_mode,
-            protocol=protocol,
-            request_timeout=timeout,
-            lazy_connect=lazy_connect,
-            reconciliation_interval_ms=reconciliation_interval_ms,
-        )
-
-    return client
-
-
-async def subscribe_by_method(
-    client: TGlideClient,
-    channels: Set[str],
-    subscription_method: SubscriptionMethod,
-    timeout_ms: int = 5000,
-) -> None:
-    """
-    Subscribe to exact channels using the specified method.
-    This helper is intended for Lazy and Blocking methods only.
-    For Config method, subscriptions are set at client creation time.
-    Does NOT wait for subscription to be established - use wait_for_subscription_state_if_needed after.
-    """
-    if subscription_method == SubscriptionMethod.Lazy:
-        result = await client.subscribe_lazy(channels)  # type: ignore[func-returns-value]
-    else:  # Blocking
-        result = await client.subscribe(channels, timeout_ms=timeout_ms)  # type: ignore[func-returns-value]
-
-    assert result is None, f"Expected subscribe to return None, got {result}"
-
-
-async def psubscribe_by_method(
-    client: TGlideClient,
-    patterns: Set[str],
-    subscription_method: SubscriptionMethod,
-    timeout_ms: int = 5000,
-) -> None:
-    """
-    Subscribe to patterns using the specified method.
-    This helper is intended for Lazy and Blocking methods only.
-    For Config method, subscriptions are set at client creation time.
-    Does NOT wait for subscription to be established - use wait_for_subscription_state_if_needed after.
-    """
-    if subscription_method == SubscriptionMethod.Lazy:
-        result = await client.psubscribe_lazy(patterns)  # type: ignore[func-returns-value]
-    else:  # Blocking
-        result = await client.psubscribe(patterns, timeout_ms=timeout_ms)  # type: ignore[func-returns-value]
-
-    assert result is None, f"Expected psubscribe to return None, got {result}"
-
-
-async def ssubscribe_by_method(
-    client: GlideClusterClient,
-    channels: Set[str],
-    subscription_method: SubscriptionMethod,
-    timeout_ms: int = 5000,
-) -> None:
-    """
-    Subscribe to sharded channels using the specified method.
-    This helper is intended for Lazy and Blocking methods only.
-    For Config method, subscriptions are set at client creation time.
-    Does NOT wait for subscription to be established - use wait_for_subscription_state_if_needed after.
-    """
-    if subscription_method == SubscriptionMethod.Lazy:
-        result = await client.ssubscribe_lazy(channels)  # type: ignore[func-returns-value]
-    else:  # Blocking
-        result = await client.ssubscribe(channels, timeout_ms=timeout_ms)  # type: ignore[func-returns-value]
-
-    assert result is None, f"Expected ssubscribe to return None, got {result}"
-
-
-async def unsubscribe_by_method(
-    client: TGlideClient,
-    channels: Optional[Set[str]],
-    subscription_method: SubscriptionMethod,
-    timeout_ms: int = 5000,
-) -> None:
-    """
-    Unsubscribe from exact channels using the specified method.
-    This helper is intended for Lazy and Blocking methods only.
-    For Config method, cannot dynamically unsubscribe.
-    Does NOT wait for unsubscription to complete - use wait_for_subscription_state_if_needed after.
-    """
-    if subscription_method == SubscriptionMethod.Config:
-        return
-
-    if subscription_method == SubscriptionMethod.Lazy:
-        result = await client.unsubscribe_lazy(channels)  # type: ignore[func-returns-value]
-    else:  # Blocking
-        result = await client.unsubscribe(channels, timeout_ms=timeout_ms)  # type: ignore[func-returns-value]
-
-    assert result is None, f"Expected unsubscribe to return None, got {result}"
-
-
-async def punsubscribe_by_method(
-    client: TGlideClient,
-    patterns: Optional[Set[str]],
-    subscription_method: SubscriptionMethod,
-    timeout_ms: int = 5000,
-) -> None:
-    """
-    Unsubscribe from patterns using the specified method.
-    This helper is intended for Lazy and Blocking methods only.
-    For Config method, cannot dynamically unsubscribe.
-    Does NOT wait for unsubscription to complete - use wait_for_subscription_state_if_needed after.
-    """
-    if subscription_method == SubscriptionMethod.Config:
-        return
-
-    if subscription_method == SubscriptionMethod.Lazy:
-        result = await client.punsubscribe_lazy(patterns)  # type: ignore[func-returns-value]
-    else:  # Blocking
-        result = await client.punsubscribe(patterns, timeout_ms=timeout_ms)  # type: ignore[func-returns-value]
-
-    assert result is None, f"Expected punsubscribe to return None, got {result}"
-
-
-async def sunsubscribe_by_method(
-    client: GlideClusterClient,
-    channels: Optional[Set[str]],
-    subscription_method: SubscriptionMethod,
-    timeout_ms: int = 5000,
-) -> None:
-    """
-    Unsubscribe from sharded channels using the specified method.
-    This helper is intended for Lazy and Blocking methods only.
-    For Config method, cannot dynamically unsubscribe.
-    Does NOT wait for unsubscription to complete - use wait_for_subscription_state_if_needed after.
-    """
-    if subscription_method == SubscriptionMethod.Config:
-        return
-
-    if subscription_method == SubscriptionMethod.Lazy:
-        result = await client.sunsubscribe_lazy(channels)  # type: ignore[func-returns-value]
-    else:  # Blocking
-        result = await client.sunsubscribe(channels, timeout_ms=timeout_ms)  # type: ignore[func-returns-value]
-
-    assert result is None, f"Expected sunsubscribe to return None, got {result}"
-
-
-async def wait_for_subscription_state(
-    client: TGlideClient,
-    expected_channels: Optional[Set[str]] = None,
-    expected_patterns: Optional[Set[str]] = None,
-    expected_sharded: Optional[Set[str]] = None,
-    timeout_ms: int = 5000,
-    poll_interval: float = 0.1,
-) -> Dict[str, Set[str]]:
-    """
-    Wait for subscription state to match expected values by polling.
+    Create a SyncGlideClient or SyncGlideClusterClient with exponential backoff retry and jitter.
 
     Args:
-        client: The Glide client
-        expected_channels: Expected exact channel subscriptions (None = don't check)
-        expected_patterns: Expected pattern subscriptions (None = don't check)
-        expected_sharded: Expected sharded channel subscriptions (None = don't check)
-        timeout_ms: Timeout in milliseconds
-        poll_interval: How often to poll state in seconds
+        config: The client configuration (SyncGlideClientConfiguration or SyncGlideClusterClientConfiguration).
+        max_retries: Maximum number of retry attempts (default: 3).
 
     Returns:
-        Dictionary with current actual subscription state
+        SyncGlideClient or SyncGlideClusterClient: The created client instance.
 
     Raises:
-        TimeoutError: If expected state not reached within timeout
+        Exception: If all retry attempts fail.
     """
-    timeout_seconds = timeout_ms / 1000.0
-    start_time = anyio.current_time()
-    last_actual_state: Optional[Dict[str, Set[str]]] = None
+    import time
 
-    PubSubModes = get_pubsub_modes(client)
+    is_cluster = isinstance(config, SyncGlideClusterClientConfiguration)
+    client_class = SyncGlideClusterClient if is_cluster else SyncGlideClient
 
-    while True:
-        elapsed = anyio.current_time() - start_time
-        if elapsed > timeout_seconds:
-            error_msg = (
-                f"Subscription state not reached within {timeout_ms}ms.\n"
-                f"Expected - channels: {expected_channels}, patterns: {expected_patterns}, "
-                f"sharded: {expected_sharded}\n"
-            )
-            if last_actual_state:
-                error_msg += (
-                    f"Actual - channels: {last_actual_state.get('channels', set())}, "
-                    f"patterns: {last_actual_state.get('patterns', set())}, "
-                    f"sharded: {last_actual_state.get('sharded', set())}\n"
-                )
-            raise TimeoutError(error_msg)
-
+    for i in range(max_retries):
         try:
-            state = await client.get_subscriptions()
-            actual_subs = state.actual_subscriptions
-
-            channels_actual = actual_subs.get(PubSubModes.Exact, set())  # type: ignore[arg-type]
-            patterns_actual = actual_subs.get(PubSubModes.Pattern, set())  # type: ignore[arg-type]
-            sharded_actual: Set[str] = set()
-            if isinstance(client, GlideClusterClient):
-                sharded_actual = actual_subs.get(PubSubModes.Sharded, set())  # type: ignore[union-attr, arg-type]
-
-            last_actual_state = {
-                "channels": channels_actual,
-                "patterns": patterns_actual,
-                "sharded": sharded_actual,
-            }
-
-            # Check if all expected states match
-            channels_match = (
-                expected_channels is None or channels_actual == expected_channels
-            )
-            patterns_match = (
-                expected_patterns is None or patterns_actual == expected_patterns
-            )
-            sharded_match = (
-                expected_sharded is None or sharded_actual == expected_sharded
-            )
-
-            if channels_match and patterns_match and sharded_match:
-                return last_actual_state
-
-        except Exception as e:
-            # Ignore connection errors during polling
-            if not isinstance(e, (ConnectionError, TimeoutError)):
+            return client_class.create(config)
+        except Exception:
+            if i == max_retries - 1:
                 raise
+            # Exponential backoff with jitter (±25%)
+            base_delay = 2**i
+            jitter = base_delay * random.uniform(-0.25, 0.25)
+            time.sleep(base_delay + jitter)
 
-        await anyio.sleep(poll_interval)
 
-
-async def wait_for_subscription_state_if_needed(
-    client: TGlideClient,
-    subscription_method: SubscriptionMethod,
-    expected_channels: Optional[Set[str]] = None,
-    expected_patterns: Optional[Set[str]] = None,
-    expected_sharded: Optional[Set[str]] = None,
-    timeout_ms: int = 5000,
-) -> None:
+async def assert_connected(client: TGlideClient) -> None:
     """
-    - Lazy: wait/poll until state matches (with timeout)
-    - Blocking and Config: verify immediately
+    Assert that the client is connected.
+    """
+    result = await client.ping()
+    assert result == b"PONG"
+
+
+def build_client_side_cache(**kwargs) -> ClientSideCache:
+    """
+    Create a ClientSideCache for testing from the given arguments.
+    If required argument(s) are not specified, defaults will be used.
     """
 
-    # Lazy subscriptions may need time to reconcile
-    if subscription_method == SubscriptionMethod.Lazy:
-        await wait_for_subscription_state(
-            client,
-            expected_channels=expected_channels,
-            expected_patterns=expected_patterns,
-            expected_sharded=expected_sharded,
-            timeout_ms=timeout_ms,
-        )
-        return
+    kwargs.setdefault("max_cache_kb", 1024)
+    kwargs.setdefault("entry_ttl_ms", 60000)
+    return ClientSideCache.create(**kwargs)
 
-    # Blocking and Config should already be established
-    state = await client.get_subscriptions()
 
-    # Define empty set with proper type
-    empty_set: Set[str] = set()
+# Assert Methods
+# --------------
 
-    if isinstance(client, GlideClusterClient):
-        ClusterModes = GlideClusterClientConfiguration.PubSubChannelModes
-        cluster_subs = cast(
-            Dict[GlideClusterClientConfiguration.PubSubChannelModes, Set[str]],
-            state.actual_subscriptions,
-        )
 
-        if expected_channels is not None:
-            actual_channels = cluster_subs.get(ClusterModes.Exact, empty_set)
-            assert (
-                actual_channels == expected_channels
-            ), f"Expected channels {expected_channels}, got {actual_channels}"
-
-        if expected_patterns is not None:
-            actual_patterns = cluster_subs.get(ClusterModes.Pattern, empty_set)
-            assert (
-                actual_patterns == expected_patterns
-            ), f"Expected patterns {expected_patterns}, got {actual_patterns}"
-
-        if expected_sharded is not None:
-            actual_sharded = cluster_subs.get(ClusterModes.Sharded, empty_set)
-            assert (
-                actual_sharded == expected_sharded
-            ), f"Expected sharded {expected_sharded}, got {actual_sharded}"
+def assert_client_tracking_info(info, on: bool) -> None:
+    """Assert that a ClientTrackingInfo reflects expected tracking state."""
+    if on:
+        assert "on" in info.flags
+        assert "bcast" in info.flags
+        assert info.redirect == 0  # tracking enabled but no redirection
+        assert len(info.prefixes) == 1
+        assert "" in info.prefixes
     else:
-        StandaloneModes = GlideClientConfiguration.PubSubChannelModes
-        standalone_subs = cast(
-            Dict[GlideClientConfiguration.PubSubChannelModes, Set[str]],
-            state.actual_subscriptions,
-        )
-
-        if expected_channels is not None:
-            actual_channels = standalone_subs.get(StandaloneModes.Exact, empty_set)
-            assert (
-                actual_channels == expected_channels
-            ), f"Expected channels {expected_channels}, got {actual_channels}"
-
-        if expected_patterns is not None:
-            actual_patterns = standalone_subs.get(StandaloneModes.Pattern, empty_set)
-            assert (
-                actual_patterns == expected_patterns
-            ), f"Expected patterns {expected_patterns}, got {actual_patterns}"
+        assert "off" in info.flags
+        assert info.redirect == -1  # tracking disabled
+        assert len(info.prefixes) == 0
 
 
-def decode_pubsub_msg(msg: Optional[PubSubMsg]) -> PubSubMsg:
-    """Decode a PubSubMsg with bytes to one with strings."""
-    if not msg:
-        return PubSubMsg("", "", None)
-    string_msg = cast(bytes, msg.message).decode()
-    string_channel = cast(bytes, msg.channel).decode()
-    string_pattern = cast(bytes, msg.pattern).decode() if msg.pattern else None
-    return PubSubMsg(string_msg, string_channel, string_pattern)
+def assert_connected_sync(client: TSyncGlideClient) -> None:
+    """Assert that the sync client is connected."""
+    result = client.ping()
+    assert result == b"PONG"
 
 
-async def get_message_by_method(
-    method: MessageReadMethod,
-    client: TGlideClient,
-    callback_messages: Optional[List[PubSubMsg]] = None,
-    index: Optional[int] = None,
-) -> PubSubMsg:
-    """
-    Get a pubsub message using the specified read method.
+def assert_memory_stats_db_entry(db_entry: MemoryStatsDb) -> None:
+    """Validate that a MemoryStatsDb instance has expected field types and values."""
+    assert isinstance(db_entry, MemoryStatsDb)
+    assert db_entry.overhead_hashtable_expires >= 0
+    assert db_entry.overhead_hashtable_main >= 0
+
+
+def assert_memory_stats_fields(stats: MemoryStats, server_version: str) -> None:
+    """Validate that a MemoryStats instance has expected field types and values.
 
     Args:
-        method: How to read the message (Async, Sync, or Callback)
-        client: The client to read from
-        callback_messages: List of messages from callback (required for Callback method)
-        index: Index in callback_messages list (required for Callback method)
-
-    Returns:
-        Decoded PubSubMsg
+        stats: The MemoryStats object to validate.
+        server_version: The server version string (e.g. "8.1.0").
     """
-    if method == MessageReadMethod.Async:
-        return decode_pubsub_msg(await client.get_pubsub_message())
-    elif method == MessageReadMethod.Sync:
-        return decode_pubsub_msg(client.try_get_pubsub_message())
-    else:  # Callback
-        assert callback_messages is not None and index is not None
-        return decode_pubsub_msg(callback_messages[index])
+    assert isinstance(stats.db, dict)
+    # Db entries are only populated if the node has at least one key. In cluster mode, an entry
+    # will only be present if that key is stored on that node. Standalone and single-node cluster
+    # tests validate db entries directly via assert_memory_stats_db_entry.
+    for db_idx, db_entry in stats.db.items():
+        assert isinstance(db_idx, int)
+        assert_memory_stats_db_entry(db_entry)
+
+    assert stats.allocator_active > 0
+    assert stats.allocator_allocated > 0
+    assert stats.allocator_fragmentation_bytes >= 0
+    assert stats.allocator_resident > 0
+    assert isinstance(stats.allocator_rss_bytes, int)
+    assert stats.aof_buffer >= 0
+    assert stats.clients_normal >= 0
+    assert stats.clients_slaves >= 0
+    assert stats.dataset_bytes >= 0
+    assert isinstance(stats.fragmentation_bytes, int)
+    assert stats.keys_bytes_per_key >= 0
+    assert stats.keys_count >= 0
+    assert stats.lua_caches >= 0
+    assert stats.overhead_total > 0
+    assert stats.peak_allocated > 0
+    assert stats.replication_backlog >= 0
+    assert isinstance(stats.rss_overhead_bytes, int)
+    assert stats.startup_allocated > 0
+    assert stats.total_allocated > 0
+
+    # Required float fields (alphabetical)
+    assert stats.allocator_fragmentation_ratio >= 0
+    assert stats.allocator_rss_ratio >= 0
+    assert stats.dataset_percentage >= 0
+    assert stats.fragmentation >= 0
+    assert stats.peak_percentage >= 0
+    assert stats.rss_overhead_ratio >= 0
+
+    # Optional Redis 7.0+ fields
+    if server_version >= "7.0.0":
+        assert stats.cluster_links is not None and stats.cluster_links >= 0
+        assert stats.functions_caches is not None and stats.functions_caches >= 0
+    else:
+        assert stats.cluster_links is None
+        assert stats.functions_caches is None
+
+    # Optional Valkey 8.0+ fields
+    if server_version >= "8.0.0":
+        assert stats.allocator_muzzy is not None and stats.allocator_muzzy >= 0
+        assert stats.db_dict_rehashing_count is not None
+        assert stats.overhead_db_hashtable_lut is not None
+        assert stats.overhead_db_hashtable_rehashing is not None
+    else:
+        assert stats.allocator_muzzy is None
+        assert stats.db_dict_rehashing_count is None
+        assert stats.overhead_db_hashtable_lut is None
+        assert stats.overhead_db_hashtable_rehashing is None
 
 
-async def check_no_messages_left(
-    method: MessageReadMethod,
-    client: TGlideClient,
-    callback_messages: Optional[List[PubSubMsg]] = None,
-    expected_callback_count: int = 0,
-    async_timeout: float = 3.0,
-) -> None:
+def get_standalone_address() -> NodeAddress:
+    """Get the standalone server address from conftest (CI) or fallback to localhost.
+
+    Use in tests that run both with conftest (CI) and without (--noconftest local).
     """
-    Verify there are no more messages to read.
-
-    Args:
-        method: The read method being used
-        client: The client to check
-        callback_messages: Callback message list (for Callback method)
-        expected_callback_count: Expected number of messages in callback list
-        async_timeout: Timeout for async method check
-
-    Raises:
-        AssertionError if there are unexpected messages
-    """
-    if method == MessageReadMethod.Async:
-        with pytest.raises(TimeoutError):
-            with anyio.fail_after(async_timeout):
-                await client.get_pubsub_message()
-    elif method == MessageReadMethod.Sync:
-        assert client.try_get_pubsub_message() is None
-    else:  # Callback
-        assert callback_messages is not None
-        assert len(callback_messages) == expected_callback_count
-
-
-def new_message(msg: PubSubMsg, context: Any) -> None:
-    """Standard callback function that appends messages to a context list."""
-    received_messages: List[PubSubMsg] = context
-    received_messages.append(msg)
-
-
-async def pubsub_client_cleanup(
-    client: Optional[TGlideClient],
-) -> None:
-    """
-    Clean up a pubsub client by unsubscribing and closing.
-
-    For Config method: just close (server will clean up on disconnect)
-    For Lazy/Blocking: unsubscribe from all before closing
-    """
-    if client is None:
-        return
-
-    cleanup_error = None
+    import pytest
 
     try:
-        # Get current subscriptions and unsubscribe
-        state = await client.get_subscriptions()
-        actual = state.actual_subscriptions
+        cluster = pytest.standalone_cluster  # type: ignore[attr-defined]
+        addr = cluster.nodes_addr[0]
+        return NodeAddress(addr.host, addr.port)
+    except (AttributeError, IndexError):
+        return NodeAddress("localhost", 6379)
 
-        has_channels: bool
-        has_patterns: bool
-        has_sharded: bool
 
-        if isinstance(client, GlideClusterClient):
-            ClusterModes = GlideClusterClientConfiguration.PubSubChannelModes
-            cluster_subs = cast(
-                Dict[GlideClusterClientConfiguration.PubSubChannelModes, Set[str]],
-                actual,
-            )
-            has_channels = bool(cluster_subs.get(ClusterModes.Exact))
-            has_patterns = bool(cluster_subs.get(ClusterModes.Pattern))
-            has_sharded = bool(cluster_subs.get(ClusterModes.Sharded))
-        else:
-            StandaloneModes = GlideClientConfiguration.PubSubChannelModes
-            standalone_subs = cast(
-                Dict[GlideClientConfiguration.PubSubChannelModes, Set[str]],
-                actual,
-            )
-            has_channels = bool(standalone_subs.get(StandaloneModes.Exact))
-            has_patterns = bool(standalone_subs.get(StandaloneModes.Pattern))
-            has_sharded = False
+def get_cluster_addresses() -> list:
+    """Get the cluster server addresses from conftest (CI) or fallback to localhost:7000.
 
-        # Unsubscribe from all using lazy (faster cleanup)
-        if has_channels:
-            await client.unsubscribe_lazy()
-        if has_patterns:
-            await client.punsubscribe_lazy()
-        if has_sharded:
-            await cast(GlideClusterClient, client).sunsubscribe_lazy()
+    Use in tests that run both with conftest (CI) and without (--noconftest local).
+    """
+    import pytest
 
-        # Wait briefly for unsubscriptions
-        if has_channels or has_patterns or has_sharded:
-            await wait_for_subscription_state(
-                client,
-                expected_channels=set(),
-                expected_patterns=set(),
-                expected_sharded=(
-                    set() if isinstance(client, GlideClusterClient) else None
-                ),
-                timeout_ms=3000,
-            )
-
-    except Exception as e:
-        cleanup_error = e
-    finally:
-        await client.close()
-        del client
-        # The closure is not completed in the glide-core instantly
-        await anyio.sleep(1)
-
-        if cleanup_error:
-            raise cleanup_error
+    try:
+        cluster = pytest.valkey_cluster  # type: ignore[attr-defined]
+        return [NodeAddress(addr.host, addr.port) for addr in cluster.nodes_addr]
+    except (AttributeError, IndexError):
+        return [NodeAddress("localhost", 7000)]

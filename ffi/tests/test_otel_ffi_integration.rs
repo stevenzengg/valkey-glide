@@ -1,13 +1,38 @@
+use glide_core::GlideSpan;
 use glide_core::request_type::RequestType;
 use glide_ffi::{
-    create_batch_otel_span, create_batch_otel_span_with_parent, create_named_otel_span,
-    create_otel_span, create_otel_span_with_parent, drop_otel_span,
+    create_batch_otel_span, create_batch_otel_span_with_parent,
+    create_batch_otel_span_with_trace_context, create_named_otel_span, create_otel_span,
+    create_otel_span_with_parent, create_otel_span_with_trace_context, drop_otel_span,
 };
 use std::ffi::CString;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
+
+/// Take a co-owning [`Arc<GlideSpan>`] for a span pointer returned by one of the
+/// `create_*_otel_span` FFI functions, WITHOUT consuming the reference still held by
+/// the raw pointer.
+///
+/// The FFI create functions leave the span's strong count at 1 (the count owned by the
+/// raw pointer handed back to the caller). Cloning that ownership here lets a test observe
+/// the strong count across a subsequent `drop_otel_span` call: a correct drop releases the
+/// FFI-held reference, so the count returned to this owner must fall back to 1. If
+/// `drop_otel_span` ever leaked (e.g. failed to call `Arc::from_raw`), the count would stay
+/// at 2 and the assertion would fire.
+///
+/// # Safety
+/// `span_ptr` must be a live span pointer returned by a `create_*_otel_span` FFI function
+/// that has NOT yet been passed to `drop_otel_span`.
+unsafe fn co_owner(span_ptr: u64) -> Arc<GlideSpan> {
+    unsafe {
+        // Bump the strong count so converting the raw pointer back to an Arc does not steal
+        // the reference owned by the FFI-side raw pointer.
+        Arc::increment_strong_count(span_ptr as *const GlideSpan);
+        Arc::from_raw(span_ptr as *const GlideSpan)
+    }
+}
 
 #[test]
 fn test_create_otel_span_with_valid_inputs() {
@@ -61,6 +86,115 @@ fn test_create_otel_span_with_valid_inputs() {
         unsafe {
             drop_otel_span(span_ptr);
         }
+    }
+}
+
+#[test]
+fn test_create_otel_span_with_trace_context_valid_inputs() {
+    logger_core::init(Some(logger_core::Level::Debug), None);
+
+    let trace_id = CString::new("0af7651916cd43dd8448eb211c80319c").unwrap();
+    let span_id = CString::new("b7ad6b7169203331").unwrap();
+    let trace_state = CString::new("vendor=value").unwrap();
+
+    let span_ptr = unsafe {
+        create_otel_span_with_trace_context(
+            RequestType::Get,
+            trace_id.as_ptr(),
+            span_id.as_ptr(),
+            1,
+            trace_state.as_ptr(),
+        )
+    };
+
+    assert_ne!(span_ptr, 0, "valid remote context should create a span");
+    assert_eq!(span_ptr % 8, 0, "span pointer should be 8-byte aligned");
+
+    unsafe {
+        drop_otel_span(span_ptr);
+    }
+}
+
+#[test]
+fn test_create_otel_span_with_trace_context_invalid_context_falls_back() {
+    logger_core::init(Some(logger_core::Level::Debug), None);
+
+    let invalid_trace_id = CString::new("not-valid").unwrap();
+    let invalid_span_id = CString::new("zzzzzzzzzzzzzzzz").unwrap();
+    let valid_trace_id = CString::new("0af7651916cd43dd8448eb211c80319c").unwrap();
+    let valid_span_id = CString::new("b7ad6b7169203331").unwrap();
+    let invalid_trace_state = CString::new("bad,tracestate,entry").unwrap();
+
+    let test_cases = [
+        (
+            "invalid trace ID",
+            invalid_trace_id.as_ptr(),
+            valid_span_id.as_ptr(),
+            std::ptr::null(),
+        ),
+        (
+            "invalid span ID",
+            valid_trace_id.as_ptr(),
+            invalid_span_id.as_ptr(),
+            std::ptr::null(),
+        ),
+        (
+            "invalid trace state",
+            valid_trace_id.as_ptr(),
+            valid_span_id.as_ptr(),
+            invalid_trace_state.as_ptr(),
+        ),
+        (
+            "null trace ID",
+            std::ptr::null(),
+            valid_span_id.as_ptr(),
+            std::ptr::null(),
+        ),
+        (
+            "null span ID",
+            valid_trace_id.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+        ),
+    ];
+
+    for (name, trace_id, span_id, trace_state) in test_cases {
+        let span_ptr = unsafe {
+            create_otel_span_with_trace_context(RequestType::Set, trace_id, span_id, 1, trace_state)
+        };
+
+        assert_ne!(span_ptr, 0, "{name} should fall back to standalone span",);
+
+        unsafe {
+            drop_otel_span(span_ptr);
+        }
+    }
+}
+
+#[test]
+fn test_create_batch_otel_span_with_trace_context() {
+    logger_core::init(Some(logger_core::Level::Debug), None);
+
+    let trace_id = CString::new("0af7651916cd43dd8448eb211c80319c").unwrap();
+    let span_id = CString::new("b7ad6b7169203331").unwrap();
+
+    let span_ptr = unsafe {
+        create_batch_otel_span_with_trace_context(
+            trace_id.as_ptr(),
+            span_id.as_ptr(),
+            1,
+            std::ptr::null(),
+        )
+    };
+
+    assert_ne!(
+        span_ptr, 0,
+        "valid remote context should create a batch span"
+    );
+    assert_eq!(span_ptr % 8, 0, "span pointer should be 8-byte aligned");
+
+    unsafe {
+        drop_otel_span(span_ptr);
     }
 }
 
@@ -836,4 +970,469 @@ fn test_batch_span_error_handling() {
             drop_otel_span(span_ptr);
         }
     }
+}
+
+#[test]
+fn test_custom_command_span_creation() {
+    logger_core::init(Some(logger_core::Level::Debug), None);
+
+    let span_ptr = create_otel_span(RequestType::CustomCommand);
+    assert_ne!(
+        span_ptr, 0,
+        "create_otel_span should succeed for CustomCommand with fallback name"
+    );
+
+    // Verify pointer properties
+    assert_eq!(span_ptr % 8, 0, "Span pointer should be 8-byte aligned");
+    assert!(
+        span_ptr >= 0x1000,
+        "Span pointer should be above minimum valid address"
+    );
+
+    // Clean up
+    unsafe {
+        drop_otel_span(span_ptr);
+    }
+}
+
+#[test]
+fn test_custom_command_span_with_parent() {
+    logger_core::init(Some(logger_core::Level::Debug), None);
+
+    // Create a parent span
+    let parent_name = CString::new("user_operation").expect("CString::new failed");
+    let parent_span_ptr = unsafe { create_named_otel_span(parent_name.as_ptr()) };
+    assert_ne!(parent_span_ptr, 0, "Parent span creation should succeed");
+
+    let child_span_ptr =
+        unsafe { create_otel_span_with_parent(RequestType::CustomCommand, parent_span_ptr) };
+    assert_ne!(
+        child_span_ptr, 0,
+        "create_otel_span_with_parent should succeed for CustomCommand with fallback name"
+    );
+
+    // Verify child span has different pointer than parent
+    assert_ne!(
+        child_span_ptr, parent_span_ptr,
+        "Child span should have different pointer than parent"
+    );
+
+    // Verify pointer properties
+    assert_eq!(
+        child_span_ptr % 8,
+        0,
+        "Child span pointer should be 8-byte aligned"
+    );
+
+    // Clean up (child first, then parent)
+    unsafe {
+        drop_otel_span(child_span_ptr);
+        drop_otel_span(parent_span_ptr);
+    }
+}
+
+#[test]
+fn test_multiple_custom_command_spans() {
+    logger_core::init(Some(logger_core::Level::Debug), None);
+
+    let mut span_ptrs = Vec::new();
+
+    for i in 0..5 {
+        let span_ptr = create_otel_span(RequestType::CustomCommand);
+        assert_ne!(
+            span_ptr, 0,
+            "create_otel_span should succeed for CustomCommand iteration {i}"
+        );
+
+        // Verify pointer properties
+        assert_eq!(span_ptr % 8, 0, "Span pointer should be 8-byte aligned");
+        assert!(
+            span_ptr >= 0x1000,
+            "Span pointer should be above minimum valid address"
+        );
+
+        span_ptrs.push(span_ptr);
+    }
+
+    // Verify all spans are unique
+    for i in 0..span_ptrs.len() {
+        for j in (i + 1)..span_ptrs.len() {
+            assert_ne!(
+                span_ptrs[i], span_ptrs[j],
+                "All CustomCommand spans should have unique pointers"
+            );
+        }
+    }
+
+    // Clean up all spans
+    for span_ptr in span_ptrs {
+        unsafe {
+            drop_otel_span(span_ptr);
+        }
+    }
+}
+
+#[test]
+fn test_custom_command_hierarchy() {
+    logger_core::init(Some(logger_core::Level::Debug), None);
+
+    // Create a root operation span
+    let root_name = CString::new("script_execution").expect("CString::new failed");
+    let root_span_ptr = unsafe { create_named_otel_span(root_name.as_ptr()) };
+    assert_ne!(root_span_ptr, 0, "Root span creation should succeed");
+
+    // Create batch span as child of root
+    let batch_span_ptr = unsafe { create_batch_otel_span_with_parent(root_span_ptr) };
+    assert_ne!(batch_span_ptr, 0, "Batch span creation should succeed");
+
+    let custom_span_1 =
+        unsafe { create_otel_span_with_parent(RequestType::CustomCommand, batch_span_ptr) };
+    let custom_span_2 =
+        unsafe { create_otel_span_with_parent(RequestType::CustomCommand, batch_span_ptr) };
+    let custom_span_3 =
+        unsafe { create_otel_span_with_parent(RequestType::CustomCommand, batch_span_ptr) };
+
+    assert_ne!(
+        custom_span_1, 0,
+        "CustomCommand span 1 creation should succeed"
+    );
+    assert_ne!(
+        custom_span_2, 0,
+        "CustomCommand span 2 creation should succeed"
+    );
+    assert_ne!(
+        custom_span_3, 0,
+        "CustomCommand span 3 creation should succeed"
+    );
+
+    // Verify all spans have unique pointers
+    let all_spans = [
+        root_span_ptr,
+        batch_span_ptr,
+        custom_span_1,
+        custom_span_2,
+        custom_span_3,
+    ];
+    for i in 0..all_spans.len() {
+        for j in (i + 1)..all_spans.len() {
+            assert_ne!(
+                all_spans[i], all_spans[j],
+                "All spans should have unique pointers"
+            );
+        }
+    }
+
+    // Clean up in reverse order (children before parents)
+    unsafe {
+        drop_otel_span(custom_span_1);
+        drop_otel_span(custom_span_2);
+        drop_otel_span(custom_span_3);
+        drop_otel_span(batch_span_ptr);
+        drop_otel_span(root_span_ptr);
+    }
+}
+
+#[test]
+fn test_mixed_command_types_in_batch() {
+    logger_core::init(Some(logger_core::Level::Debug), None);
+
+    // Create a batch span
+    let batch_span_ptr = create_batch_otel_span();
+    assert_ne!(batch_span_ptr, 0, "Batch span creation should succeed");
+
+    // Create a mix of regular commands and custom commands
+    let command_types = vec![
+        RequestType::Set,
+        RequestType::Get,
+        RequestType::CustomCommand, // Represents EVAL, EVALSHA, etc.
+        RequestType::Del,
+        RequestType::CustomCommand, // Another custom command
+        RequestType::Exists,
+        RequestType::CustomCommand, // Yet another custom command
+    ];
+
+    let mut child_spans = Vec::new();
+
+    for request_type in command_types {
+        let child_span_ptr = unsafe { create_otel_span_with_parent(request_type, batch_span_ptr) };
+        assert_ne!(
+            child_span_ptr, 0,
+            "Child span creation should succeed for {request_type:?}"
+        );
+        child_spans.push(child_span_ptr);
+    }
+
+    // Verify all child spans are unique
+    for i in 0..child_spans.len() {
+        for j in (i + 1)..child_spans.len() {
+            assert_ne!(
+                child_spans[i], child_spans[j],
+                "All child spans should have unique pointers"
+            );
+        }
+    }
+
+    // Clean up all child spans first
+    for child_span_ptr in child_spans {
+        unsafe {
+            drop_otel_span(child_span_ptr);
+        }
+    }
+
+    // Clean up batch span
+    unsafe {
+        drop_otel_span(batch_span_ptr);
+    }
+}
+
+#[test]
+fn test_custom_command_with_null_parent() {
+    logger_core::init(Some(logger_core::Level::Debug), None);
+
+    // Test CustomCommand span creation with null parent (should fallback to independent span)
+    let span_ptr = unsafe { create_otel_span_with_parent(RequestType::CustomCommand, 0) };
+    assert_ne!(
+        span_ptr, 0,
+        "CustomCommand with null parent should fallback to independent span"
+    );
+
+    // Verify pointer properties
+    assert_eq!(span_ptr % 8, 0, "Span pointer should be 8-byte aligned");
+
+    // Clean up
+    unsafe {
+        drop_otel_span(span_ptr);
+    }
+}
+
+#[test]
+fn test_custom_command_with_invalid_parent() {
+    logger_core::init(Some(logger_core::Level::Debug), None);
+
+    // Test CustomCommand span creation with invalid parent pointers
+    let invalid_parents = vec![
+        0xDEADBEEF,            // Garbage pointer
+        0x1001,                // Misaligned pointer
+        0x800,                 // Address too low
+        0x8000_0000_0000_0000, // Address too high
+    ];
+
+    let mut fallback_spans = Vec::new();
+
+    for invalid_parent_ptr in invalid_parents {
+        let span_ptr =
+            unsafe { create_otel_span_with_parent(RequestType::CustomCommand, invalid_parent_ptr) };
+        assert_ne!(
+            span_ptr, 0,
+            "CustomCommand with invalid parent 0x{invalid_parent_ptr:x} should fallback to independent span"
+        );
+        fallback_spans.push(span_ptr);
+    }
+
+    // Clean up all fallback spans
+    for span_ptr in fallback_spans {
+        unsafe {
+            drop_otel_span(span_ptr);
+        }
+    }
+}
+
+#[test]
+fn test_regression_no_error_logs_for_custom_command() {
+    logger_core::init(Some(logger_core::Level::Debug), None);
+
+    let span_ptr = create_otel_span(RequestType::CustomCommand);
+    assert_ne!(
+        span_ptr, 0,
+        "CustomCommand span creation should succeed without errors"
+    );
+
+    // Create CustomCommand span with parent - should succeed without errors
+    let parent_name = CString::new("parent").expect("CString::new failed");
+    let parent_span_ptr = unsafe { create_named_otel_span(parent_name.as_ptr()) };
+    assert_ne!(parent_span_ptr, 0, "Parent span creation should succeed");
+
+    let child_span_ptr =
+        unsafe { create_otel_span_with_parent(RequestType::CustomCommand, parent_span_ptr) };
+    assert_ne!(
+        child_span_ptr, 0,
+        "CustomCommand child span creation should succeed without errors"
+    );
+
+    // Clean up
+    unsafe {
+        drop_otel_span(child_span_ptr);
+        drop_otel_span(parent_span_ptr);
+        drop_otel_span(span_ptr);
+    }
+
+    // If we reach here without panics, the fix is working correctly
+    // No error logs should have been produced
+}
+
+// ---------------------------------------------------------------------------
+// Native-memory leak regression tests (tracked by issue #6226).
+//
+// These replace the two Java integration tests `testSpanMemoryLeak` and
+// `testSpanTransactionMemoryLeak` disabled in #6008. Those tests ran commands and then
+// asserted on the JVM heap (`Runtime.totalMemory() - freeMemory()`), but OpenTelemetry
+// spans are allocated in native Rust memory (`Arc<GlideSpan>` handed across FFI via
+// `Arc::into_raw`), so a JVM-heap measurement could never observe the leak it targeted
+// and varied 20-30% from GC/JIT noise.
+//
+// Scope: these are FFI-boundary guards. They prove `drop_otel_span` releases its
+// `Arc<GlideSpan>` reference rather than leaking it — the only layer at which a leak can
+// occur given the current design. They do not cover a wrapper that forgets to call
+// `drop_otel_span` at all; that is a per-language binding concern.
+//
+// The checks below instead observe the span's `Arc` strong count directly, so a leak in
+// `drop_otel_span` (a missed `Arc::from_raw`) is caught deterministically at the layer
+// where it can actually occur.
+// ---------------------------------------------------------------------------
+
+/// A single create -> drop cycle must release the span's native allocation: the FFI-held
+/// `Arc` reference is gone after `drop_otel_span`, leaving only the test's co-owner.
+#[test]
+fn test_drop_otel_span_releases_native_reference() {
+    logger_core::init(Some(logger_core::Level::Debug), None);
+
+    let span_ptr = create_otel_span(RequestType::Get);
+    assert_ne!(span_ptr, 0, "Span creation should succeed");
+
+    // Co-own the span so we can watch the strong count across the FFI drop.
+    let owner = unsafe { co_owner(span_ptr) };
+    assert_eq!(
+        Arc::strong_count(&owner),
+        2,
+        "Before drop: the FFI raw pointer and the test co-owner should both hold a reference"
+    );
+
+    unsafe {
+        drop_otel_span(span_ptr);
+    }
+
+    assert_eq!(
+        Arc::strong_count(&owner),
+        1,
+        "After drop: only the test co-owner should remain; drop_otel_span must release the \
+         FFI-held reference rather than leak it"
+    );
+}
+
+/// Repeatedly creating and dropping spans through the FFI entry points must not accumulate
+/// native allocations: every span's reference count must return to baseline after its drop.
+/// This is the sustained-load loop the disabled Java `testSpanMemoryLeak` intended, run at
+/// the FFI boundary where the allocation actually lives.
+#[test]
+fn test_span_create_drop_loop_does_not_leak() {
+    logger_core::init(Some(logger_core::Level::Debug), None);
+
+    const ITERATIONS: usize = 1000;
+    let named = CString::new("loop_named_span").expect("CString::new failed");
+
+    for i in 0..ITERATIONS {
+        // Rotate across the parentless create paths to exercise each one's into_raw/from_raw.
+        let span_ptr = match i % 3 {
+            0 => create_otel_span(RequestType::Get),
+            1 => create_otel_span(RequestType::Set),
+            _ => unsafe { create_named_otel_span(named.as_ptr()) },
+        };
+        assert_ne!(span_ptr, 0, "Span creation should succeed on iteration {i}");
+
+        let owner = unsafe { co_owner(span_ptr) };
+        assert_eq!(
+            Arc::strong_count(&owner),
+            2,
+            "Iteration {i}: span should have exactly the FFI reference plus the test co-owner"
+        );
+
+        unsafe {
+            drop_otel_span(span_ptr);
+        }
+
+        assert_eq!(
+            Arc::strong_count(&owner),
+            1,
+            "Iteration {i}: drop_otel_span must release the native reference (no leak)"
+        );
+        // `owner` is dropped here, fully reclaiming the span before the next iteration.
+    }
+}
+
+/// A parent batch span with command children (the shape exercised by the disabled
+/// `testSpanTransactionMemoryLeak`) must release every native allocation once each span is
+/// dropped, including the parent reference held by its children's creation path.
+#[test]
+fn test_batch_span_hierarchy_does_not_leak() {
+    logger_core::init(Some(logger_core::Level::Debug), None);
+
+    let parent_ptr = create_batch_otel_span();
+    assert_ne!(parent_ptr, 0, "Batch parent span creation should succeed");
+    let parent_owner = unsafe { co_owner(parent_ptr) };
+
+    assert_eq!(
+        Arc::strong_count(&parent_owner),
+        2,
+        "Parent before children: FFI reference plus test co-owner"
+    );
+
+    // Create a batch of command children, mirroring an exec/transaction with multiple commands.
+    // Include a nested batch span via create_batch_otel_span_with_parent to match the
+    // parented-batch shape of the disabled testSpanTransactionMemoryLeak.
+    const CHILDREN: usize = 50;
+    let mut child_ptrs = Vec::with_capacity(CHILDREN + 1);
+    for i in 0..CHILDREN {
+        let request_type = if i % 2 == 0 {
+            RequestType::Set
+        } else {
+            RequestType::Get
+        };
+        let child_ptr = unsafe { create_otel_span_with_parent(request_type, parent_ptr) };
+        assert_ne!(child_ptr, 0, "Child span {i} creation should succeed");
+        child_ptrs.push(child_ptr);
+    }
+    let nested_batch_ptr = unsafe { create_batch_otel_span_with_parent(parent_ptr) };
+    assert_ne!(
+        nested_batch_ptr, 0,
+        "Nested batch span creation should succeed"
+    );
+    child_ptrs.push(nested_batch_ptr);
+
+    // Creating children must not bump the parent's strong count: the link is via span context,
+    // not a retained clone of the parent's outer Arc. A leak here would be masked if the count
+    // were only checked after all drops, so assert stability while the children are still live.
+    assert_eq!(
+        Arc::strong_count(&parent_owner),
+        2,
+        "Parent count must be unchanged by child creation (children hold no parent Arc clone)"
+    );
+
+    // Each child holds only its own FFI reference, so dropping a child returns its count to the
+    // co-owner baseline.
+    for (i, &child_ptr) in child_ptrs.iter().enumerate() {
+        let child_owner = unsafe { co_owner(child_ptr) };
+        assert_eq!(
+            Arc::strong_count(&child_owner),
+            2,
+            "Child {i} before drop: FFI reference plus test co-owner"
+        );
+        unsafe {
+            drop_otel_span(child_ptr);
+        }
+        assert_eq!(
+            Arc::strong_count(&child_owner),
+            1,
+            "Child {i} after drop: native reference released (no leak)"
+        );
+    }
+
+    // The parent falls back to the co-owner baseline once its own FFI reference is dropped.
+    unsafe {
+        drop_otel_span(parent_ptr);
+    }
+    assert_eq!(
+        Arc::strong_count(&parent_owner),
+        1,
+        "Parent batch span after drop: native reference released (no leak)"
+    );
 }

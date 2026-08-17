@@ -1,6 +1,7 @@
 /** Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0 */
 package redis.clients.jedis;
 
+import glide.api.logging.Logger;
 import java.net.URI;
 import javax.net.ssl.HostnameVerifier;
 import javax.net.ssl.SSLParameters;
@@ -770,10 +771,9 @@ public class JedisPool extends Pool<Jedis> {
             final String host,
             int port,
             final JedisClientConfig clientConfig) {
-        // Create factory and set pool reference
         GlideJedisFactory factory = new GlideJedisFactory(host, port, clientConfig);
+        factory.setPool(this);
         initPool(poolConfig, factory);
-        factory.setPool(this); // Set pool reference after initialization
     }
 
     /**
@@ -882,8 +882,8 @@ public class JedisPool extends Pool<Jedis> {
 
         GlideJedisFactory factory =
                 new GlideJedisFactory(host, port, mergeUriConfig(uri, clientConfig));
+        factory.setPool(this);
         initPool(poolConfig, factory);
-        factory.setPool(this); // Set pool reference after initialization
     }
 
     /**
@@ -894,12 +894,10 @@ public class JedisPool extends Pool<Jedis> {
      */
     public JedisPool(
             final GenericObjectPoolConfig<Jedis> poolConfig, PooledObjectFactory<Jedis> factory) {
-        initPool(poolConfig, factory);
-
-        // If it's a GlideJedisFactory, set the pool reference
         if (factory instanceof GlideJedisFactory) {
             ((GlideJedisFactory) factory).setPool(this);
         }
+        initPool(poolConfig, factory);
     }
 
     /**
@@ -956,10 +954,27 @@ public class JedisPool extends Pool<Jedis> {
     }
 
     @Override
+    public Jedis getResource() {
+        Jedis jedis = super.getResource();
+        jedis.setDataSource(this);
+        return jedis;
+    }
+
+    @Override
     protected void returnResourceObject(Jedis resource) {
-        if (resource != null) {
+        if (resource == null) {
+            return;
+        }
+        if (resource.isBroken()) {
+            returnBrokenResource(resource);
+            return;
+        }
+        try {
             resource.resetForReuse();
             super.returnResourceObject(resource);
+        } catch (RuntimeException e) {
+            returnBrokenResource(resource);
+            Logger.log(Logger.Level.WARN, "JedisPool", "Resource is returned to the pool as broken", e);
         }
     }
 }

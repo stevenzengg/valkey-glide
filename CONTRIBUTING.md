@@ -1,62 +1,17 @@
 # Contributing Guidelines
 
-Thank you for your interest in contributing to our project. Whether it's a bug report, new feature, correction, or additional
-documentation, we greatly value feedback and contributions from our community.
+This Bitbucket repository is Atlassian's fork of `valkey-io/valkey-glide`.
 
-Please read through this document before submitting any issues or pull requests to ensure we have all the necessary
-information to effectively respond to your bug report or contribution.
+For Atlassian changes, use the normal internal workflow:
 
+1. Track work in Jira.
+2. Create a branch from the Bitbucket `main` branch.
+3. Keep changes focused and avoid unrelated upstream churn.
+4. Run the closest relevant build or test target before opening a pull request.
+5. Open a Bitbucket pull request and follow the repository's required reviewers and pipeline checks.
 
-## Reporting Bugs/Feature Requests
+Fork-specific changes should stay limited to Atlassian packaging, publishing, CI, and networking behavior. Prefer upstream code for general GLIDE behavior unless an Atlassian-specific integration requires a fork change.
 
-We welcome you to use the GitHub issue tracker to report bugs or suggest features.
+For upstream sync work, see [UPSTREAM_SYNC.md](./UPSTREAM_SYNC.md).
 
-When filing an issue, please check existing open, or recently closed, issues to make sure somebody else hasn't already
-reported the issue. Please try to include as much information as you can.
-
-## Contributing via Pull Requests
-Contributions via pull requests are much appreciated. Before sending us a pull request, please ensure that:
-
-1. You are working against the latest source on the *main* branch.
-2. You check existing open, and recently merged, pull requests to make sure someone else hasn't addressed the problem already.
-3. You open an issue to discuss any significant changes before starting the work - we would hate for your time to be wasted.
-
-To send us a pull request, please:
-
-1. Fork the repository.
-2. Modify the source; please focus on the specific change you are contributing. If you also reformat all the code, it will be hard for us to focus on your change.
-3. Ensure local tests pass.
-4. Commit to your fork using clear commit messages, merge or squash commits as necessary.
-5. Send us a pull request, answering any default questions in the pull request interface.
-6. Pay attention to any automated CI failures reported in the pull request, and stay involved in the conversation.
-
-GitHub provides additional document on [forking a repository](https://help.github.com/articles/fork-a-repo/) and
-[creating a pull request](https://help.github.com/articles/creating-a-pull-request/).
-
-
-## Finding contributions to work on
-Looking at the existing issues is a great way to find something to contribute on. As our projects, by default, use the default GitHub issue labels (enhancement/bug/duplicate/help wanted/invalid/question/wontfix), looking at any 'help wanted' issues is a great place to start.
-
-## Developer Guides
--   [Java](./java/DEVELOPER.md)
--   [Node](./node/DEVELOPER.md)
--   [Python](./python/DEVELOPER.md)
--   [Go](./go/DEVELOPER.md)
-
-## Code of Conduct
-This project has adopted the [Amazon Open Source Code of Conduct](https://aws.github.io/code-of-conduct).
-For more information see the [Code of Conduct FAQ](https://aws.github.io/code-of-conduct-faq) or contact
-opensource-codeofconduct@amazon.com with any additional questions or comments.
-
-
-## Security issue notifications
-See [SECURITY.md](./SECURITY.md)
-
-
-## Licensing
-
-See the [LICENSE](LICENSE) file for our project's licensing. We will ask you to confirm the licensing of your contribution.
-
-## Community Support and Feedback
-
-We encourage you to join our community to support, share feedback, and ask questions. You can approach us for anything on our Valkey Slack: [Join Valkey Slack](https://join.slack.com/t/valkey-oss-developer/shared_invite/zt-2nxs51chx-EB9hu9Qdch3GMfRcztTSkQ).
+For public open-source contribution guidance, use the upstream GitHub repository instead of this fork.

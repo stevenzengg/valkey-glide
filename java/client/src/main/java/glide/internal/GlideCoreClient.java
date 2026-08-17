@@ -1,10 +1,16 @@
 /** Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0 */
 package glide.internal;
 
+import command_request.CommandRequestOuterClass.CacheMetricsType;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+import glide.api.BaseClient;
+import glide.api.logging.Logger;
 import glide.ffi.resolvers.NativeUtils;
-import java.lang.ref.Cleaner;
+import java.lang.ref.PhantomReference;
+import java.lang.ref.ReferenceQueue;
+import java.lang.ref.WeakReference;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -16,7 +22,39 @@ import java.util.concurrent.atomic.AtomicLong;
  * create connections - that responsibility belongs to ConnectionManager.
  */
 public class GlideCoreClient implements AutoCloseable {
-    private static final Cleaner CLEANER = Cleaner.create();
+    private static final ReferenceQueue<Object> CLEANUP_QUEUE = new ReferenceQueue<>();
+    private static final ConcurrentHashMap<PhantomReference<?>, Runnable> CLEANUP_ACTIONS =
+            new ConcurrentHashMap<>();
+
+    static {
+        // Start cleanup thread
+        Thread cleanupThread =
+                new Thread(
+                        () -> {
+                            while (true) {
+                                try {
+                                    PhantomReference<?> ref = (PhantomReference<?>) CLEANUP_QUEUE.remove();
+                                    Runnable action = CLEANUP_ACTIONS.remove(ref);
+                                    if (action != null) {
+                                        action.run();
+                                    }
+                                    ref.clear();
+                                } catch (InterruptedException e) {
+                                    Thread.currentThread().interrupt();
+                                    break;
+                                } catch (Exception e) {
+                                    // Log but don't stop cleanup thread
+                                    Logger.log(
+                                            Logger.Level.WARN,
+                                            "GlideCoreClient-Cleanup",
+                                            "Error in cleanup thread: " + e.getMessage());
+                                }
+                            }
+                        },
+                        "GlideCoreClient-Cleanup");
+        cleanupThread.setDaemon(true);
+        cleanupThread.start();
+    }
 
     static {
         // Load the native library
@@ -36,17 +74,16 @@ public class GlideCoreClient implements AutoCloseable {
 
     private static native void freeNativeBuffer(long id);
 
-    private static final java.util.concurrent.ConcurrentHashMap<
-                    Long, java.lang.ref.WeakReference<glide.api.BaseClient>>
-            clients = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<Long, WeakReference<BaseClient>> clients =
+            new ConcurrentHashMap<>();
 
     /**
      * Empty 2D byte array constant for reuse in various contexts (script params, subPattern, etc.)
      */
     public static final byte[][] EMPTY_2D_BYTE_ARRAY = new byte[0][];
 
-    public static void registerClient(long handle, glide.api.BaseClient client) {
-        clients.put(handle, new java.lang.ref.WeakReference<>(client));
+    public static void registerClient(long handle, BaseClient client) {
+        clients.put(handle, new WeakReference<>(client));
     }
 
     public static void unregisterClient(long handle) {
@@ -61,18 +98,19 @@ public class GlideCoreClient implements AutoCloseable {
                 (pattern != null && pattern.length > 0)
                         ? new glide.api.models.PubSubMessage(msg, ch, glide.api.models.GlideString.of(pattern))
                         : new glide.api.models.PubSubMessage(msg, ch);
-        var ref = clients.get(handle);
+        WeakReference<BaseClient> ref = clients.get(handle);
         if (ref != null) {
-            var c = ref.get();
+            BaseClient c = ref.get();
             if (c != null) c.__enqueuePubSubMessage(m);
         }
     }
 
-    // Register a Java Cleaner to free native memory when the given ByteBuffer is GC'd
+    // Register cleanup action to free native memory when the given ByteBuffer is GC'd
     static void registerNativeBufferCleaner(java.nio.ByteBuffer buffer, long id) {
         if (buffer == null || id == 0) return;
-        CLEANER.register(
-                buffer,
+        PhantomReference<java.nio.ByteBuffer> ref = new PhantomReference<>(buffer, CLEANUP_QUEUE);
+        CLEANUP_ACTIONS.put(
+                ref,
                 () -> {
                     try {
                         freeNativeBuffer(id);
@@ -105,8 +143,8 @@ public class GlideCoreClient implements AutoCloseable {
     /** Cleanup coordination flag. */
     private final AtomicBoolean cleanupInProgress = new AtomicBoolean(false);
 
-    /** Cleaner to ensure native cleanup. */
-    private final Cleaner.Cleanable cleanable;
+    /** Phantom reference to ensure native cleanup. */
+    private final PhantomReference<GlideCoreClient> cleanupRef;
 
     /** Shared state for cleanup coordination. */
     private final NativeState nativeState;
@@ -138,113 +176,28 @@ public class GlideCoreClient implements AutoCloseable {
         // Create shared state for proper cleanup coordination
         this.nativeState = new NativeState(existingHandle);
 
-        // Register cleanup action with Cleaner - but don't double-close since handle is managed
-        // externally
-        this.cleanable = CLEANER.register(this, new CleanupAction(this.nativeState));
+        // Register cleanup action - but don't double-close since handle is managed externally
+        this.cleanupRef = new PhantomReference<>(this, CLEANUP_QUEUE);
+        CLEANUP_ACTIONS.put(this.cleanupRef, new CleanupAction(this.nativeState));
     }
 
     // ==================== COMMAND EXECUTION METHODS ====================
 
-    /**
-     * Execute binary command asynchronously using raw protobuf bytes (for compatibility with
-     * CommandManager)
-     */
-    public CompletableFuture<Object> executeBinaryCommandAsync(byte[] requestBytes) {
-        return executeBinaryCommandAsyncInternal(requestBytes, this.requestTimeoutMillis);
-    }
-
-    /**
-     * Execute binary command asynchronously without Java-side timeout. Used for blocking commands
-     * (BLPOP, BRPOP, etc.) where the command has its own timeout that Rust handles.
-     */
-    public CompletableFuture<Object> executeBinaryCommandAsyncNoTimeout(byte[] requestBytes) {
-        return executeBinaryCommandAsyncInternal(requestBytes, 0);
-    }
-
-    private CompletableFuture<Object> executeBinaryCommandAsyncInternal(
-            byte[] requestBytes, long timeoutMs) {
-        try {
-            long handle = nativeClientHandle.get();
-            if (handle == 0) {
-                CompletableFuture<Object> future = new CompletableFuture<>();
-                future.completeExceptionally(
-                        new glide.api.models.exceptions.ClosingException("Client is closed"));
-                return future;
-            }
-
-            // Create future and register it with the async registry
-            CompletableFuture<Object> future = new CompletableFuture<>();
-            long correlationId;
-            try {
-                correlationId = AsyncRegistry.register(future, this.maxInflightRequests, handle, timeoutMs);
-            } catch (glide.api.models.exceptions.RequestException e) {
-                future.completeExceptionally(e);
-                return future;
-            }
-
-            // Execute binary command directly using protobuf bytes
-            GlideNativeBridge.executeBinaryCommandAsync(handle, requestBytes, correlationId);
-
-            return future;
-
-        } catch (Exception e) {
-            CompletableFuture<Object> future = new CompletableFuture<>();
-            future.completeExceptionally(e);
-            return future;
-        }
-    }
-
-    /**
-     * Execute command asynchronously using raw protobuf bytes (for compatibility with CommandManager)
-     */
-    public CompletableFuture<Object> executeCommandAsync(byte[] requestBytes) {
-        return executeCommandAsyncInternal(requestBytes, this.requestTimeoutMillis);
-    }
-
-    /**
-     * Execute command asynchronously without Java-side timeout. Used for blocking commands (BLPOP,
-     * BRPOP, etc.) where the command has its own timeout that Rust handles.
-     */
-    public CompletableFuture<Object> executeCommandAsyncNoTimeout(byte[] requestBytes) {
-        return executeCommandAsyncInternal(requestBytes, 0);
-    }
-
-    private CompletableFuture<Object> executeCommandAsyncInternal(
-            byte[] requestBytes, long timeoutMs) {
-        try {
-            long handle = nativeClientHandle.get();
-            if (handle == 0) {
-                CompletableFuture<Object> future = new CompletableFuture<>();
-                future.completeExceptionally(
-                        new glide.api.models.exceptions.ClosingException("Client is closed"));
-                return future;
-            }
-
-            // Create future and register it with the async registry
-            CompletableFuture<Object> future = new CompletableFuture<>();
-            long correlationId;
-            try {
-                correlationId = AsyncRegistry.register(future, this.maxInflightRequests, handle, timeoutMs);
-            } catch (glide.api.models.exceptions.RequestException e) {
-                future.completeExceptionally(e);
-                return future;
-            }
-
-            // Execute command directly using protobuf bytes
-            GlideNativeBridge.executeCommandAsync(handle, requestBytes, correlationId);
-
-            return future;
-
-        } catch (Exception e) {
-            CompletableFuture<Object> future = new CompletableFuture<>();
-            future.completeExceptionally(e);
-            return future;
-        }
-    }
-
-    /** Execute batch asynchronously using raw protobuf bytes. */
+    /** Execute a batch of commands asynchronously via JNI. */
     public CompletableFuture<Object> executeBatchAsync(
-            byte[] batchRequestBytes, boolean expectUtf8Response, Integer timeoutOverrideMs) {
+            int[] requestTypes,
+            byte[][][] args,
+            boolean isAtomic,
+            boolean raiseOnError,
+            int timeout,
+            boolean retryServerError,
+            boolean retryConnectionError,
+            boolean hasRoute,
+            int routeType,
+            String routeParam,
+            boolean expectUtf8Response,
+            long timeoutMs,
+            long spanPtr) {
         try {
             long handle = nativeClientHandle.get();
             if (handle == 0) {
@@ -254,13 +207,8 @@ public class GlideCoreClient implements AutoCloseable {
                 return future;
             }
 
-            // Create future and register it with the async registry
             CompletableFuture<Object> future = new CompletableFuture<>();
             long correlationId;
-            long timeoutMs =
-                    timeoutOverrideMs != null && timeoutOverrideMs > 0
-                            ? timeoutOverrideMs
-                            : this.requestTimeoutMillis;
             try {
                 correlationId = AsyncRegistry.register(future, this.maxInflightRequests, handle, timeoutMs);
             } catch (glide.api.models.exceptions.RequestException e) {
@@ -268,9 +216,21 @@ public class GlideCoreClient implements AutoCloseable {
                 return future;
             }
 
-            // Execute batch directly
             GlideNativeBridge.executeBatchAsync(
-                    handle, batchRequestBytes, expectUtf8Response, correlationId);
+                    handle,
+                    correlationId,
+                    requestTypes,
+                    args,
+                    isAtomic,
+                    raiseOnError,
+                    timeout,
+                    retryServerError,
+                    retryConnectionError,
+                    hasRoute,
+                    routeType,
+                    routeParam,
+                    expectUtf8Response,
+                    spanPtr);
 
             return future;
 
@@ -372,7 +332,80 @@ public class GlideCoreClient implements AutoCloseable {
         return future;
     }
 
-    /** Execute script via native invoke_script path */
+    /** Get cache metrics */
+    public CompletableFuture<Object> getCacheMetrics(CacheMetricsType metricsType) {
+        CompletableFuture<Object> future = new CompletableFuture<>();
+
+        long handle = nativeClientHandle.get();
+        if (handle == 0) {
+            future.completeExceptionally(
+                    new glide.api.models.exceptions.ClosingException("Client is closed"));
+            return future;
+        }
+
+        long correlationId;
+        try {
+            correlationId =
+                    AsyncRegistry.register(
+                            future, this.maxInflightRequests, handle, this.requestTimeoutMillis);
+        } catch (glide.api.models.exceptions.RequestException e) {
+            future.completeExceptionally(e);
+            return future;
+        }
+
+        GlideNativeBridge.getCacheMetrics(handle, correlationId, metricsType.getNumber());
+        return future;
+    }
+
+    /** Execute a single command asynchronously via JNI. */
+    public CompletableFuture<Object> executeCommandAsync(
+            int requestType,
+            byte[][] args,
+            boolean hasRoute,
+            int routeType,
+            String routeParam,
+            boolean expectUtf8Response,
+            long timeoutMs,
+            long spanPtr) {
+        try {
+            long handle = nativeClientHandle.get();
+            if (handle == 0) {
+                CompletableFuture<Object> future = new CompletableFuture<>();
+                future.completeExceptionally(
+                        new glide.api.models.exceptions.ClosingException("Client is closed"));
+                return future;
+            }
+
+            CompletableFuture<Object> future = new CompletableFuture<>();
+            long correlationId;
+            try {
+                correlationId = AsyncRegistry.register(future, this.maxInflightRequests, handle, timeoutMs);
+            } catch (glide.api.models.exceptions.RequestException e) {
+                future.completeExceptionally(e);
+                return future;
+            }
+
+            GlideNativeBridge.executeCommandAsync(
+                    handle,
+                    correlationId,
+                    requestType,
+                    args != null ? args : EMPTY_2D_BYTE_ARRAY,
+                    hasRoute,
+                    routeType,
+                    routeParam,
+                    expectUtf8Response,
+                    spanPtr);
+
+            return future;
+
+        } catch (Exception e) {
+            CompletableFuture<Object> future = new CompletableFuture<>();
+            future.completeExceptionally(e);
+            return future;
+        }
+    }
+
+    /** Execute a script asynchronously via JNI. */
     public CompletableFuture<Object> executeScriptAsync(
             String hash,
             byte[][] keys,
@@ -476,8 +509,12 @@ public class GlideCoreClient implements AutoCloseable {
             }
         }
 
-        // Also trigger the cleaner cleanup (safe to call multiple times)
-        cleanable.clean();
+        // Also trigger the cleanup action (safe to call multiple times)
+        Runnable action = CLEANUP_ACTIONS.remove(cleanupRef);
+        if (action != null) {
+            action.run();
+        }
+        cleanupRef.clear();
     }
 
     /** Shared state for cleanup coordination */

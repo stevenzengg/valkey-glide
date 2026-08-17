@@ -2,20 +2,28 @@
  * Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0
  */
 use once_cell::sync::OnceCell;
+use serde::Serialize;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::{
+    fmt,
     path::{Path, PathBuf},
     sync::RwLock,
+    sync::atomic::{AtomicUsize, Ordering},
 };
-use tracing::{self, event};
+use tracing::{
+    self, Event, Subscriber, event,
+    field::{Field, Visit},
+};
 use tracing_appender::rolling::{RollingFileAppender, RollingWriter, Rotation};
 use tracing_subscriber::{
     Registry,
     filter::Filtered,
     fmt::{
-        Layer,
-        format::{DefaultFields, Format},
+        FmtContext, FormatEvent, FormatFields, Layer,
+        format::{DefaultFields, Format, Writer},
     },
     layer::Layered,
+    registry::LookupSpan,
 };
 
 use tracing_subscriber::{
@@ -28,13 +36,14 @@ use tracing_subscriber::{
 use std::str::FromStr;
 
 // Layer-Filter pair determines whether a log will be collected
-type InnerFiltered = Filtered<Layer<Registry>, LevelFilter, Registry>;
+type InnerFiltered =
+    Filtered<Layer<Registry, DefaultFields, GlideLogFormat>, LevelFilter, Registry>;
 // A Reloadable pair of layer-filter
 type InnerLayered = Layered<reload::Layer<InnerFiltered, Registry>, Registry>;
 // A reloadable layer of subscriber to a rolling file
 type FileReload = Handle<
     Filtered<
-        Layer<InnerLayered, DefaultFields, Format, LazyRollingFileAppender>,
+        Layer<InnerLayered, DefaultFields, GlideLogFormat, LazyRollingFileAppender>,
         LevelFilter,
         InnerLayered,
     >,
@@ -54,8 +63,84 @@ pub static INITIATE_ONCE: InitiateOnce = InitiateOnce {
     init_once: OnceCell::new(),
 };
 
+/// Cheap, cached effective max log verbosity (0=Off,1=Error,2=Warn,3=Info,4=Debug,5=Trace).
+/// Read on every lazy-log macro invocation to short-circuit the (expensive, RwLock-guarded)
+/// reload-subscriber `enabled` check when the level is disabled — the common hot-path case
+/// (e.g. per-command trace/debug logs while running at the default Warn level). Updated by
+/// `init` whenever the effective level changes; set as an UPPER BOUND on the true effective
+/// level so it can never suppress a log that should be emitted.
+pub static CURRENT_MAX_VERBOSITY: AtomicUsize = AtomicUsize::new(0);
+
+/// Maps `tracing::Level` to the verbosity ordering used by `CURRENT_MAX_VERBOSITY`.
+#[inline]
+pub fn level_may_be_enabled(level: tracing::Level) -> bool {
+    let needed = match level {
+        tracing::Level::ERROR => 1,
+        tracing::Level::WARN => 2,
+        tracing::Level::INFO => 3,
+        tracing::Level::DEBUG => 4,
+        tracing::Level::TRACE => 5,
+    };
+    CURRENT_MAX_VERBOSITY.load(Ordering::Relaxed) >= needed
+}
+
 const FILE_DIRECTORY: &str = "glide-logs";
 const ENV_GLIDE_LOG_DIR: &str = "GLIDE_LOG_DIR";
+const STRUCTURED_PAYLOAD_FIELD: &str = "glide_structured_payload";
+
+struct GlideLogFormat {
+    text_format: Format,
+}
+
+impl Default for GlideLogFormat {
+    fn default() -> Self {
+        Self {
+            text_format: Format::default(),
+        }
+    }
+}
+
+impl<S, N> FormatEvent<S, N> for GlideLogFormat
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+    N: for<'writer> FormatFields<'writer> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> fmt::Result {
+        let mut visitor = StructuredPayloadVisitor::default();
+        event.record(&mut visitor);
+
+        if let Some(payload) = visitor.payload {
+            writeln!(writer, "{payload}")?;
+            return Ok(());
+        }
+
+        self.text_format.format_event(ctx, writer, event)
+    }
+}
+
+#[derive(Default)]
+struct StructuredPayloadVisitor {
+    payload: Option<String>,
+}
+
+impl Visit for StructuredPayloadVisitor {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == STRUCTURED_PAYLOAD_FIELD {
+            self.payload = Some(value.to_string());
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        if field.name() == STRUCTURED_PAYLOAD_FIELD {
+            self.payload = Some(format!("{value:?}"));
+        }
+    }
+}
 
 /// Wraps [RollingFileAppender] to defer initialization until logging is required,
 /// allowing [init] to disable file logging on read-only filesystems.
@@ -105,6 +190,50 @@ pub enum Level {
     Trace = 4,
     Off = 5,
 }
+
+#[derive(Debug, Clone)]
+pub struct StructuredField {
+    key: &'static str,
+    value: JsonValue,
+}
+
+pub fn structured_field<Value: Serialize>(key: &'static str, value: Value) -> StructuredField {
+    StructuredField {
+        key,
+        value: serde_json::to_value(value).unwrap_or(JsonValue::Null),
+    }
+}
+
+#[macro_export]
+macro_rules! structured_fields {
+    ($($key:literal => $value:expr),* $(,)?) => {
+        &[$($crate::structured_field($key, $value)),*]
+    };
+}
+
+fn structured_payload(
+    log_level: &Level,
+    log_identifier: &str,
+    fields: &[StructuredField],
+) -> String {
+    let mut payload = JsonMap::with_capacity(fields.len() + 3);
+    for field in fields {
+        payload.insert(field.key.to_string(), field.value.clone());
+    }
+    payload.insert("glide_structured".to_string(), JsonValue::Bool(true));
+    payload.insert(
+        "glide_event".to_string(),
+        JsonValue::String(log_identifier.to_string()),
+    );
+    payload.insert(
+        "level".to_string(),
+        JsonValue::String(log_level.as_str().to_string()),
+    );
+    serde_json::to_string(&payload).unwrap_or_else(|_| {
+        "{\"glide_structured\":true,\"glide_event\":\"serialization_failed\"}".to_string()
+    })
+}
+
 impl Level {
     fn to_filter(&self) -> filter::LevelFilter {
         match self {
@@ -114,6 +243,17 @@ impl Level {
             Level::Warn => LevelFilter::WARN,
             Level::Error => LevelFilter::ERROR,
             Level::Off => LevelFilter::OFF,
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            Level::Error => "error",
+            Level::Warn => "warn",
+            Level::Info => "info",
+            Level::Debug => "debug",
+            Level::Trace => "trace",
+            Level::Off => "off",
         }
     }
 }
@@ -142,6 +282,7 @@ pub fn init(minimal_level: Option<Level>, file_name: Option<&str>) -> Level {
     let level_filter = level.to_filter();
     let reloads = INITIATE_ONCE.init_once.get_or_init(|| {
         let stdout_fmt = tracing_subscriber::fmt::layer()
+            .event_format(GlideLogFormat::default())
             .with_ansi(true)
             .with_filter(LevelFilter::OFF);
 
@@ -157,6 +298,7 @@ pub fn init(minimal_level: Option<Level>, file_name: Option<&str>) -> Level {
         );
 
         let file_fmt = tracing_subscriber::fmt::layer()
+            .event_format(GlideLogFormat::default())
             .with_writer(file_appender)
             .with_filter(LevelFilter::OFF);
         let (file_layer, file_reload) = reload::Layer::new(file_fmt);
@@ -176,11 +318,15 @@ pub fn init(minimal_level: Option<Level>, file_name: Option<&str>) -> Level {
             .with_target("logger_core", log_level)
             .with_target(std::env!("CARGO_PKG_NAME"), log_level);
 
+        // Use try_init() instead of init() to gracefully handle the case where
+        // a tracing subscriber has already been set by the application.
+        // This allows applications to control their own logging configuration.
         tracing_subscriber::registry()
             .with(stdout_layer)
             .with(file_layer)
             .with(targets_filter)
-            .init();
+            .try_init()
+            .ok(); // Ignore the error if subscriber already set
 
         let reloads: Reloads = Reloads {
             console_reload: RwLock::new(stdout_reload),
@@ -224,6 +370,18 @@ pub fn init(minimal_level: Option<Level>, file_name: Option<&str>) -> Level {
                 .modify(|layer| *layer.filter_mut() = LevelFilter::OFF);
         }
     };
+    // Publish the effective max verbosity for the cheap lazy-macro gate.
+    CURRENT_MAX_VERBOSITY.store(
+        match level {
+            Level::Off => 0,
+            Level::Error => 1,
+            Level::Warn => 2,
+            Level::Info => 3,
+            Level::Debug => 4,
+            Level::Trace => 5,
+        },
+        Ordering::Relaxed,
+    );
     level
 }
 
@@ -251,6 +409,154 @@ create_log!(log_debug, DEBUG);
 create_log!(log_info, INFO);
 create_log!(log_warn, WARN);
 create_log!(log_error, ERROR);
+
+pub fn log_structured<Identifier: AsRef<str>>(
+    log_level: Level,
+    log_identifier: Identifier,
+    fields: &[StructuredField],
+) {
+    if INITIATE_ONCE.init_once.get().is_none() {
+        init(Some(Level::Warn), None);
+    };
+    let payload = structured_payload(&log_level, log_identifier.as_ref(), fields);
+    match log_level {
+        Level::Debug => event!(
+            tracing::Level::DEBUG,
+            glide_structured_payload = payload.as_str()
+        ),
+        Level::Trace => event!(
+            tracing::Level::TRACE,
+            glide_structured_payload = payload.as_str()
+        ),
+        Level::Info => event!(
+            tracing::Level::INFO,
+            glide_structured_payload = payload.as_str()
+        ),
+        Level::Warn => event!(
+            tracing::Level::WARN,
+            glide_structured_payload = payload.as_str()
+        ),
+        Level::Error => event!(
+            tracing::Level::ERROR,
+            glide_structured_payload = payload.as_str()
+        ),
+        Level::Off => (),
+    }
+}
+
+/// Lazy logging macros that only evaluate the message expression if the log level is enabled.
+/// This avoids the cost of `format!(...)` when the level is disabled.
+///
+/// Usage:
+/// ```ignore
+/// log_trace_lazy!("identifier", format!("expensive computation: {}", value));
+/// log_warn_lazy!("identifier", format!("something happened: {:?}", err));
+/// ```
+#[macro_export]
+macro_rules! log_trace_lazy {
+    ($identifier:expr, $message:expr) => {
+        if $crate::level_may_be_enabled(tracing::Level::TRACE)
+            && tracing::event_enabled!(tracing::Level::TRACE)
+        {
+            $crate::log_trace($identifier, $message);
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! log_debug_lazy {
+    ($identifier:expr, $message:expr) => {
+        if $crate::level_may_be_enabled(tracing::Level::DEBUG)
+            && tracing::event_enabled!(tracing::Level::DEBUG)
+        {
+            $crate::log_debug($identifier, $message);
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! log_info_lazy {
+    ($identifier:expr, $message:expr) => {
+        if $crate::level_may_be_enabled(tracing::Level::INFO)
+            && tracing::event_enabled!(tracing::Level::INFO)
+        {
+            $crate::log_info($identifier, $message);
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! log_warn_lazy {
+    ($identifier:expr, $message:expr) => {
+        if tracing::event_enabled!(tracing::Level::WARN) {
+            $crate::log_warn($identifier, $message);
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! log_error_lazy {
+    ($identifier:expr, $message:expr) => {
+        if tracing::event_enabled!(tracing::Level::ERROR) {
+            $crate::log_error($identifier, $message);
+        }
+    };
+}
+
+/// Rate-limited logging macro. Logs at most once per `interval_secs` seconds.
+/// Uses a static AtomicU64 per call site to track the last log time.
+///
+/// Usage:
+/// ```ignore
+/// log_warn_rate_limited!("identifier", 10, format!("something happened: {}", val));
+/// ```
+#[macro_export]
+macro_rules! log_warn_rate_limited {
+    ($identifier:expr, $interval_secs:expr, $message:expr) => {{
+        static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last = LAST_LOG.load(std::sync::atomic::Ordering::Relaxed);
+        if now >= last + $interval_secs {
+            LAST_LOG.store(now, std::sync::atomic::Ordering::Relaxed);
+            $crate::log_warn($identifier, $message);
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! log_info_rate_limited {
+    ($identifier:expr, $interval_secs:expr, $message:expr) => {{
+        static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last = LAST_LOG.load(std::sync::atomic::Ordering::Relaxed);
+        if now >= last + $interval_secs {
+            LAST_LOG.store(now, std::sync::atomic::Ordering::Relaxed);
+            $crate::log_info($identifier, $message);
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! log_debug_rate_limited {
+    ($identifier:expr, $interval_secs:expr, $message:expr) => {{
+        static LAST_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last = LAST_LOG.load(std::sync::atomic::Ordering::Relaxed);
+        if now >= last + $interval_secs {
+            LAST_LOG.store(now, std::sync::atomic::Ordering::Relaxed);
+            $crate::log_debug($identifier, $message);
+        }
+    }};
+}
 
 // Logs the given log, with log_identifier and log level prefixed. If the given log level is below the threshold of given when the logger was initialized, the log will be ignored.
 // log_identifier should be used to add context to a log, and make it easier to connect it to other relevant logs. For example, it can be used to pass a task identifier.
@@ -304,5 +610,30 @@ mod tests {
         // Case 3: empty variable is not acceptable
         unsafe { std::env::set_var(ENV_GLIDE_LOG_DIR, "") };
         assert!(create_directory_from_env(ENV_GLIDE_LOG_DIR).is_none());
+    }
+
+    #[test]
+    fn test_structured_payload_escapes_values() {
+        let payload = structured_payload(
+            &Level::Warn,
+            "command\"event",
+            &[
+                structured_field("glide_structured", false),
+                structured_field("glide_event", "overridden"),
+                structured_field("level", "info"),
+                structured_field("callback_id", 42_i64),
+                structured_field("command", "GET\nkey"),
+                structured_field("success", false),
+            ],
+        );
+
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+        assert_eq!(payload["glide_structured"], true);
+        assert_eq!(payload["glide_event"], "command\"event");
+        assert_eq!(payload["level"], "warn");
+        assert_eq!(payload["callback_id"], 42);
+        assert_eq!(payload["command"], "GET\nkey");
+        assert_eq!(payload["success"], false);
     }
 }
