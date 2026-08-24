@@ -232,3 +232,90 @@ quickcheck! {
         assert!(codec.decode_eof(&mut buf).unwrap().is_none());
     }
 }
+
+#[test]
+#[serial_test::serial]
+fn codec_logs_structured_diagnostic_on_value_parse_error() {
+    use std::fs::{read_dir, read_to_string};
+    use tokio_util::codec::Decoder as _;
+
+    let log_dir = tempfile::tempdir().unwrap();
+    unsafe { std::env::set_var("GLIDE_LOG_DIR", log_dir.path()) };
+    logger_core::init(Some(logger_core::Level::Debug), Some("resp-decode-test"));
+
+    let malformed = b"+abc\xff\r\n";
+    let mut codec = redis::ValueCodec::default();
+    let mut buf = bytes::BytesMut::from(&malformed[..]);
+    let error = codec
+        .decode(&mut buf)
+        .expect_err("expected malformed UTF-8 to fail");
+    assert!(error.to_string().contains("invalid utf-8 in line"));
+
+    let log_file = read_dir(log_dir.path())
+        .unwrap()
+        .next()
+        .expect("expected RESP diagnostic log file")
+        .unwrap()
+        .path();
+    let contents = read_to_string(log_file).unwrap();
+    let event: serde_json::Value = serde_json::from_str(contents.lines().last().unwrap()).unwrap();
+
+    assert_eq!(event["glide_event"], "resp_decode_error");
+    assert_eq!(event["level"], "debug");
+    assert_eq!(event["parser_phase"], "value_parse");
+    assert_eq!(event["buffer_len"], malformed.len());
+    assert_eq!(event["parser_offset"], 0);
+    assert_eq!(event["resp_type_byte"], b'+');
+    assert_eq!(event["preview_start"], 0);
+    assert_eq!(event["preview_hex"], "2b616263ff0d0a");
+    assert_eq!(event["aggregate_stack_remaining"], serde_json::json!([]));
+    assert_eq!(event["recoverable"], false);
+    assert!(event["error"]
+        .as_str()
+        .unwrap()
+        .contains("invalid utf-8 in line"));
+}
+
+#[test]
+#[serial_test::serial]
+fn codec_logs_structured_diagnostic_on_frame_scan_error() {
+    use std::fs::{read_dir, read_to_string};
+    use tokio_util::codec::Decoder as _;
+
+    let log_dir = tempfile::tempdir().unwrap();
+    unsafe { std::env::set_var("GLIDE_LOG_DIR", log_dir.path()) };
+    logger_core::init(Some(logger_core::Level::Debug), Some("resp-scan-test"));
+
+    let malformed = b"$3\r\nabcXX";
+    let mut codec = redis::ValueCodec::default();
+    let mut buf = bytes::BytesMut::from(&malformed[..]);
+    let error = codec
+        .decode(&mut buf)
+        .expect_err("expected malformed terminator to fail");
+    assert!(error
+        .to_string()
+        .contains("expected CRLF after blob payload"));
+
+    let log_file = read_dir(log_dir.path())
+        .unwrap()
+        .next()
+        .expect("expected RESP diagnostic log file")
+        .unwrap()
+        .path();
+    let contents = read_to_string(log_file).unwrap();
+    let event: serde_json::Value = serde_json::from_str(contents.lines().last().unwrap()).unwrap();
+
+    assert_eq!(event["glide_event"], "resp_decode_error");
+    assert_eq!(event["parser_phase"], "frame_scan");
+    assert_eq!(event["buffer_len"], malformed.len());
+    assert_eq!(event["parser_offset"], 0);
+    assert_eq!(event["resp_type_byte"], b'$');
+    assert_eq!(event["preview_start"], 0);
+    assert_eq!(event["preview_hex"], "24330d0a6162635858");
+    assert_eq!(event["aggregate_stack_remaining"], serde_json::json!([1]));
+    assert_eq!(event["recoverable"], false);
+    assert!(event["error"]
+        .as_str()
+        .unwrap()
+        .contains("expected CRLF after blob payload"));
+}

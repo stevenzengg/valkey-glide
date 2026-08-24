@@ -424,6 +424,10 @@ mod zero_copy {
             self.stack.clear();
             self.stack.push(1);
         }
+
+        pub(super) fn diagnostic_state(&self) -> (usize, &[usize]) {
+            (self.pos, &self.stack)
+        }
     }
 
     /// Continue scanning one top-level RESP value where the previous call
@@ -697,8 +701,44 @@ mod aio_support {
     use super::*;
 
     use bytes::{Buf, BytesMut};
+    use std::fmt::Write as _;
     use tokio::io::AsyncRead;
     use tokio_util::codec::{Decoder, Encoder};
+
+    const RESP_DIAGNOSTIC_PREVIEW_BYTES: usize = 64;
+
+    fn log_resp_decode_error(
+        parser_phase: &'static str,
+        error: &RedisError,
+        bytes: &[u8],
+        parser_offset: usize,
+        aggregate_stack_remaining: &[usize],
+    ) {
+        let preview_start = parser_offset.saturating_sub(RESP_DIAGNOSTIC_PREVIEW_BYTES / 2);
+        let preview_end = preview_start
+            .saturating_add(RESP_DIAGNOSTIC_PREVIEW_BYTES)
+            .min(bytes.len());
+        let mut preview_hex = String::with_capacity((preview_end - preview_start) * 2);
+        for byte in &bytes[preview_start..preview_end] {
+            let _ = write!(&mut preview_hex, "{byte:02x}");
+        }
+
+        logger_core::log_structured(
+            logger_core::Level::Debug,
+            "resp_decode_error",
+            logger_core::structured_fields!(
+                "parser_phase" => parser_phase,
+                "error" => error.to_string(),
+                "buffer_len" => bytes.len(),
+                "parser_offset" => parser_offset,
+                "resp_type_byte" => bytes.get(parser_offset).copied(),
+                "preview_start" => preview_start,
+                "preview_hex" => preview_hex,
+                "aggregate_stack_remaining" => aggregate_stack_remaining,
+                "recoverable" => false,
+            ),
+        );
+    }
 
     /// Tokio codec that decodes RESP frames zero-copy from the read
     /// buffer. See the `zero_copy` module for the strategy.
@@ -725,6 +765,14 @@ mod aio_support {
             // payloads out of it.
             match super::zero_copy::scan_resume(&bytes[..], &mut self.scan) {
                 Err(err) => {
+                    let (parser_offset, aggregate_stack_remaining) = self.scan.diagnostic_state();
+                    log_resp_decode_error(
+                        "frame_scan",
+                        &err,
+                        bytes,
+                        parser_offset,
+                        aggregate_stack_remaining,
+                    );
                     self.scan.reset();
                     Err(err)
                 }
@@ -760,7 +808,13 @@ mod aio_support {
                     let frame = crate::buf_pool::pooled_bytes_from_slice(&bytes[..end]);
                     bytes.advance(end);
                     let mut pos = 0;
-                    let value = super::zero_copy::parse_value(&frame, &mut pos, 1)?;
+                    let value = match super::zero_copy::parse_value(&frame, &mut pos, 1) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            log_resp_decode_error("value_parse", &err, &frame, pos, &[]);
+                            return Err(err);
+                        }
+                    };
                     Ok(Some(Ok(value)))
                 }
             }
