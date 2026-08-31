@@ -17,9 +17,8 @@ import java.util.stream.Collectors;
 /** Public API for configuring and draining native request-phase metric samples. */
 public final class RequestMetrics {
     private static final int MAX_DRAIN_SAMPLES = 10_000;
-    private static final String CONFIGURATION_ERROR_MESSAGE = "Unable to configure request metrics.";
-    private static final String SAMPLE_PERCENTAGE_ERROR_MESSAGE =
-            "Unable to update request metrics sample percentage.";
+    private static final String UNKNOWN_CONFIGURATION_ERROR_MESSAGE =
+            "Native request metrics configuration failed.";
 
     private RequestMetrics() {}
 
@@ -32,14 +31,14 @@ public final class RequestMetrics {
                         config.getSamplePercentage(),
                         config.getBufferCapacity(),
                         config.getAllowedCustomCommands().stream().sorted().toArray(String[]::new));
-        throwForNonzeroStatus(status, CONFIGURATION_ERROR_MESSAGE);
+        throwForNonzeroStatus(status, UNKNOWN_CONFIGURATION_ERROR_MESSAGE);
     }
 
     /** Updates the percentage of requests sampled by native request metrics collection. */
     public static void setSamplePercentage(int samplePercentage) {
         RequestMetricsConfiguration.validateSamplePercentage(samplePercentage);
         int status = RequestMetricsResolver.setRequestMetricsSamplePercentage(samplePercentage);
-        throwForNonzeroStatus(status, SAMPLE_PERCENTAGE_ERROR_MESSAGE);
+        throwForNonzeroStatus(status, UNKNOWN_CONFIGURATION_ERROR_MESSAGE);
     }
 
     /** Drains at most {@code maxSamples} request metric samples without performing I/O. */
@@ -61,9 +60,35 @@ public final class RequestMetrics {
     }
 
     private static void throwForNonzeroStatus(int status, String message) {
-        if (status != 0) {
-            throw new ConfigurationError(message);
+        if (status == RequestMetricsResolver.STATUS_OK) {
+            return;
         }
+        String statusMessage;
+        switch (status) {
+            case RequestMetricsResolver.STATUS_INVALID_SAMPLE_PERCENTAGE:
+                statusMessage = "Request metrics sample percentage must be between 0 and 100.";
+                break;
+            case RequestMetricsResolver.STATUS_INVALID_CAPACITY:
+                statusMessage = "Request metrics buffer capacity must be between 1 and 1000000.";
+                break;
+            case RequestMetricsResolver.STATUS_TOO_MANY_ALLOWED_CUSTOM_COMMANDS:
+                statusMessage = "Request metrics allows at most 64 custom commands.";
+                break;
+            case RequestMetricsResolver.STATUS_INVALID_ALLOWED_CUSTOM_COMMAND:
+                statusMessage = "Request metrics custom commands must match [A-Z0-9_.-]{1,64}.";
+                break;
+            case RequestMetricsResolver.STATUS_CONFIGURATION_MISMATCH:
+                statusMessage =
+                        "Request metrics are already configured with a different buffer capacity or"
+                                + " custom-command allow-list.";
+                break;
+            case RequestMetricsResolver.STATUS_NOT_CONFIGURED:
+                statusMessage = "Request metrics have not been configured.";
+                break;
+            default:
+                statusMessage = message;
+        }
+        throw new ConfigurationError(statusMessage);
     }
 
     private static RequestMetricBatch toRequestMetricBatch(
@@ -81,6 +106,7 @@ public final class RequestMetrics {
         List<RequestMetricPhaseDuration> phaseDurations =
                 sample.getPhaseDurationsList().stream()
                         .map(RequestMetrics::toRequestMetricPhaseDuration)
+                        .filter(duration -> duration.getPhase() != RequestMetricPhase.UNSPECIFIED)
                         .collect(Collectors.toList());
         return new RequestMetricSample(
                 sample.getOperation(),

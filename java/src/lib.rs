@@ -2,6 +2,11 @@
 
 use glide_core::client::FINISHED_SCAN_CURSOR;
 use glide_core::errors::{error_message, error_type};
+use glide_core::native_request_metrics::{
+    RequestMetricDrain, RequestMetricPhase as NativeRequestMetricPhase,
+    RequestMetricResult as NativeRequestMetricResult, RequestMetricsConfigurationError,
+    RequestMetricsState,
+};
 use logger_core::log_structured;
 // Protocol constants for Java (defined directly since we don't use socket layer)
 const TYPE_HASH: &str = "hash";
@@ -11,6 +16,16 @@ const TYPE_STREAM: &str = "stream";
 const TYPE_STRING: &str = "string";
 const TYPE_ZSET: &str = "zset";
 const MAX_REQUEST_ARGS_LENGTH_IN_BYTES: usize = 2_i32.pow(12) as usize; // 4096 bytes
+const MAX_ALLOWED_REQUEST_METRIC_CUSTOM_COMMANDS: jint = 64;
+const REQUEST_METRICS_STATUS_OK: jint = 0;
+const REQUEST_METRICS_STATUS_INVALID_SAMPLE_PERCENTAGE: jint = 1;
+const REQUEST_METRICS_STATUS_INVALID_CAPACITY: jint = 2;
+const REQUEST_METRICS_STATUS_TOO_MANY_ALLOWED_CUSTOM_COMMANDS: jint = 3;
+const REQUEST_METRICS_STATUS_INVALID_ALLOWED_CUSTOM_COMMAND: jint = 4;
+const REQUEST_METRICS_STATUS_CONFIGURATION_MISMATCH: jint = 5;
+const REQUEST_METRICS_STATUS_NOT_CONFIGURED: jint = 6;
+const REQUEST_METRICS_DRAIN_ERROR_MESSAGE: &str = "Unable to drain native request metrics.";
+const REQUEST_METRICS_INVALID_DRAIN_SIZE_MESSAGE: &str = "maxSamples must be greater than 0";
 
 // Telemetry required for getStatistics
 use glide_core::Telemetry;
@@ -45,6 +60,128 @@ use crate::address_resolver::JavaAddressResolver;
 
 fn elapsed_ms(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn request_metrics_configuration_status(
+    result: Result<(), RequestMetricsConfigurationError>,
+) -> jint {
+    match result {
+        Ok(()) => REQUEST_METRICS_STATUS_OK,
+        Err(RequestMetricsConfigurationError::InvalidSamplePercentage { .. }) => {
+            REQUEST_METRICS_STATUS_INVALID_SAMPLE_PERCENTAGE
+        }
+        Err(RequestMetricsConfigurationError::InvalidCapacity { .. }) => {
+            REQUEST_METRICS_STATUS_INVALID_CAPACITY
+        }
+        Err(RequestMetricsConfigurationError::TooManyAllowedCustomCommands { .. }) => {
+            REQUEST_METRICS_STATUS_TOO_MANY_ALLOWED_CUSTOM_COMMANDS
+        }
+        Err(RequestMetricsConfigurationError::InvalidAllowedCustomCommand { .. }) => {
+            REQUEST_METRICS_STATUS_INVALID_ALLOWED_CUSTOM_COMMAND
+        }
+        Err(RequestMetricsConfigurationError::ConfigurationMismatch) => {
+            REQUEST_METRICS_STATUS_CONFIGURATION_MISMATCH
+        }
+        Err(RequestMetricsConfigurationError::NotConfigured) => {
+            REQUEST_METRICS_STATUS_NOT_CONFIGURED
+        }
+    }
+}
+
+fn request_metric_phase(
+    phase: NativeRequestMetricPhase,
+) -> glide_core::request_metrics::RequestMetricPhase {
+    use glide_core::request_metrics::RequestMetricPhase;
+
+    match phase {
+        NativeRequestMetricPhase::JniIngress => {
+            RequestMetricPhase::REQUEST_METRIC_PHASE_JNI_INGRESS
+        }
+        NativeRequestMetricPhase::ClientQueue => {
+            RequestMetricPhase::REQUEST_METRIC_PHASE_CLIENT_QUEUE
+        }
+        NativeRequestMetricPhase::CommandPrepare => {
+            RequestMetricPhase::REQUEST_METRIC_PHASE_COMMAND_PREPARE
+        }
+        NativeRequestMetricPhase::ConnectionWait => {
+            RequestMetricPhase::REQUEST_METRIC_PHASE_CONNECTION_WAIT
+        }
+        NativeRequestMetricPhase::PipelineQueue => {
+            RequestMetricPhase::REQUEST_METRIC_PHASE_PIPELINE_QUEUE
+        }
+        NativeRequestMetricPhase::SocketWrite => {
+            RequestMetricPhase::REQUEST_METRIC_PHASE_SOCKET_WRITE
+        }
+        NativeRequestMetricPhase::ResponseWait => {
+            RequestMetricPhase::REQUEST_METRIC_PHASE_RESPONSE_WAIT
+        }
+        NativeRequestMetricPhase::RetryBackoff => {
+            RequestMetricPhase::REQUEST_METRIC_PHASE_RETRY_BACKOFF
+        }
+        NativeRequestMetricPhase::CoreDecode => {
+            RequestMetricPhase::REQUEST_METRIC_PHASE_CORE_DECODE
+        }
+        NativeRequestMetricPhase::CallbackQueue => {
+            RequestMetricPhase::REQUEST_METRIC_PHASE_CALLBACK_QUEUE
+        }
+        NativeRequestMetricPhase::CallbackComplete => {
+            RequestMetricPhase::REQUEST_METRIC_PHASE_CALLBACK_COMPLETE
+        }
+        NativeRequestMetricPhase::Total => RequestMetricPhase::REQUEST_METRIC_PHASE_TOTAL,
+    }
+}
+
+fn request_metric_result(
+    result: NativeRequestMetricResult,
+) -> glide_core::request_metrics::RequestMetricResult {
+    use glide_core::request_metrics::RequestMetricResult;
+
+    match result {
+        NativeRequestMetricResult::Success => RequestMetricResult::REQUEST_METRIC_RESULT_SUCCESS,
+        NativeRequestMetricResult::Failure => RequestMetricResult::REQUEST_METRIC_RESULT_FAILURE,
+        NativeRequestMetricResult::Timeout => RequestMetricResult::REQUEST_METRIC_RESULT_TIMEOUT,
+        NativeRequestMetricResult::Cancelled => {
+            RequestMetricResult::REQUEST_METRIC_RESULT_CANCELLED
+        }
+    }
+}
+
+fn request_metric_batch(
+    state: &RequestMetricsState,
+    drain: &RequestMetricDrain,
+) -> Result<glide_core::request_metrics::RequestMetricBatch, std::string::FromUtf8Error> {
+    let samples = drain
+        .samples()
+        .iter()
+        .map(|sample| {
+            let operation = String::from_utf8(state.operation_bytes(sample.operation()).to_vec())?;
+            let phase_durations = sample
+                .populated_phase_durations()
+                .map(|(phase, duration_nanos)| {
+                    glide_core::request_metrics::RequestMetricPhaseDuration {
+                        phase: protobuf::EnumOrUnknown::new(request_metric_phase(phase)),
+                        duration_nanos,
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            Ok(glide_core::request_metrics::RequestMetricSample {
+                operation: operation.into(),
+                result: protobuf::EnumOrUnknown::new(request_metric_result(sample.result())),
+                attempt_count: sample.attempt_count(),
+                phase_durations,
+                ..Default::default()
+            })
+        })
+        .collect::<Result<Vec<_>, std::string::FromUtf8Error>>()?;
+
+    Ok(glide_core::request_metrics::RequestMetricBatch {
+        samples,
+        dropped_samples: drain.dropped_samples(),
+        remaining_samples: drain.remaining_samples(),
+        has_more: drain.has_more(),
+        ..Default::default()
+    })
 }
 
 fn redis_command_name(cmd: &redis::Cmd) -> String {
@@ -1404,6 +1541,160 @@ pub extern "system" fn Java_glide_ffi_resolvers_StatisticsResolver_getStatistics
     );
 
     map
+}
+
+/// Configures the process-global request metrics sampler.
+///
+/// The return value is a stable status code: 0=OK, 1=invalid sample percentage,
+/// 2=invalid capacity, 3=too many allowed custom commands, 4=invalid allowed custom command,
+/// 5=fixed-configuration mismatch, and 6=not configured.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_glide_ffi_resolvers_RequestMetricsResolver_configureRequestMetrics<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    sample_percentage: jint,
+    buffer_capacity: jint,
+    allowed_custom_commands: JObjectArray<'local>,
+) -> jint {
+    handle_panics(
+        move || {
+            fn configure_request_metrics(
+                env: &mut JNIEnv<'_>,
+                sample_percentage: jint,
+                buffer_capacity: jint,
+                allowed_custom_commands: JObjectArray<'_>,
+            ) -> Result<jint, FFIError> {
+                if sample_percentage < 0 {
+                    return Ok(REQUEST_METRICS_STATUS_INVALID_SAMPLE_PERCENTAGE);
+                }
+                if buffer_capacity <= 0 {
+                    return Ok(REQUEST_METRICS_STATUS_INVALID_CAPACITY);
+                }
+                if allowed_custom_commands.is_null() {
+                    return Ok(REQUEST_METRICS_STATUS_INVALID_ALLOWED_CUSTOM_COMMAND);
+                }
+
+                let command_count = env.get_array_length(&allowed_custom_commands)?;
+                if command_count > MAX_ALLOWED_REQUEST_METRIC_CUSTOM_COMMANDS {
+                    return Ok(REQUEST_METRICS_STATUS_TOO_MANY_ALLOWED_CUSTOM_COMMANDS);
+                }
+
+                let mut commands = Vec::with_capacity(command_count as usize);
+                for index in 0..command_count {
+                    let command = env.get_object_array_element(&allowed_custom_commands, index)?;
+                    if command.is_null() {
+                        return Ok(REQUEST_METRICS_STATUS_INVALID_ALLOWED_CUSTOM_COMMAND);
+                    }
+                    let command: String = env.get_string(&JString::from(command))?.into();
+                    commands.push(command.into_bytes());
+                }
+                let command_refs = commands.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                Ok(request_metrics_configuration_status(
+                    glide_core::native_request_metrics::configure_request_metrics(
+                        sample_percentage as u32,
+                        buffer_capacity as usize,
+                        &command_refs,
+                    ),
+                ))
+            }
+
+            let result = configure_request_metrics(
+                &mut env,
+                sample_percentage,
+                buffer_capacity,
+                allowed_custom_commands,
+            );
+            handle_errors(&mut env, result)
+        },
+        "configureRequestMetrics",
+    )
+    .unwrap_or(REQUEST_METRICS_STATUS_INVALID_ALLOWED_CUSTOM_COMMAND)
+}
+
+/// Updates the live request metrics sample percentage using the stable status mapping above.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_glide_ffi_resolvers_RequestMetricsResolver_setRequestMetricsSamplePercentage(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    sample_percentage: jint,
+) -> jint {
+    handle_panics(
+        move || {
+            if sample_percentage < 0 {
+                return Some(REQUEST_METRICS_STATUS_INVALID_SAMPLE_PERCENTAGE);
+            }
+            Some(request_metrics_configuration_status(
+                glide_core::native_request_metrics::set_request_metrics_sample_percentage(
+                    sample_percentage as u32,
+                ),
+            ))
+        },
+        "setRequestMetricsSamplePercentage",
+    )
+    .unwrap_or(REQUEST_METRICS_STATUS_NOT_CONFIGURED)
+}
+
+fn throw_request_metrics_exception(env: &mut JNIEnv<'_>, class: &str, message: &str) {
+    if matches!(env.exception_check(), Ok(true)) {
+        let _ = env.exception_clear();
+    }
+    if let Err(error) = env.throw_new(class, message) {
+        log::error!("Failed to throw request metrics exception: {error}");
+    }
+}
+
+/// Drains and serializes one bounded request metrics batch on the calling thread.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_glide_ffi_resolvers_RequestMetricsResolver_drainRequestMetrics<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    max_samples: jint,
+) -> JByteArray<'local> {
+    if max_samples <= 0 {
+        throw_request_metrics_exception(
+            &mut env,
+            "java/lang/IllegalArgumentException",
+            REQUEST_METRICS_INVALID_DRAIN_SIZE_MESSAGE,
+        );
+        return JByteArray::default();
+    }
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let state = glide_core::native_request_metrics::request_metrics_state()
+            .ok_or_else(|| anyhow::anyhow!("request metrics have not been configured"))?;
+        let drain = state
+            .drain(max_samples as usize)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let batch = request_metric_batch(state, &drain)?;
+        let bytes = batch.write_to_bytes()?;
+        Ok::<JByteArray<'local>, anyhow::Error>(env.byte_array_from_slice(&bytes)?)
+    }));
+
+    match result {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(error)) => {
+            log::error!("Failed to drain request metrics: {error}");
+            throw_request_metrics_exception(
+                &mut env,
+                "java/lang/IllegalStateException",
+                REQUEST_METRICS_DRAIN_ERROR_MESSAGE,
+            );
+            JByteArray::default()
+        }
+        Err(_) => {
+            log::error!("Native function drainRequestMetrics panicked.");
+            throw_request_metrics_exception(
+                &mut env,
+                "java/lang/IllegalStateException",
+                REQUEST_METRICS_DRAIN_ERROR_MESSAGE,
+            );
+            JByteArray::default()
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -3295,4 +3586,40 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_getCacheMetrics(
         Some(())
     })
     .unwrap_or(())
+
+#[cfg(test)]
+mod request_metrics_tests {
+    use super::*;
+    use telemetrylib::request_metrics::{
+        CUSTOM_COMMAND, RequestMetricPhase as NativeRequestMetricPhase,
+        RequestMetricResult as NativeRequestMetricResult, RequestMetricsState,
+    };
+
+    #[test]
+    fn serializes_nonzero_phases_in_enum_order_with_owner_operation_resolution() {
+        let owner = RequestMetricsState::new(100, 4, &[b"GRAPH.QUERY"]).unwrap();
+        let foreign = RequestMetricsState::new(100, 4, &[b"GRAPH.QUERY"]).unwrap();
+        let foreign_operation = foreign.custom_operation(b"GRAPH.QUERY");
+        let context = owner.start(foreign_operation).unwrap();
+        context.record_phase_duration(
+            NativeRequestMetricPhase::ClientQueue,
+            Duration::from_nanos(7),
+        );
+        context.increment_attempt_count();
+        assert!(context.finish(NativeRequestMetricResult::Success));
+
+        let drain = owner.drain(1).unwrap();
+        let protobuf_batch = request_metric_batch(&owner, &drain).unwrap();
+
+        assert_eq!(protobuf_batch.samples.len(), 1);
+        let sample = &protobuf_batch.samples[0];
+        assert_eq!(&*sample.operation, CUSTOM_COMMAND);
+        assert_eq!(sample.result.value(), 1);
+        assert_eq!(sample.attempt_count, 1);
+        assert_eq!(sample.phase_durations.len(), 2);
+        assert_eq!(sample.phase_durations[0].phase.value(), 2);
+        assert_eq!(sample.phase_durations[0].duration_nanos, 7);
+        assert_eq!(sample.phase_durations[1].phase.value(), 12);
+        assert!(sample.phase_durations[1].duration_nanos > 0);
+    }
 }
