@@ -3,6 +3,7 @@ use serde::Serialize;
 use std::sync::RwLock as StdRwLock;
 mod metrics_exporter_file;
 mod open_telemetry;
+pub mod request_metrics;
 mod span_exporter_file;
 
 pub use metrics_exporter_file::FileMetricExporter;
