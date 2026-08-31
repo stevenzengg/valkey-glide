@@ -1583,12 +1583,19 @@ pub extern "system" fn Java_glide_ffi_resolvers_RequestMetricsResolver_configure
 
                 let mut commands = Vec::with_capacity(command_count as usize);
                 for index in 0..command_count {
-                    let command = env.get_object_array_element(&allowed_custom_commands, index)?;
-                    if command.is_null() {
+                    let command = env.with_local_frame(1, |env| {
+                        let command =
+                            env.get_object_array_element(&allowed_custom_commands, index)?;
+                        if command.is_null() {
+                            return Ok(None);
+                        }
+                        let command: String = env.get_string(&JString::from(command))?.into();
+                        Ok::<Option<Vec<u8>>, FFIError>(Some(command.into_bytes()))
+                    })?;
+                    let Some(command) = command else {
                         return Ok(REQUEST_METRICS_STATUS_INVALID_ALLOWED_CUSTOM_COMMAND);
-                    }
-                    let command: String = env.get_string(&JString::from(command))?.into();
-                    commands.push(command.into_bytes());
+                    };
+                    commands.push(command);
                 }
                 let command_refs = commands.iter().map(Vec::as_slice).collect::<Vec<_>>();
                 Ok(request_metrics_configuration_status(
