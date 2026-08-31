@@ -13,6 +13,8 @@ import glide.api.models.metrics.RequestMetricPhaseDuration;
 import glide.api.models.metrics.RequestMetricResult;
 import glide.api.models.metrics.RequestMetricSample;
 import glide.api.models.metrics.RequestMetricsConfiguration;
+import glide.ffi.resolvers.RequestMetricsResolver;
+import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -99,5 +101,56 @@ class RequestMetricsTest {
                 () -> new RequestMetricSample("GET", RequestMetricResult.SUCCESS, -1, List.of()));
         assertThrows(
                 IllegalArgumentException.class, () -> new RequestMetricBatch(List.of(), -1, 0, false));
+    }
+
+    @Test
+    void decodesNativeProtobufBatchIntoImmutableModels() {
+        var protobufBatch =
+                request_metrics.RequestMetrics.RequestMetricBatch.newBuilder()
+                        .addSamples(
+                                request_metrics.RequestMetrics.RequestMetricSample.newBuilder()
+                                        .setOperation("GET")
+                                        .setResultValue(99)
+                                        .setAttemptCount(2)
+                                        .addPhaseDurations(
+                                                request_metrics.RequestMetrics.RequestMetricPhaseDuration.newBuilder()
+                                                        .setPhaseValue(99)
+                                                        .setDurationNanos(42)))
+                        .setDroppedSamples(3)
+                        .setRemainingSamples(4)
+                        .setHasMore(true)
+                        .build();
+
+        var batch = RequestMetrics.decodeDrainResponse(protobufBatch.toByteArray());
+
+        assertEquals(3, batch.getDroppedSamples());
+        assertEquals(4, batch.getRemainingSamples());
+        assertTrue(batch.getHasMore());
+        assertEquals(1, batch.getSamples().size());
+        assertEquals("GET", batch.getSamples().get(0).getOperation());
+        assertEquals(RequestMetricResult.UNSPECIFIED, batch.getSamples().get(0).getResult());
+        assertEquals(2, batch.getSamples().get(0).getAttemptCount());
+        assertEquals(
+                RequestMetricPhase.UNSPECIFIED,
+                batch.getSamples().get(0).getPhaseDurations().get(0).getPhase());
+        assertEquals(42, batch.getSamples().get(0).getPhaseDurations().get(0).getDurationNanos());
+    }
+
+    @Test
+    void exposesRustFriendlyNativeResolverContract() throws ReflectiveOperationException {
+        var configure =
+                RequestMetricsResolver.class.getDeclaredMethod(
+                        "configureRequestMetrics", int.class, int.class, String[].class);
+        var update =
+                RequestMetricsResolver.class.getDeclaredMethod(
+                        "setRequestMetricsSamplePercentage", int.class);
+        var drain = RequestMetricsResolver.class.getDeclaredMethod("drainRequestMetrics", int.class);
+
+        assertTrue(Modifier.isNative(configure.getModifiers()));
+        assertEquals(int.class, configure.getReturnType());
+        assertTrue(Modifier.isNative(update.getModifiers()));
+        assertEquals(int.class, update.getReturnType());
+        assertTrue(Modifier.isNative(drain.getModifiers()));
+        assertEquals(byte[].class, drain.getReturnType());
     }
 }
