@@ -63,22 +63,22 @@ Only phases reached by a sampled request are present. Durations for repeated att
 
 | Phase | Measured boundary |
 | --- | --- |
-| `JNI_INGRESS` | From entry into the direct-command JNI function, through byte copying, request parsing and validation, operation binding, and preparation for the asynchronous runtime handoff. |
+| `JNI_INGRESS` | From the selected native direct-command entry timestamp through request-byte copying, parsing and validation, and operation binding. It ends before post-bind dispatch bookkeeping, `CLIENT_QUEUE`, and the runtime spawn. |
 | `CLIENT_QUEUE` | From immediately before spawning the command future until the first action in that future. |
-| `COMMAND_PREPARE` | Conversion of the parsed single-command request into the core command and routing representation. |
-| `CONNECTION_WAIT` | Waiting to acquire or refresh a connection when the selected command path requires it. |
-| `PIPELINE_QUEUE` | From submission to an asynchronous connection pipeline until that pipeline accepts the message for an attempt. |
-| `SOCKET_WRITE` | From acceptance of a network attempt until its bytes are flushed. |
-| `RESPONSE_WAIT` | From the same accepted-attempt point until the response or terminal attempt outcome. It intentionally overlaps `SOCKET_WRITE`. |
-| `RETRY_BACKOFF` | Time spent sleeping before another connection or command attempt. |
-| `CORE_DECODE` | Conversion of the raw protocol result into the core value returned to the Java bridge. |
+| `COMMAND_PREPARE` | Accumulated across two synchronous intervals: converting the parsed direct command and route into their core representations, and calling `client.send_command` to create the command future. The second interval ends when that call returns the future; awaiting the future and all network work are excluded. |
+| `CONNECTION_WAIT` | Time inside the single-node cluster `get_connection` boundary: route/address selection and connection-future or reconnect readiness waits. It is omitted for standalone commands and multi-node fan-out, where there is no comparable honest boundary; general slot-refresh work is not labeled as connection wait. |
+| `PIPELINE_QUEUE` | From immediately before the asynchronous `mpsc` send begins, including permit/backpressure wait, until entry to `PipelineSink::start_send`. It ends before output-closed, stored-error, and protocol-desynchronization rejection checks, so it can be present with zero attempts. If the handoff never reaches `start_send`, terminal finalization closes the active interval. |
+| `SOCKET_WRITE` | From immediately before an actual underlying sink `start_send` call until the first covering successful flush or response, or until a synchronous start-send/flush error, cancellation/finalization, or sink drop closes it. Each attempt's timer ends exactly once, including when a response arrives before its flush. |
+| `RESPONSE_WAIT` | From the same underlying `start_send` boundary until the complete logical response is assembled, including every aggregate or fenced response, or until terminal error, cancellation/finalization, or sink drop. It intentionally overlaps `SOCKET_WRITE`. |
+| `RETRY_BACKOFF` | Time only inside existing explicit command retry sleeps, including ordinary retry, slot-refresh retry-delay, and busy-loading delay paths. Immediate redirects and routing, refresh, or reconnect work outside an explicit retry sleep are excluded. |
+| `CORE_DECODE` | Conversion of the core response into the expected core return value, including configured response decompression. A raw command error passes through the same timed wrapper; Java object conversion is excluded. |
 | `CALLBACK_QUEUE` | From enqueueing the callback job until a Java callback worker receives that exact job. |
 | `CALLBACK_COMPLETE` | From callback-worker receipt, after `CALLBACK_QUEUE` ends, through native-to-Java conversion and Java future completion until synchronous Java completion actions return to native code. |
-| `TOTAL` | From the one sampling decision at JNI entry until the terminal result is fixed and the compact sample is offered to the native buffer. |
+| `TOTAL` | From the selected native-entry timestamp through the terminal result/finalization timestamp, which also closes any active phases. Sample construction, serialization, and the nonblocking buffer offer happen afterward and are excluded. |
 
 Because completing a Java future can wake its waiting thread before the native callback call returns, a sample may become visible to `drain` just after the corresponding future appears complete. Consumers should drain periodically instead of assuming that an immediately following drain must contain that command.
 
-`attemptCount` is incremented when a network send attempt is accepted. It includes retries and does not count work that fails before an attempt is accepted. The terminal result is recorded once:
+`attemptCount` is incremented immediately before each actual underlying sink `start_send` call, after queue-time rejection checks. It includes retries and a call whose synchronous `start_send` returns an error. Selection/readiness failure, channel-handoff failure, closed output, or stored error/protocol state rejected before that call does not count as an attempt. The terminal result is recorded once:
 
 - `SUCCESS` means the command result and Java callback completion both succeeded.
 - `FAILURE` includes command, decode, callback conversion, delivery, and other non-timeout failures.
