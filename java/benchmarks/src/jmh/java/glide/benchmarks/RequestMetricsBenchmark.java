@@ -7,8 +7,8 @@ import glide.api.models.configuration.GlideClientConfiguration;
 import glide.api.models.configuration.NodeAddress;
 import glide.api.models.metrics.RequestMetricBatch;
 import glide.api.models.metrics.RequestMetricsConfiguration;
+import java.util.Collections;
 import java.util.Locale;
-import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -255,7 +255,7 @@ public class RequestMetricsBenchmark {
                 RequestMetricsConfiguration.builder()
                         .samplePercentage(samplePercentage)
                         .bufferCapacity(BUFFER_CAPACITY)
-                        .allowedCustomCommands(Set.of())
+                        .allowedCustomCommands(Collections.emptySet())
                         .build());
     }
 
