@@ -323,6 +323,12 @@ public class AsyncRegistryTest {
                 AsyncRegistry.completeCallbackWithErrorCodeForNative(
                         correlationId, 2, "core request timed out"));
         assertTrue(command.isCompletedExceptionally());
+
+        CompletableFuture<Object> legacyFuture = new CompletableFuture<>();
+        long legacyCorrelationId = AsyncRegistry.register(legacyFuture, 0, 17L, 0);
+        assertTrue(
+                AsyncRegistry.completeCallbackWithErrorCode(
+                        legacyCorrelationId, 2, "core request timed out"));
     }
 
     @Test

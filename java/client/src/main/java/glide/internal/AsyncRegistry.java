@@ -76,6 +76,10 @@ public final class AsyncRegistry {
         CompletionOutcome(int nativeCode) {
             this.nativeCode = nativeCode;
         }
+
+        private boolean acceptedNativeDelivery() {
+            return this == COMPLETED || this == NATIVE_TIMEOUT;
+        }
     }
 
     private static final class CompletionState {
@@ -595,8 +599,10 @@ public final class AsyncRegistry {
      */
     public static boolean completeCallbackWithErrorCode(
             long correlationId, int errorTypeCode, String errorMessage) {
-        return completeCallbackWithErrorCodeForNative(correlationId, errorTypeCode, errorMessage)
-                == CompletionOutcome.COMPLETED.nativeCode;
+        int outcome =
+                completeCallbackWithErrorCodeForNative(correlationId, errorTypeCode, errorMessage);
+        return outcome == CompletionOutcome.COMPLETED.nativeCode
+                || outcome == CompletionOutcome.NATIVE_TIMEOUT.nativeCode;
     }
 
     /** Complete an exceptional callback and return its exact terminal outcome to native code. */
@@ -687,9 +693,7 @@ public final class AsyncRegistry {
         logLifecycle(
                 Logger.Level.WARN,
                 correlationId,
-                outcome == CompletionOutcome.COMPLETED
-                        ? "complete_error"
-                        : "complete_error_already_completed",
+                outcome.acceptedNativeDelivery() ? "complete_error" : "complete_error_already_completed",
                 "\"error_type_code\":"
                         + errorTypeCode
                         + ",\"exception_type\":"
