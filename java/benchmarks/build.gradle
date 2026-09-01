@@ -51,11 +51,12 @@ jmh {
     profilers = ['gc']
     resultFormat = 'JSON'
     resultsFile = project.file("${project.buildDir}/reports/jmh/results.json")
-    includes = ['ArrayTransformBenchmark']
+    includes = ['ArrayTransformBenchmark', 'RequestMetricsBenchmark']
 }
 
 if (!System.getenv("GLIDE_RELEASE_VERSION")) {
     compileJava.dependsOn ':client:publishToMavenLocal'
+    compileJmhJava.dependsOn ':client:publishToMavenLocal'
 }
 
 application {
