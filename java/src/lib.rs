@@ -3,6 +3,7 @@
 use glide_core::client::FINISHED_SCAN_CURSOR;
 use glide_core::errors::{error_message, error_type};
 use glide_core::native_request_metrics::{
+    BoundedOperation, PendingRequestMetricContext, PhaseTimer, RequestMetricContext,
     RequestMetricDrain, RequestMetricPhase as NativeRequestMetricPhase,
     RequestMetricResult as NativeRequestMetricResult, RequestMetricsConfigurationError,
     RequestMetricsState,
@@ -86,6 +87,124 @@ fn request_metrics_configuration_status(
             REQUEST_METRICS_STATUS_NOT_CONFIGURED
         }
     }
+}
+
+type PendingJavaRequestMetrics = (Arc<RequestMetricsState>, PendingRequestMetricContext);
+
+enum SynchronousRequestMetricsState {
+    Pending {
+        state: Arc<RequestMetricsState>,
+        pending: PendingRequestMetricContext,
+        operation: BoundedOperation,
+    },
+    Bound(Arc<RequestMetricContext>),
+}
+
+struct SynchronousRequestMetricsGuard {
+    state: Option<SynchronousRequestMetricsState>,
+}
+
+impl SynchronousRequestMetricsGuard {
+    fn new(pending: Option<PendingJavaRequestMetrics>) -> Self {
+        Self {
+            state: pending.map(|(state, pending)| SynchronousRequestMetricsState::Pending {
+                state,
+                pending,
+                operation: BoundedOperation::custom_command(),
+            }),
+        }
+    }
+
+    fn set_operation(&mut self, request_type: jint, args: &[Vec<u8>]) {
+        if let Some(SynchronousRequestMetricsState::Pending {
+            state, operation, ..
+        }) = self.state.as_mut()
+        {
+            *operation = request_metric_operation(state, request_type, args);
+        }
+    }
+
+    fn context_for_spawn(&mut self) -> Option<Arc<RequestMetricContext>> {
+        let state = self.state.take()?;
+        let context = match state {
+            SynchronousRequestMetricsState::Pending {
+                pending, operation, ..
+            } => pending.bind_and_record_phase(operation, NativeRequestMetricPhase::JniIngress),
+            SynchronousRequestMetricsState::Bound(context) => context,
+        };
+        self.state = Some(SynchronousRequestMetricsState::Bound(Arc::clone(&context)));
+        Some(context)
+    }
+
+    fn disarm_after_spawn(&mut self) {
+        self.state.take();
+    }
+}
+
+impl Drop for SynchronousRequestMetricsGuard {
+    fn drop(&mut self) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        let context = match state {
+            SynchronousRequestMetricsState::Pending {
+                pending, operation, ..
+            } => pending.bind_and_record_phase(operation, NativeRequestMetricPhase::JniIngress),
+            SynchronousRequestMetricsState::Bound(context) => context,
+        };
+        context.finish(NativeRequestMetricResult::Failure);
+    }
+}
+
+fn start_request_metrics() -> SynchronousRequestMetricsGuard {
+    let pending = glide_core::native_request_metrics::request_metrics_state().and_then(|state| {
+        state
+            .start_pending()
+            .map(|pending| (Arc::clone(state), pending))
+    });
+    SynchronousRequestMetricsGuard::new(pending)
+}
+
+fn request_metric_operation(
+    state: &RequestMetricsState,
+    request_type: jint,
+    args: &[Vec<u8>],
+) -> BoundedOperation {
+    let proto_request_type =
+        protobuf::EnumOrUnknown::<glide_core::command_request::RequestType>::from_i32(request_type);
+    let request_type: glide_core::request_type::RequestType = proto_request_type.into();
+    if matches!(
+        request_type,
+        glide_core::request_type::RequestType::CustomCommand
+    ) {
+        return args
+            .first()
+            .map_or_else(BoundedOperation::custom_command, |command| {
+                state.custom_operation(command)
+            });
+    }
+    request_type
+        .request_metric_name()
+        .map_or_else(BoundedOperation::custom_command, BoundedOperation::known)
+}
+
+fn finish_client_queue_on_future_entry(client_queue_timer: Option<PhaseTimer>) {
+    if let Some(client_queue_timer) = client_queue_timer {
+        client_queue_timer.finish();
+    }
+}
+
+fn time_command_prepare<T>(
+    request_metrics: Option<&Arc<RequestMetricContext>>,
+    prepare: impl FnOnce() -> T,
+) -> T {
+    let timer = request_metrics
+        .map(|context| context.start_phase(NativeRequestMetricPhase::CommandPrepare));
+    let result = prepare();
+    if let Some(timer) = timer {
+        timer.finish();
+    }
+    result
 }
 
 fn request_metric_phase(
@@ -247,6 +366,7 @@ struct InFlightCommand {
     root_span_ptr_present: bool,
     started_at: Instant,
     details: InFlightCommandDetails,
+    request_metrics: Option<Arc<RequestMetricContext>>,
 }
 
 static IN_FLIGHT_COMMANDS: OnceLock<Mutex<HashMap<jlong, InFlightCommand>>> = OnceLock::new();
@@ -262,6 +382,7 @@ fn track_pending_single_command(
     command_arg_count: usize,
     expect_utf8: bool,
     root_span_ptr_present: bool,
+    request_metrics: Option<Arc<RequestMetricContext>>,
 ) {
     in_flight_commands().lock().insert(
         callback_id,
@@ -275,6 +396,7 @@ fn track_pending_single_command(
                 request_type,
                 command_arg_count,
             },
+            request_metrics,
         },
     );
 }
@@ -299,6 +421,7 @@ fn track_pending_batch_command(
                 command_count,
                 is_atomic,
             },
+            request_metrics: None,
         },
     );
 }
@@ -318,21 +441,19 @@ fn track_single_command(
     root_span_ptr_present: bool,
     started_at: Instant,
 ) {
-    in_flight_commands().lock().insert(
-        context.callback_id,
-        InFlightCommand {
-            handle_id: context.handle_id,
-            routing: context.routing.to_string(),
-            expect_utf8,
-            root_span_ptr_present,
-            started_at,
-            details: InFlightCommandDetails::Single {
-                request_type: context.request_type,
-                command_name: context.command_name.to_string(),
-                command_arg_count: context.command_arg_count,
-            },
-        },
-    );
+    let mut commands = in_flight_commands().lock();
+    if let Some(command) = commands.get_mut(&context.callback_id) {
+        command.handle_id = context.handle_id;
+        command.routing = context.routing.to_string();
+        command.expect_utf8 = expect_utf8;
+        command.root_span_ptr_present = root_span_ptr_present;
+        command.started_at = started_at;
+        command.details = InFlightCommandDetails::Single {
+            request_type: context.request_type,
+            command_name: context.command_name.to_string(),
+            command_arg_count: context.command_arg_count,
+        };
+    }
 }
 
 struct BatchCommandLogContext<'a> {
@@ -350,29 +471,42 @@ fn track_batch_command(
     root_span_ptr_present: bool,
     started_at: Instant,
 ) {
-    in_flight_commands().lock().insert(
-        context.callback_id,
-        InFlightCommand {
-            handle_id: context.handle_id,
-            routing: context.routing.to_string(),
-            expect_utf8,
-            root_span_ptr_present,
-            started_at,
-            details: InFlightCommandDetails::Batch {
-                command_count: context.command_count,
-                command_names: context.command_names.to_string(),
-                is_atomic: context.is_atomic,
-            },
-        },
-    );
+    let mut commands = in_flight_commands().lock();
+    if let Some(command) = commands.get_mut(&context.callback_id) {
+        command.handle_id = context.handle_id;
+        command.routing = context.routing.to_string();
+        command.expect_utf8 = expect_utf8;
+        command.root_span_ptr_present = root_span_ptr_present;
+        command.started_at = started_at;
+        command.details = InFlightCommandDetails::Batch {
+            command_count: context.command_count,
+            command_names: context.command_names.to_string(),
+            is_atomic: context.is_atomic,
+        };
+    }
 }
 
 pub(crate) fn finish_in_flight_command(callback_id: jlong) {
     in_flight_commands().lock().remove(&callback_id);
 }
 
-fn log_callback_marked_timed_out(callback_id: jlong) {
+pub(crate) fn has_in_flight_command(callback_id: jlong) -> bool {
+    in_flight_commands().lock().contains_key(&callback_id)
+}
+
+fn take_timed_out_in_flight_command(callback_id: jlong) -> Option<InFlightCommand> {
     let command = in_flight_commands().lock().remove(&callback_id);
+    if let Some(request_metrics) = command
+        .as_ref()
+        .and_then(|command| command.request_metrics.as_ref())
+    {
+        request_metrics.finish(NativeRequestMetricResult::Timeout);
+    }
+    command
+}
+
+fn log_callback_marked_timed_out(callback_id: jlong) {
+    let command = take_timed_out_in_flight_command(callback_id);
     match command {
         Some(command) => match command.details {
             InFlightCommandDetails::PendingSingle {
@@ -1558,65 +1692,61 @@ pub extern "system" fn Java_glide_ffi_resolvers_RequestMetricsResolver_configure
     buffer_capacity: jint,
     allowed_custom_commands: JObjectArray<'local>,
 ) -> jint {
-    handle_panics(
-        move || {
-            fn configure_request_metrics(
-                env: &mut JNIEnv<'_>,
-                sample_percentage: jint,
-                buffer_capacity: jint,
-                allowed_custom_commands: JObjectArray<'_>,
-            ) -> Result<jint, FFIError> {
-                if sample_percentage < 0 {
-                    return Ok(REQUEST_METRICS_STATUS_INVALID_SAMPLE_PERCENTAGE);
-                }
-                if buffer_capacity <= 0 {
-                    return Ok(REQUEST_METRICS_STATUS_INVALID_CAPACITY);
-                }
-                if allowed_custom_commands.is_null() {
-                    return Ok(REQUEST_METRICS_STATUS_INVALID_ALLOWED_CUSTOM_COMMAND);
-                }
-
-                let command_count = env.get_array_length(&allowed_custom_commands)?;
-                if command_count > MAX_ALLOWED_REQUEST_METRIC_CUSTOM_COMMANDS {
-                    return Ok(REQUEST_METRICS_STATUS_TOO_MANY_ALLOWED_CUSTOM_COMMANDS);
-                }
-
-                let mut commands = Vec::with_capacity(command_count as usize);
-                for index in 0..command_count {
-                    let command = env.with_local_frame(1, |env| {
-                        let command =
-                            env.get_object_array_element(&allowed_custom_commands, index)?;
-                        if command.is_null() {
-                            return Ok(None);
-                        }
-                        let command: String = env.get_string(&JString::from(command))?.into();
-                        Ok::<Option<Vec<u8>>, FFIError>(Some(command.into_bytes()))
-                    })?;
-                    let Some(command) = command else {
-                        return Ok(REQUEST_METRICS_STATUS_INVALID_ALLOWED_CUSTOM_COMMAND);
-                    };
-                    commands.push(command);
-                }
-                let command_refs = commands.iter().map(Vec::as_slice).collect::<Vec<_>>();
-                Ok(request_metrics_configuration_status(
-                    glide_core::native_request_metrics::configure_request_metrics(
-                        sample_percentage as u32,
-                        buffer_capacity as usize,
-                        &command_refs,
-                    ),
-                ))
+    run_ffi(|| {
+        fn configure_request_metrics(
+            env: &mut JNIEnv<'_>,
+            sample_percentage: jint,
+            buffer_capacity: jint,
+            allowed_custom_commands: JObjectArray<'_>,
+        ) -> Result<jint, FFIError> {
+            if sample_percentage < 0 {
+                return Ok(REQUEST_METRICS_STATUS_INVALID_SAMPLE_PERCENTAGE);
+            }
+            if buffer_capacity <= 0 {
+                return Ok(REQUEST_METRICS_STATUS_INVALID_CAPACITY);
+            }
+            if allowed_custom_commands.is_null() {
+                return Ok(REQUEST_METRICS_STATUS_INVALID_ALLOWED_CUSTOM_COMMAND);
             }
 
-            let result = configure_request_metrics(
-                &mut env,
-                sample_percentage,
-                buffer_capacity,
-                allowed_custom_commands,
-            );
-            handle_errors(&mut env, result)
-        },
-        "configureRequestMetrics",
-    )
+            let command_count = env.get_array_length(&allowed_custom_commands)?;
+            if command_count > MAX_ALLOWED_REQUEST_METRIC_CUSTOM_COMMANDS {
+                return Ok(REQUEST_METRICS_STATUS_TOO_MANY_ALLOWED_CUSTOM_COMMANDS);
+            }
+
+            let mut commands = Vec::with_capacity(command_count as usize);
+            for index in 0..command_count {
+                let command = env.with_local_frame(1, |env| {
+                    let command = env.get_object_array_element(&allowed_custom_commands, index)?;
+                    if command.is_null() {
+                        return Ok(None);
+                    }
+                    let command: String = env.get_string(&JString::from(command))?.into();
+                    Ok::<Option<Vec<u8>>, FFIError>(Some(command.into_bytes()))
+                })?;
+                let Some(command) = command else {
+                    return Ok(REQUEST_METRICS_STATUS_INVALID_ALLOWED_CUSTOM_COMMAND);
+                };
+                commands.push(command);
+            }
+            let command_refs = commands.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            Ok(request_metrics_configuration_status(
+                glide_core::native_request_metrics::configure_request_metrics(
+                    sample_percentage as u32,
+                    buffer_capacity as usize,
+                    &command_refs,
+                ),
+            ))
+        }
+
+        let result = configure_request_metrics(
+            &mut env,
+            sample_percentage,
+            buffer_capacity,
+            allowed_custom_commands,
+        );
+        handle_errors(&mut env, result)
+    })
     .unwrap_or(REQUEST_METRICS_STATUS_INVALID_ALLOWED_CUSTOM_COMMAND)
 }
 
@@ -1627,19 +1757,16 @@ pub extern "system" fn Java_glide_ffi_resolvers_RequestMetricsResolver_setReques
     _class: JClass<'_>,
     sample_percentage: jint,
 ) -> jint {
-    handle_panics(
-        move || {
-            if sample_percentage < 0 {
-                return Some(REQUEST_METRICS_STATUS_INVALID_SAMPLE_PERCENTAGE);
-            }
-            Some(request_metrics_configuration_status(
-                glide_core::native_request_metrics::set_request_metrics_sample_percentage(
-                    sample_percentage as u32,
-                ),
-            ))
-        },
-        "setRequestMetricsSamplePercentage",
-    )
+    run_ffi(|| {
+        if sample_percentage < 0 {
+            return Some(REQUEST_METRICS_STATUS_INVALID_SAMPLE_PERCENTAGE);
+        }
+        Some(request_metrics_configuration_status(
+            glide_core::native_request_metrics::set_request_metrics_sample_percentage(
+                sample_percentage as u32,
+            ),
+        ))
+    })
     .unwrap_or(REQUEST_METRICS_STATUS_NOT_CONFIGURED)
 }
 
@@ -2102,9 +2229,10 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_markTimedOut(
     _env: JNIEnv,
     _class: JClass,
     callback_id: jlong,
-) {
+) -> jni::sys::jboolean {
+    let native_owns_timeout = jni_client::mark_callback_timed_out(callback_id);
     log_callback_marked_timed_out(callback_id);
-    jni_client::mark_callback_timed_out(callback_id);
+    native_owns_timeout as jni::sys::jboolean
 }
 
 /// Execute a batch (pipeline/transaction) asynchronously.
@@ -2459,6 +2587,7 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeCommandAsync
     span_ptr: jlong,
 ) {
     run_ffi(|| {
+        let mut request_metrics_guard = start_request_metrics();
         let Some(jvm) = get_jvm_or_complete_error(&mut env, callback_id, "executeCommandAsync")
         else {
             return Some(());
@@ -2520,6 +2649,8 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeCommandAsync
                 return Some(());
             }
         };
+        request_metrics_guard.set_operation(request_type, &args_data);
+        let request_metrics = request_metrics_guard.context_for_spawn();
 
         // Extract route parameters
         let has_route_bool = has_route != 0;
@@ -2541,9 +2672,14 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeCommandAsync
             args_data.len(),
             expect_utf8_bool,
             span_ptr != 0,
+            request_metrics.clone(),
         );
 
+        let client_queue_timer = request_metrics
+            .as_ref()
+            .map(|context| context.start_phase(NativeRequestMetricPhase::ClientQueue));
         get_runtime().spawn(async move {
+            finish_client_queue_on_future_entry(client_queue_timer);
             let result: Result<redis::Value, redis::RedisError> = async {
                 let mut client = jni_client::ensure_client_for_handle(handle_id)
                     .await
@@ -2555,50 +2691,57 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeCommandAsync
                         ))
                     })?;
 
-                // Build redis::Cmd directly from requestType int and args
-                let proto_request_type = protobuf::EnumOrUnknown::<
-                    glide_core::command_request::RequestType,
-                >::from_i32(request_type);
-                let rt: glide_core::request_type::RequestType = proto_request_type.into();
-                let Some(mut cmd) = rt.get_command() else {
-                    return Err(redis::RedisError::from((
-                        redis::ErrorKind::ClientError,
-                        "Invalid request type",
-                        format!("request_type={}", request_type),
-                    )));
-                };
-                for arg in &args_data {
-                    cmd.arg(arg.as_slice());
-                }
-
-                // Apply compression
-                #[allow(clippy::collapsible_if)]
-                if client.is_compression_enabled() {
-                    if let Err(e) = process_command_for_compression(&mut cmd, &client) {
-                        if e.is_incompatible_command() {
+                let (mut cmd, routing) = time_command_prepare(
+                    request_metrics.as_ref(),
+                    || -> Result<_, redis::RedisError> {
+                        // Build redis::Cmd directly from requestType int and args
+                        let proto_request_type = protobuf::EnumOrUnknown::<
+                            glide_core::command_request::RequestType,
+                        >::from_i32(request_type);
+                        let rt: glide_core::request_type::RequestType = proto_request_type.into();
+                        let Some(mut cmd) = rt.get_command() else {
                             return Err(redis::RedisError::from((
                                 redis::ErrorKind::ClientError,
-                                "Incompatible command with compression",
-                                e.to_string(),
+                                "Invalid request type",
+                                format!("request_type={}", request_type),
                             )));
+                        };
+                        for arg in &args_data {
+                            cmd.arg(arg.as_slice());
                         }
-                    }
-                }
 
-                // Compute routing
-                let routing = routing::resolve_routing_from_params(
-                    has_route_bool,
-                    route_type_val,
-                    route_param_str.as_deref(),
-                    Some(&cmd),
-                )
-                .map_err(|e| {
-                    redis::RedisError::from((
-                        redis::ErrorKind::ClientError,
-                        "Routing error",
-                        e.to_string(),
-                    ))
-                })?;
+                        // Apply compression
+                        #[allow(clippy::collapsible_if)]
+                        if client.is_compression_enabled() {
+                            if let Err(e) = process_command_for_compression(&mut cmd, &client) {
+                                if e.is_incompatible_command() {
+                                    return Err(redis::RedisError::from((
+                                        redis::ErrorKind::ClientError,
+                                        "Incompatible command with compression",
+                                        e.to_string(),
+                                    )));
+                                }
+                            }
+                        }
+
+                        // Compute routing
+                        let routing = routing::resolve_routing_from_params(
+                            has_route_bool,
+                            route_type_val,
+                            route_param_str.as_deref(),
+                            Some(&cmd),
+                        )
+                        .map_err(|e| {
+                            redis::RedisError::from((
+                                redis::ErrorKind::ClientError,
+                                "Routing error",
+                                e.to_string(),
+                            ))
+                        })?;
+                        cmd.set_request_metrics(request_metrics.clone());
+                        Ok((cmd, routing))
+                    },
+                )?;
 
                 let command_name = redis_command_name(&cmd);
                 let command_arg_count = cmd.args_iter().len();
@@ -2637,7 +2780,10 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeCommandAsync
                         }
                     });
 
-                let result = client.send_command(&mut cmd, routing).await;
+                let send_command = time_command_prepare(request_metrics.as_ref(), || {
+                    client.send_command(&mut cmd, routing)
+                });
+                let result = send_command.await;
                 let command_elapsed_ms = elapsed_ms(command_started_at.elapsed());
                 log_single_command_completed(&log_context, command_elapsed_ms, &result);
 
@@ -2661,8 +2807,15 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeCommandAsync
                 }
             }
 
-            complete_callback(jvm, callback_id, result, !expect_utf8_bool);
+            jni_client::complete_callback_with_metrics(
+                jvm,
+                callback_id,
+                result,
+                !expect_utf8_bool,
+                request_metrics,
+            );
         });
+        request_metrics_guard.disarm_after_spawn();
 
         Some(())
     })
@@ -3593,6 +3746,7 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_getCacheMetrics(
         Some(())
     })
     .unwrap_or(())
+}
 
 #[cfg(test)]
 mod request_metrics_tests {

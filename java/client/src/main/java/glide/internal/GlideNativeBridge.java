@@ -127,8 +127,8 @@ public class GlideNativeBridge {
             boolean expectUtf8Response,
             long callbackId);
 
-    /** Mark a callback as timed out on the native side. */
-    public static native void markTimedOut(long callbackId);
+    /** Mark a callback as timed out on the native side and report whether native owns its state. */
+    public static native boolean markTimedOut(long callbackId);
 
     /** Get cache metrics */
     public static native void getCacheMetrics(long clientPtr, long callbackId, int metricsType);

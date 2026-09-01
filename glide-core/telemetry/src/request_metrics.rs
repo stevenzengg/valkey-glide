@@ -1,10 +1,11 @@
 use rand::Rng;
 use std::array;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use thiserror::Error;
+use tokio::time::Instant;
 
 pub const REQUEST_METRIC_PHASE_COUNT: usize = 12;
 pub const CUSTOM_COMMAND: &str = "CUSTOM_COMMAND";
@@ -78,6 +79,11 @@ impl BoundedOperation {
     /// Creates an allocation-free identity for a command known at compile time.
     pub const fn known(operation: &'static str) -> Self {
         Self(BoundedOperationKind::Known(operation))
+    }
+
+    /// Creates the static fallback identity for an unknown or unlisted command.
+    pub const fn custom_command() -> Self {
+        Self(BoundedOperationKind::CustomCommand)
     }
 }
 
@@ -168,7 +174,7 @@ impl RequestMetricsState {
         self: &Arc<Self>,
         operation: BoundedOperation,
     ) -> Option<Arc<RequestMetricContext>> {
-        self.start_with_sampler(operation, &mut ThreadLocalSampler)
+        self.start_pending().map(|pending| pending.bind(operation))
     }
 
     /// Starts a sampled request using an instance-scoped percentile source.
@@ -177,6 +183,20 @@ impl RequestMetricsState {
         operation: BoundedOperation,
         sampler: &mut S,
     ) -> Option<Arc<RequestMetricContext>> {
+        self.start_pending_with_sampler(sampler)
+            .map(|pending| pending.bind(operation))
+    }
+
+    /// Selects a request before its bounded operation is available.
+    pub fn start_pending(self: &Arc<Self>) -> Option<PendingRequestMetricContext> {
+        self.start_pending_with_sampler(&mut ThreadLocalSampler)
+    }
+
+    /// Selects a request with an instance-scoped sampler before binding its operation.
+    pub fn start_pending_with_sampler<S: Sampler>(
+        self: &Arc<Self>,
+        sampler: &mut S,
+    ) -> Option<PendingRequestMetricContext> {
         let sample_percentage = self.sample_percentage.load(Ordering::Relaxed);
         if sample_percentage == 0 {
             return None;
@@ -187,10 +207,10 @@ impl RequestMetricsState {
             return None;
         }
 
-        Some(Arc::new(RequestMetricContext::new(
-            operation,
-            Arc::clone(self),
-        )))
+        Some(PendingRequestMetricContext {
+            started_at: Instant::now(),
+            state: Arc::clone(self),
+        })
     }
 
     /// Resolves custom bytes to a pre-interned allow-list slot or the static fallback.
@@ -270,34 +290,102 @@ impl RequestMetricsState {
     }
 }
 
+/// A sampled request whose operation identity has not been parsed yet.
+///
+/// This value is intentionally move-only: consuming it to bind the operation makes
+/// the one-time handoff explicit without synchronization or a second sampling decision.
+pub struct PendingRequestMetricContext {
+    started_at: Instant,
+    state: Arc<RequestMetricsState>,
+}
+
+impl PendingRequestMetricContext {
+    pub fn bind(self, operation: BoundedOperation) -> Arc<RequestMetricContext> {
+        Arc::new(RequestMetricContext::new(
+            operation,
+            self.started_at,
+            self.state,
+        ))
+    }
+
+    /// Binds the operation and records an initial phase from the original sampled entry instant.
+    pub fn bind_and_record_phase(
+        self,
+        operation: BoundedOperation,
+        phase: RequestMetricPhase,
+    ) -> Arc<RequestMetricContext> {
+        let started_at = self.started_at;
+        let context = self.bind(operation);
+        context.record_phase_nanos(phase, duration_nanos(started_at.elapsed()).max(1));
+        context
+    }
+}
+
 pub struct RequestMetricContext {
     operation: BoundedOperation,
     started_at: Instant,
     phase_nanos: [AtomicU64; REQUEST_METRIC_PHASE_COUNT],
     attempt_count: AtomicU32,
-    finished: AtomicBool,
+    lifecycle: Mutex<RequestMetricLifecycle>,
     state: Arc<RequestMetricsState>,
 }
 
+struct RequestMetricLifecycle {
+    // This is the sole context-owned lock. No lifecycle method awaits or calls back into a phase
+    // owner while holding it; phase owners may therefore call context methods under their own
+    // locks without creating a reverse context-to-owner lock order.
+    finished: bool,
+    next_phase_id: u64,
+    active_phases: Vec<ActivePhase>,
+}
+
+struct ActivePhase {
+    id: u64,
+    phase: RequestMetricPhase,
+    started_at: Instant,
+}
+
 impl RequestMetricContext {
-    fn new(operation: BoundedOperation, state: Arc<RequestMetricsState>) -> Self {
+    fn new(
+        operation: BoundedOperation,
+        started_at: Instant,
+        state: Arc<RequestMetricsState>,
+    ) -> Self {
         Self {
             operation,
-            started_at: Instant::now(),
+            started_at,
             phase_nanos: array::from_fn(|_| AtomicU64::new(0)),
             attempt_count: AtomicU32::new(0),
-            finished: AtomicBool::new(false),
+            lifecycle: Mutex::new(RequestMetricLifecycle {
+                finished: false,
+                next_phase_id: 0,
+                active_phases: Vec::new(),
+            }),
             state,
         }
     }
 
     pub fn start_phase(self: &Arc<Self>, phase: RequestMetricPhase) -> PhaseTimer {
+        let started_at = Instant::now();
+        let phase_id = {
+            let mut lifecycle = self.lock_lifecycle();
+            if lifecycle.finished {
+                None
+            } else {
+                let id = lifecycle.next_phase_id;
+                lifecycle.next_phase_id = lifecycle.next_phase_id.wrapping_add(1);
+                lifecycle.active_phases.push(ActivePhase {
+                    id,
+                    phase,
+                    started_at,
+                });
+                Some(id)
+            }
+        };
         PhaseTimer {
             inner: Arc::new(PhaseTimerInner {
-                phase,
-                started_at: Instant::now(),
+                phase_id,
                 context: Arc::clone(self),
-                finished: AtomicBool::new(false),
             }),
         }
     }
@@ -311,22 +399,30 @@ impl RequestMetricContext {
     }
 
     pub fn add_attempts(&self, count: u32) {
-        saturating_add_u32(&self.attempt_count, count);
+        let lifecycle = self.lock_lifecycle();
+        if !lifecycle.finished {
+            saturating_add_u32(&self.attempt_count, count);
+        }
     }
 
     /// Completes this context once and enqueues a compact sample without blocking.
     pub fn finish(&self, result: RequestMetricResult) -> bool {
-        if self
-            .finished
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
-        {
+        let mut lifecycle = self.lock_lifecycle();
+        if lifecycle.finished {
             return false;
         }
+        lifecycle.finished = true;
 
-        self.record_phase_nanos(
+        let finished_at = Instant::now();
+        for active_phase in lifecycle.active_phases.drain(..) {
+            self.record_phase_nanos_uncoordinated(
+                active_phase.phase,
+                duration_nanos(finished_at.duration_since(active_phase.started_at)).max(1),
+            );
+        }
+        self.record_phase_nanos_uncoordinated(
             RequestMetricPhase::Total,
-            duration_nanos(self.started_at.elapsed()).max(1),
+            duration_nanos(finished_at.duration_since(self.started_at)).max(1),
         );
         let sample = RequestMetricSample {
             operation: self.operation,
@@ -347,7 +443,42 @@ impl RequestMetricContext {
     }
 
     fn record_phase_nanos(&self, phase: RequestMetricPhase, nanos: u64) {
+        let lifecycle = self.lock_lifecycle();
+        if lifecycle.finished {
+            return;
+        }
+        self.record_phase_nanos_uncoordinated(phase, nanos);
+    }
+
+    fn record_phase_nanos_uncoordinated(&self, phase: RequestMetricPhase, nanos: u64) {
         saturating_add_u64(&self.phase_nanos[phase.index()], nanos);
+    }
+
+    fn finish_phase(&self, phase_id: u64) -> bool {
+        let finished_at = Instant::now();
+        let mut lifecycle = self.lock_lifecycle();
+        if lifecycle.finished {
+            return false;
+        }
+        let Some(index) = lifecycle
+            .active_phases
+            .iter()
+            .position(|active_phase| active_phase.id == phase_id)
+        else {
+            return false;
+        };
+        let active_phase = lifecycle.active_phases.swap_remove(index);
+        self.record_phase_nanos_uncoordinated(
+            active_phase.phase,
+            duration_nanos(finished_at.duration_since(active_phase.started_at)).max(1),
+        );
+        true
+    }
+
+    fn lock_lifecycle(&self) -> std::sync::MutexGuard<'_, RequestMetricLifecycle> {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -357,10 +488,8 @@ pub struct PhaseTimer {
 }
 
 struct PhaseTimerInner {
-    phase: RequestMetricPhase,
-    started_at: Instant,
+    phase_id: Option<u64>,
     context: Arc<RequestMetricContext>,
-    finished: AtomicBool,
 }
 
 impl PhaseTimer {
@@ -372,16 +501,8 @@ impl PhaseTimer {
 
 impl PhaseTimerInner {
     fn finish(&self) -> bool {
-        if self
-            .finished
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
-        {
-            return false;
-        }
-        let elapsed = duration_nanos(self.started_at.elapsed()).max(1);
-        self.context.record_phase_nanos(self.phase, elapsed);
-        true
+        self.phase_id
+            .is_some_and(|phase_id| self.context.finish_phase(phase_id))
     }
 }
 

@@ -2,6 +2,8 @@
 package glide.api.models.metrics;
 
 import glide.api.models.exceptions.ConfigurationError;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.Set;
 import java.util.regex.Pattern;
 
@@ -21,7 +23,7 @@ public final class RequestMetricsConfiguration {
             int samplePercentage, int bufferCapacity, Set<String> allowedCustomCommands) {
         this.samplePercentage = samplePercentage;
         this.bufferCapacity = bufferCapacity;
-        this.allowedCustomCommands = Set.copyOf(allowedCustomCommands);
+        this.allowedCustomCommands = Collections.unmodifiableSet(new HashSet<>(allowedCustomCommands));
     }
 
     public static Builder builder() {
@@ -49,7 +51,7 @@ public final class RequestMetricsConfiguration {
     public static final class Builder {
         private int samplePercentage = DEFAULT_SAMPLE_PERCENTAGE;
         private int bufferCapacity = DEFAULT_BUFFER_CAPACITY;
-        private Set<String> allowedCustomCommands = Set.of();
+        private Set<String> allowedCustomCommands = Collections.emptySet();
 
         private Builder() {}
 
@@ -64,7 +66,8 @@ public final class RequestMetricsConfiguration {
         }
 
         public Builder allowedCustomCommands(Set<String> allowedCustomCommands) {
-            this.allowedCustomCommands = Set.copyOf(allowedCustomCommands);
+            this.allowedCustomCommands =
+                    Collections.unmodifiableSet(new HashSet<>(allowedCustomCommands));
             return this;
         }
 

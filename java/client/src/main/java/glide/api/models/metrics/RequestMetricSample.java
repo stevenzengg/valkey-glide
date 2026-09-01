@@ -1,6 +1,8 @@
 /** Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0 */
 package glide.api.models.metrics;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 
@@ -23,7 +25,9 @@ public final class RequestMetricSample {
         }
         this.attemptCount = attemptCount;
         this.phaseDurations =
-                List.copyOf(Objects.requireNonNull(phaseDurations, "phaseDurations must not be null"));
+                Collections.unmodifiableList(
+                        new ArrayList<>(
+                                Objects.requireNonNull(phaseDurations, "phaseDurations must not be null")));
     }
 
     public String getOperation() {

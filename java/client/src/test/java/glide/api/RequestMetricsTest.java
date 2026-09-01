@@ -15,11 +15,14 @@ import glide.api.models.metrics.RequestMetricSample;
 import glide.api.models.metrics.RequestMetricsConfiguration;
 import glide.ffi.resolvers.RequestMetricsResolver;
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import org.junit.jupiter.api.Test;
 
 class RequestMetricsTest {
@@ -42,7 +45,7 @@ class RequestMetricsTest {
                 ConfigurationError.class,
                 () ->
                         RequestMetricsConfiguration.builder()
-                                .allowedCustomCommands(Set.of("graph.query"))
+                                .allowedCustomCommands(Collections.singleton("graph.query"))
                                 .build());
         assertThrows(IllegalArgumentException.class, () -> RequestMetrics.drain(0));
         assertThrows(IllegalArgumentException.class, () -> RequestMetrics.drain(10_001));
@@ -50,16 +53,16 @@ class RequestMetricsTest {
 
     @Test
     void createsImmutableConfiguration() {
-        var config =
+        RequestMetricsConfiguration config =
                 RequestMetricsConfiguration.builder()
                         .samplePercentage(10)
                         .bufferCapacity(16_384)
-                        .allowedCustomCommands(Set.of("GRAPH.QUERY"))
+                        .allowedCustomCommands(Collections.singleton("GRAPH.QUERY"))
                         .build();
 
         assertEquals(10, config.getSamplePercentage());
         assertEquals(16_384, config.getBufferCapacity());
-        assertEquals(Set.of("GRAPH.QUERY"), config.getAllowedCustomCommands());
+        assertEquals(Collections.singleton("GRAPH.QUERY"), config.getAllowedCustomCommands());
         assertThrows(
                 UnsupportedOperationException.class, () -> config.getAllowedCustomCommands().add("GET"));
     }
@@ -72,11 +75,13 @@ class RequestMetricsTest {
 
     @Test
     void createsImmutableValueModelsAndDefensivelyCopiesSamples() {
-        var duration = new RequestMetricPhaseDuration(RequestMetricPhase.TOTAL, 42);
-        var durations = new ArrayList<>(List.of(duration));
-        var sample = new RequestMetricSample("GET", RequestMetricResult.SUCCESS, 1, durations);
-        var samples = new ArrayList<>(List.of(sample));
-        var batch = new RequestMetricBatch(samples, 2, 3, true);
+        RequestMetricPhaseDuration duration =
+                new RequestMetricPhaseDuration(RequestMetricPhase.TOTAL, 42);
+        List<RequestMetricPhaseDuration> durations = new ArrayList<>(Arrays.asList(duration));
+        RequestMetricSample sample =
+                new RequestMetricSample("GET", RequestMetricResult.SUCCESS, 1, durations);
+        List<RequestMetricSample> samples = new ArrayList<>(Arrays.asList(sample));
+        RequestMetricBatch batch = new RequestMetricBatch(samples, 2, 3, true);
 
         durations.clear();
         samples.clear();
@@ -86,12 +91,12 @@ class RequestMetricsTest {
         assertEquals("GET", sample.getOperation());
         assertEquals(RequestMetricResult.SUCCESS, sample.getResult());
         assertEquals(1, sample.getAttemptCount());
-        assertEquals(List.of(duration), sample.getPhaseDurations());
-        assertEquals(List.of(sample), batch.getSamples());
+        assertEquals(Arrays.asList(duration), sample.getPhaseDurations());
+        assertEquals(Arrays.asList(sample), batch.getSamples());
         assertEquals(2, batch.getDroppedSamples());
         assertEquals(3, batch.getRemainingSamples());
         assertTrue(batch.getHasMore());
-        assertFalse(new RequestMetricBatch(List.of(), 0, 0, false).getHasMore());
+        assertFalse(new RequestMetricBatch(Collections.emptyList(), 0, 0, false).getHasMore());
         assertThrows(
                 UnsupportedOperationException.class, () -> sample.getPhaseDurations().add(duration));
         assertThrows(UnsupportedOperationException.class, () -> batch.getSamples().add(sample));
@@ -100,14 +105,17 @@ class RequestMetricsTest {
                 () -> new RequestMetricPhaseDuration(RequestMetricPhase.TOTAL, -1));
         assertThrows(
                 IllegalArgumentException.class,
-                () -> new RequestMetricSample("GET", RequestMetricResult.SUCCESS, -1, List.of()));
+                () ->
+                        new RequestMetricSample(
+                                "GET", RequestMetricResult.SUCCESS, -1, Collections.emptyList()));
         assertThrows(
-                IllegalArgumentException.class, () -> new RequestMetricBatch(List.of(), -1, 0, false));
+                IllegalArgumentException.class,
+                () -> new RequestMetricBatch(Collections.emptyList(), -1, 0, false));
     }
 
     @Test
     void decodesNativeProtobufBatchIntoImmutableModels() {
-        var protobufBatch =
+        request_metrics.RequestMetrics.RequestMetricBatch protobufBatch =
                 request_metrics.RequestMetrics.RequestMetricBatch.newBuilder()
                         .addSamples(
                                 request_metrics.RequestMetrics.RequestMetricSample.newBuilder()
@@ -139,7 +147,7 @@ class RequestMetricsTest {
                                         .build())
                         .build();
 
-        var batch = RequestMetrics.decodeDrainResponse(protobufBatch.toByteArray());
+        RequestMetricBatch batch = RequestMetrics.decodeDrainResponse(protobufBatch.toByteArray());
 
         assertEquals(3, batch.getDroppedSamples());
         assertEquals(4, batch.getRemainingSamples());
@@ -156,22 +164,22 @@ class RequestMetricsTest {
 
     @Test
     void mapsEveryNativeConfigurationStatusToAStableMessage() throws ReflectiveOperationException {
-        var mapper =
+        Method mapper =
                 RequestMetrics.class.getDeclaredMethod("throwForNonzeroStatus", int.class, String.class);
         mapper.setAccessible(true);
-        var expectedMessages =
-                Map.of(
-                        1, "Request metrics sample percentage must be between 0 and 100.",
-                        2, "Request metrics buffer capacity must be between 1 and 1000000.",
-                        3, "Request metrics allows at most 64 custom commands.",
-                        4, "Request metrics custom commands must match [A-Z0-9_.-]{1,64}.",
-                        5,
-                                "Request metrics are already configured with a different buffer capacity or"
-                                        + " custom-command allow-list.",
-                        6, "Request metrics have not been configured.");
+        Map<Integer, String> expectedMessages = new LinkedHashMap<>();
+        expectedMessages.put(1, "Request metrics sample percentage must be between 0 and 100.");
+        expectedMessages.put(2, "Request metrics buffer capacity must be between 1 and 1000000.");
+        expectedMessages.put(3, "Request metrics allows at most 64 custom commands.");
+        expectedMessages.put(4, "Request metrics custom commands must match [A-Z0-9_.-]{1,64}.");
+        expectedMessages.put(
+                5,
+                "Request metrics are already configured with a different buffer capacity or"
+                        + " custom-command allow-list.");
+        expectedMessages.put(6, "Request metrics have not been configured.");
 
-        for (var entry : expectedMessages.entrySet()) {
-            var thrown =
+        for (Map.Entry<Integer, String> entry : expectedMessages.entrySet()) {
+            InvocationTargetException thrown =
                     assertThrows(
                             InvocationTargetException.class,
                             () -> mapper.invoke(null, entry.getKey(), "fallback"));
@@ -182,13 +190,13 @@ class RequestMetricsTest {
 
     @Test
     void exposesRustFriendlyNativeResolverContract() throws ReflectiveOperationException {
-        var configure =
+        Method configure =
                 RequestMetricsResolver.class.getDeclaredMethod(
                         "configureRequestMetrics", int.class, int.class, String[].class);
-        var update =
+        Method update =
                 RequestMetricsResolver.class.getDeclaredMethod(
                         "setRequestMetricsSamplePercentage", int.class);
-        var drain = RequestMetricsResolver.class.getDeclaredMethod("drainRequestMetrics", int.class);
+        Method drain = RequestMetricsResolver.class.getDeclaredMethod("drainRequestMetrics", int.class);
 
         assertTrue(Modifier.isNative(configure.getModifiers()));
         assertEquals(int.class, configure.getReturnType());

@@ -10,9 +10,12 @@ import glide.api.models.exceptions.ConfigurationError;
 import glide.api.models.metrics.RequestMetricBatch;
 import glide.api.models.metrics.RequestMetricsConfiguration;
 import java.io.File;
+import java.net.URL;
 import java.net.URLClassLoader;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.Set;
@@ -36,8 +39,7 @@ class RequestMetricsResolverTest {
                                     "-Xcheck:jni",
                                     "-cp",
                                     currentTestClasspath(),
-                                    IsolatedRequestMetricsLifecycle.class.getName(),
-                                    Long.toString(ProcessHandle.current().pid()))
+                                    IsolatedRequestMetricsLifecycle.class.getName())
                             .redirectErrorStream(true)
                             .redirectOutput(outputFile.toFile())
                             .start();
@@ -47,7 +49,7 @@ class RequestMetricsResolverTest {
                 child.destroyForcibly();
                 child.waitFor(10, TimeUnit.SECONDS);
             }
-            String output = Files.readString(outputFile);
+            String output = new String(Files.readAllBytes(outputFile), StandardCharsets.UTF_8);
 
             assertTrue(exited, () -> "Child JVM timed out. Output:\n" + output);
             assertEquals(0, child.exitValue(), () -> "Child JVM failed. Output:\n" + output);
@@ -66,7 +68,7 @@ class RequestMetricsResolverTest {
 
     private static String javaExecutable() {
         String executable = System.getProperty("os.name").startsWith("Windows") ? "java.exe" : "java";
-        return Path.of(System.getProperty("java.home"), "bin", executable).toString();
+        return Paths.get(System.getProperty("java.home"), "bin", executable).toString();
     }
 
     private static String currentTestClasspath() throws Exception {
@@ -75,9 +77,9 @@ class RequestMetricsResolverTest {
                 loader != null;
                 loader = loader.getParent()) {
             if (loader instanceof URLClassLoader) {
-                for (var url : ((URLClassLoader) loader).getURLs()) {
+                for (URL url : ((URLClassLoader) loader).getURLs()) {
                     if ("file".equals(url.getProtocol())) {
-                        entries.add(Path.of(url.toURI()).toString());
+                        entries.add(Paths.get(url.toURI()).toString());
                     }
                 }
             }
@@ -97,11 +99,6 @@ class RequestMetricsResolverTest {
         private IsolatedRequestMetricsLifecycle() {}
 
         public static void main(String[] arguments) {
-            long parentPid = Long.parseLong(arguments[0]);
-            require(
-                    ProcessHandle.current().pid() != parentPid,
-                    "request metrics lifecycle must run in a child JVM");
-
             requireStatus(
                     1, RequestMetricsResolver.configureRequestMetrics(-1, BUFFER_CAPACITY, new String[0]));
             requireStatus(2, RequestMetricsResolver.configureRequestMetrics(100, -1, new String[0]));
@@ -156,13 +153,8 @@ class RequestMetricsResolverTest {
             requireStatus(
                     5,
                     RequestMetricsResolver.configureRequestMetrics(
-                            100, BUFFER_CAPACITY + 1, allowedCustomCommands.toArray(String[]::new)));
-            System.out.println(
-                    SUCCESS_MARKER
-                            + " pid="
-                            + ProcessHandle.current().pid()
-                            + " allowedCustomCommands="
-                            + allowedCustomCommands.size());
+                            100, BUFFER_CAPACITY + 1, allowedCustomCommands.toArray(new String[0])));
+            System.out.println(SUCCESS_MARKER + " allowedCustomCommands=" + allowedCustomCommands.size());
         }
 
         private static void expectIllegalArgument(Runnable action) {

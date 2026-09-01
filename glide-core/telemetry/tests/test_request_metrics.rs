@@ -167,6 +167,69 @@ fn cloned_phase_timer_records_exactly_once() {
     assert!(sample.phase_duration(RequestMetricPhase::ClientQueue) > 0);
 }
 
+#[tokio::test(start_paused = true)]
+async fn finish_closes_active_phases_and_rejects_late_mutations() {
+    let state = state(100, 1, &[]);
+    let context = state
+        .start_with_sampler(
+            BoundedOperation::known("GET"),
+            &mut SequenceSampler::new([]),
+        )
+        .unwrap();
+    let timer = context.start_phase(RequestMetricPhase::ConnectionWait);
+
+    tokio::time::advance(Duration::from_millis(7)).await;
+    assert!(context.finish(RequestMetricResult::Cancelled));
+
+    tokio::time::advance(Duration::from_millis(11)).await;
+    assert!(!timer.finish());
+    context.record_phase_duration(RequestMetricPhase::CoreDecode, Duration::from_millis(13));
+    context.increment_attempt_count();
+    let late_timer = context.start_phase(RequestMetricPhase::RetryBackoff);
+    tokio::time::advance(Duration::from_millis(17)).await;
+    assert!(!late_timer.finish());
+    assert!(!context.finish(RequestMetricResult::Failure));
+
+    let drain = state.drain(1).unwrap();
+    let sample = &drain.samples()[0];
+    assert_eq!(
+        sample.phase_duration(RequestMetricPhase::ConnectionWait),
+        7_000_000
+    );
+    assert_eq!(sample.phase_duration(RequestMetricPhase::CoreDecode), 0);
+    assert_eq!(sample.phase_duration(RequestMetricPhase::RetryBackoff), 0);
+    assert_eq!(sample.attempt_count(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn sequential_phase_timers_accumulate_controlled_intervals_exactly_once() {
+    let state = state(100, 1, &[]);
+    let context = state
+        .start_with_sampler(
+            BoundedOperation::known("GET"),
+            &mut SequenceSampler::new([]),
+        )
+        .unwrap();
+
+    let first = context.start_phase(RequestMetricPhase::RetryBackoff);
+    let first_clone = first.clone();
+    tokio::time::advance(Duration::from_millis(3)).await;
+    assert!(first_clone.finish());
+    tokio::time::advance(Duration::from_millis(11)).await;
+    assert!(!first.finish());
+
+    let second = context.start_phase(RequestMetricPhase::RetryBackoff);
+    tokio::time::advance(Duration::from_millis(5)).await;
+    assert!(second.finish());
+    assert!(context.finish(RequestMetricResult::Success));
+
+    let drain = state.drain(1).unwrap();
+    assert_eq!(
+        drain.samples()[0].phase_duration(RequestMetricPhase::RetryBackoff),
+        8_000_000
+    );
+}
+
 #[test]
 fn finish_is_exactly_once_and_preserves_each_terminal_result() {
     let state = state(100, 4, &[]);

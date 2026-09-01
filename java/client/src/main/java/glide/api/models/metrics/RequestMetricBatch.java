@@ -1,6 +1,8 @@
 /** Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0 */
 package glide.api.models.metrics;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 
@@ -16,7 +18,9 @@ public final class RequestMetricBatch {
             long droppedSamples,
             long remainingSamples,
             boolean hasMore) {
-        this.samples = List.copyOf(Objects.requireNonNull(samples, "samples must not be null"));
+        this.samples =
+                Collections.unmodifiableList(
+                        new ArrayList<>(Objects.requireNonNull(samples, "samples must not be null")));
         if (droppedSamples < 0) {
             throw new IllegalArgumentException("droppedSamples must not be negative");
         }
