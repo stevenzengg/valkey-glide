@@ -958,6 +958,7 @@ where
     }
 
     // `None` means that the stream was out of items causing that poll loop to shut down.
+    #[cfg(test)]
     async fn send_single(
         &mut self,
         item: SinkItem,
