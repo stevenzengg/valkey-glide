@@ -710,21 +710,20 @@ public class CommandManager {
                 spanPtr = OpenTelemetryResolver.createLeakedOtelSpan(requestType.name());
             }
 
-            CompletableFuture<Object> jniFuture =
-                    coreClient.executeCommandAsync(
-                            requestType.getNumber(),
-                            args,
-                            routeArgs.hasRoute,
-                            routeArgs.routeType,
-                            routeArgs.routeParam,
-                            expectUtf8Response,
-                            coreClient.getRequestTimeoutMillis(),
-                            spanPtr);
-
-            return jniFuture
-                    .thenApply(result -> buildResponseFromJniResult(result, expectUtf8Response))
-                    .thenApply(response -> applyHandlerWithCleanup(response, responseHandler))
-                    .exceptionally(this::exceptionHandler);
+            return coreClient.executeCommandAsync(
+                    requestType.getNumber(),
+                    args,
+                    routeArgs.hasRoute,
+                    routeArgs.routeType,
+                    routeArgs.routeParam,
+                    expectUtf8Response,
+                    coreClient.getRequestTimeoutMillis(),
+                    spanPtr,
+                    jniFuture ->
+                            jniFuture
+                                    .thenApply(result -> buildResponseFromJniResult(result, expectUtf8Response))
+                                    .thenApply(response -> applyHandlerWithCleanup(response, responseHandler))
+                                    .exceptionally(this::exceptionHandler));
         } catch (Exception e) {
             CompletableFuture<T> errorFuture = new CompletableFuture<T>();
             errorFuture.completeExceptionally(e);
@@ -755,21 +754,20 @@ public class CommandManager {
                 spanPtr = OpenTelemetryResolver.createLeakedOtelSpan(requestType.name());
             }
 
-            CompletableFuture<Object> jniFuture =
-                    coreClient.executeCommandAsync(
-                            requestType.getNumber(),
-                            args,
-                            routeArgs.hasRoute,
-                            routeArgs.routeType,
-                            routeArgs.routeParam,
-                            expectUtf8Response,
-                            0,
-                            spanPtr);
-
-            return jniFuture
-                    .thenApply(result -> buildResponseFromJniResult(result, expectUtf8Response))
-                    .thenApply(response -> applyHandlerWithCleanup(response, responseHandler))
-                    .exceptionally(this::exceptionHandler);
+            return coreClient.executeCommandAsync(
+                    requestType.getNumber(),
+                    args,
+                    routeArgs.hasRoute,
+                    routeArgs.routeType,
+                    routeArgs.routeParam,
+                    expectUtf8Response,
+                    0,
+                    spanPtr,
+                    jniFuture ->
+                            jniFuture
+                                    .thenApply(result -> buildResponseFromJniResult(result, expectUtf8Response))
+                                    .thenApply(response -> applyHandlerWithCleanup(response, responseHandler))
+                                    .exceptionally(this::exceptionHandler));
         } catch (Exception e) {
             CompletableFuture<T> errorFuture = new CompletableFuture<T>();
             errorFuture.completeExceptionally(e);

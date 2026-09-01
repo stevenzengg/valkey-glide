@@ -68,7 +68,8 @@ public final class AsyncRegistry {
         TIMEOUT(1),
         CANCELLED(2),
         FAILURE(3),
-        TIMEOUT_MARK_MISSED(4);
+        TIMEOUT_MARK_MISSED(4),
+        NATIVE_TIMEOUT(5);
 
         private final int nativeCode;
 
@@ -79,17 +80,33 @@ public final class AsyncRegistry {
 
     private static final class CompletionState {
         private final CompletableFuture<Object> future;
+        private final CompletableFuture<?> terminalFuture;
         private CompletionOutcome internallyCompletedAs;
 
-        private CompletionState(CompletableFuture<Object> future) {
+        private CompletionState(CompletableFuture<Object> future, CompletableFuture<?> terminalFuture) {
             this.future = future;
+            this.terminalFuture = terminalFuture;
+        }
+
+        private CompletionOutcome acceptedCompletionOutcome(CompletionOutcome deliveredAs) {
+            if (terminalFuture != future && terminalFuture.isCancelled()) {
+                return CompletionOutcome.CANCELLED;
+            }
+            if (deliveredAs != CompletionOutcome.NATIVE_TIMEOUT
+                    && terminalFuture != future
+                    && terminalFuture.isCompletedExceptionally()) {
+                return CompletionOutcome.FAILURE;
+            }
+            return deliveredAs;
         }
 
         private CompletionOutcome rejectedCompletionOutcome() {
             if (internallyCompletedAs != null) {
                 return internallyCompletedAs;
             }
-            return future.isCancelled() ? CompletionOutcome.CANCELLED : CompletionOutcome.FAILURE;
+            return terminalFuture.isCancelled() || future.isCancelled()
+                    ? CompletionOutcome.CANCELLED
+                    : CompletionOutcome.FAILURE;
         }
     }
 
@@ -300,8 +317,25 @@ public final class AsyncRegistry {
      */
     public static <T> long register(
             CompletableFuture<T> future, int maxInflightRequests, long clientHandle, long timeoutMillis) {
+        return register(future, future, maxInflightRequests, clientHandle, timeoutMillis);
+    }
+
+    /**
+     * Register a native completion future and the terminal command future returned to the caller. The
+     * terminal future lets callback metrics include synchronous response handling and preserve
+     * caller-visible cancellation/failure outcomes.
+     */
+    public static <T, R> long register(
+            CompletableFuture<T> future,
+            CompletableFuture<R> terminalFuture,
+            int maxInflightRequests,
+            long clientHandle,
+            long timeoutMillis) {
         if (future == null) {
             throw new IllegalArgumentException("Future cannot be null");
+        }
+        if (terminalFuture == null) {
+            throw new IllegalArgumentException("Terminal future cannot be null");
         }
 
         // Check shutdown flag before registering to prevent race conditions
@@ -326,7 +360,7 @@ public final class AsyncRegistry {
 
         // Store original future for completion by native code
         activeFutures.put(correlationId, originalFuture);
-        completionStates.put(correlationId, new CompletionState(originalFuture));
+        completionStates.put(correlationId, new CompletionState(originalFuture, terminalFuture));
         registrationTimestamps.put(correlationId, System.nanoTime());
         logLifecycle(
                 Logger.Level.DEBUG,
@@ -361,6 +395,14 @@ public final class AsyncRegistry {
         // Set up cleanup on the original future
         // This ensures proper resource cleanup when completed
         setupCleanup(correlationId, originalFuture, maxInflightRequests, clientHandle);
+        if (terminalFuture != future) {
+            terminalFuture.whenComplete(
+                    (result, error) -> {
+                        if (terminalFuture.isCancelled()) {
+                            originalFuture.cancel(false);
+                        }
+                    });
+        }
 
         return correlationId;
     }
@@ -525,7 +567,7 @@ public final class AsyncRegistry {
         synchronized (state) {
             outcome =
                     state.future.complete(result)
-                            ? CompletionOutcome.COMPLETED
+                            ? state.acceptedCompletionOutcome(CompletionOutcome.COMPLETED)
                             : state.rejectedCompletionOutcome();
         }
         completionStates.remove(correlationId, state);
@@ -634,9 +676,11 @@ public final class AsyncRegistry {
                         + jsonString(msg));
         CompletionOutcome outcome;
         synchronized (state) {
+            CompletionOutcome deliveredAs =
+                    errorTypeCode == 2 ? CompletionOutcome.NATIVE_TIMEOUT : CompletionOutcome.COMPLETED;
             outcome =
                     state.future.completeExceptionally(ex)
-                            ? CompletionOutcome.COMPLETED
+                            ? state.acceptedCompletionOutcome(deliveredAs)
                             : state.rejectedCompletionOutcome();
         }
         completionStates.remove(correlationId, state);

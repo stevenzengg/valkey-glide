@@ -636,6 +636,7 @@ enum JavaCompletionOutcome {
     Cancelled,
     Failure,
     TimeoutMarkMissed,
+    NativeTimeout,
 }
 
 impl TryFrom<jint> for JavaCompletionOutcome {
@@ -648,6 +649,7 @@ impl TryFrom<jint> for JavaCompletionOutcome {
             2 => Ok(Self::Cancelled),
             3 => Ok(Self::Failure),
             4 => Ok(Self::TimeoutMarkMissed),
+            5 => Ok(Self::NativeTimeout),
             _ => Err(anyhow::anyhow!(
                 "Unknown Java callback completion outcome: {value}"
             )),
@@ -694,7 +696,9 @@ fn classify_callback_completion(
         | CallbackCompletion::Java(JavaCompletionOutcome::Failure)
         | CallbackCompletion::Failed(_) => RequestMetricResult::Failure,
         CallbackCompletion::Java(
-            JavaCompletionOutcome::Timeout | JavaCompletionOutcome::TimeoutMarkMissed,
+            JavaCompletionOutcome::Timeout
+            | JavaCompletionOutcome::TimeoutMarkMissed
+            | JavaCompletionOutcome::NativeTimeout,
         )
         | CallbackCompletion::TimedOutByMarker => RequestMetricResult::Timeout,
         CallbackCompletion::Java(JavaCompletionOutcome::Cancelled) => {
@@ -2073,6 +2077,11 @@ mod callback_metrics_tests {
             (
                 true,
                 CallbackCompletion::Java(JavaCompletionOutcome::TimeoutMarkMissed),
+                RequestMetricResult::Timeout,
+            ),
+            (
+                false,
+                CallbackCompletion::Java(JavaCompletionOutcome::NativeTimeout),
                 RequestMetricResult::Timeout,
             ),
             (

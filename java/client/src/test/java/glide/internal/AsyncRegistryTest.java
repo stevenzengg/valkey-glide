@@ -25,6 +25,7 @@ public class AsyncRegistryTest {
     private static final int CANCELLED = 2;
     private static final int FAILURE = 3;
     private static final int TIMEOUT_MARK_MISSED = 4;
+    private static final int NATIVE_TIMEOUT = 5;
 
     @BeforeEach
     void setUp() {
@@ -286,6 +287,42 @@ public class AsyncRegistryTest {
         externallyFailed.completeExceptionally(new IllegalStateException("external failure"));
         assertEquals(
                 FAILURE, AsyncRegistry.completeCallbackForNative(externallyFailedId, "late response"));
+    }
+
+    @Test
+    void terminalCommandFutureControlsCancellationAndHandlerFailureOutcomes() {
+        CompletableFuture<Object> cancellationRoot = new CompletableFuture<>();
+        CompletableFuture<String> cancelledCommand = cancellationRoot.thenApply(Object::toString);
+        long cancelledId = AsyncRegistry.register(cancellationRoot, cancelledCommand, 0, 17L, 0);
+
+        cancelledCommand.cancel(false);
+
+        assertTrue(cancellationRoot.isCancelled());
+        assertEquals(CANCELLED, AsyncRegistry.completeCallbackForNative(cancelledId, "late response"));
+
+        CompletableFuture<Object> handlerFailureRoot = new CompletableFuture<>();
+        CompletableFuture<String> failedCommand =
+                handlerFailureRoot.thenApply(
+                        ignored -> {
+                            throw new IllegalStateException("handler failed");
+                        });
+        long failedId = AsyncRegistry.register(handlerFailureRoot, failedCommand, 0, 17L, 0);
+
+        assertEquals(FAILURE, AsyncRegistry.completeCallbackForNative(failedId, "response"));
+        assertTrue(failedCommand.isCompletedExceptionally());
+    }
+
+    @Test
+    void nativeTimeoutDeliveryHasADistinctTerminalOutcome() {
+        CompletableFuture<Object> root = new CompletableFuture<>();
+        CompletableFuture<String> command = root.thenApply(Object::toString);
+        long correlationId = AsyncRegistry.register(root, command, 0, 17L, 0);
+
+        assertEquals(
+                NATIVE_TIMEOUT,
+                AsyncRegistry.completeCallbackWithErrorCodeForNative(
+                        correlationId, 2, "core request timed out"));
+        assertTrue(command.isCompletedExceptionally());
     }
 
     @Test

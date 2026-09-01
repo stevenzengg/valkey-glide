@@ -290,7 +290,7 @@ impl AttemptMetricCompletion {
     {
         let mut state = self.state.lock().expect("attempt metrics mutex poisoned");
         if matches!(*state, AttemptMetricState::Finished) {
-            return Ok(None);
+            return start_send().map(|()| None);
         }
         debug_assert!(matches!(*state, AttemptMetricState::Pending));
 
@@ -799,7 +799,6 @@ where
         };
 
         match start_result {
-            Ok((None, Some(_))) => Ok(()),
             Ok((pending_flush, request_metrics)) => {
                 if let Some(socket_write) = pending_flush {
                     self_.pending_flush_metrics.push(socket_write);
@@ -3167,6 +3166,27 @@ mod request_metrics_tests {
         assert_eq!(sample.phase_duration(RequestMetricPhase::SocketWrite), 0);
         assert_eq!(sample.phase_duration(RequestMetricPhase::ResponseWait), 0);
         assert_eq!(sample.attempt_count(), 0);
+    }
+
+    #[test]
+    fn finished_metrics_never_suppress_the_underlying_send() {
+        let state = state();
+        let context = context(&state);
+        let (message, _receiver) = message(Some(Arc::clone(&context)), None, false);
+        let completion = Arc::clone(&message.request_metrics.as_ref().unwrap().attempt_completion);
+        assert!(!completion.finish());
+        assert!(context.finish(RequestMetricResult::Cancelled));
+        let mut sink = sink();
+
+        Pin::new(&mut sink).start_send(message).unwrap();
+
+        assert_eq!(sink.sink_stream.sent, 1);
+        assert_eq!(sink.in_flight.len(), 1);
+        assert!(sink.pending_flush_metrics.is_empty());
+        let sample = drain_sample(&state);
+        assert_eq!(sample.attempt_count(), 0);
+        assert_eq!(sample.phase_duration(RequestMetricPhase::SocketWrite), 0);
+        assert_eq!(sample.phase_duration(RequestMetricPhase::ResponseWait), 0);
     }
 
     #[tokio::test(start_paused = true)]

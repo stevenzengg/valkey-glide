@@ -9,10 +9,12 @@ import glide.ffi.resolvers.NativeUtils;
 import java.lang.ref.PhantomReference;
 import java.lang.ref.ReferenceQueue;
 import java.lang.ref.WeakReference;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
 
 /**
  * GLIDE core client transport. Provides direct native access to glide-core with all routing and
@@ -367,22 +369,61 @@ public class GlideCoreClient implements AutoCloseable {
             boolean expectUtf8Response,
             long timeoutMs,
             long spanPtr) {
+        return executeCommandAsync(
+                requestType,
+                args,
+                hasRoute,
+                routeType,
+                routeParam,
+                expectUtf8Response,
+                timeoutMs,
+                spanPtr,
+                future -> future);
+    }
+
+    /**
+     * Execute a single command and register the terminal command future before native dispatch. This
+     * preserves caller-visible cancellation and synchronous response-handler failures in the callback
+     * outcome returned to native metrics.
+     */
+    public <T> CompletableFuture<T> executeCommandAsync(
+            int requestType,
+            byte[][] args,
+            boolean hasRoute,
+            int routeType,
+            String routeParam,
+            boolean expectUtf8Response,
+            long timeoutMs,
+            long spanPtr,
+            Function<CompletableFuture<Object>, CompletableFuture<T>> terminalPipeline) {
+        CompletableFuture<Object> future = new CompletableFuture<>();
+        CompletableFuture<T> terminalFuture;
+        try {
+            terminalFuture =
+                    Objects.requireNonNull(
+                            terminalPipeline.apply(future), "Terminal command future must not be null");
+        } catch (Exception e) {
+            CompletableFuture<T> errorFuture = new CompletableFuture<>();
+            errorFuture.completeExceptionally(e);
+            return errorFuture;
+        }
+
         try {
             long handle = nativeClientHandle.get();
             if (handle == 0) {
-                CompletableFuture<Object> future = new CompletableFuture<>();
                 future.completeExceptionally(
                         new glide.api.models.exceptions.ClosingException("Client is closed"));
-                return future;
+                return terminalFuture;
             }
 
-            CompletableFuture<Object> future = new CompletableFuture<>();
             long correlationId;
             try {
-                correlationId = AsyncRegistry.register(future, this.maxInflightRequests, handle, timeoutMs);
+                correlationId =
+                        AsyncRegistry.register(
+                                future, terminalFuture, this.maxInflightRequests, handle, timeoutMs);
             } catch (glide.api.models.exceptions.RequestException e) {
                 future.completeExceptionally(e);
-                return future;
+                return terminalFuture;
             }
 
             GlideNativeBridge.executeCommandAsync(
@@ -396,12 +437,11 @@ public class GlideCoreClient implements AutoCloseable {
                     expectUtf8Response,
                     spanPtr);
 
-            return future;
+            return terminalFuture;
 
         } catch (Exception e) {
-            CompletableFuture<Object> future = new CompletableFuture<>();
             future.completeExceptionally(e);
-            return future;
+            return terminalFuture;
         }
     }
 
