@@ -1,6 +1,7 @@
 /** Copyright Valkey GLIDE Project Contributors - SPDX Identifier: Apache-2.0 */
 package glide.api;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -29,6 +30,9 @@ class RequestMetricsTest {
 
     @Test
     void rejectsInvalidConfigurationAndDrainArguments() {
+        String commandAtMaximumLength = String.join("", Collections.nCopies(64, "A"));
+        String commandOverMaximumLength = String.join("", Collections.nCopies(65, "A"));
+
         assertThrows(
                 ConfigurationError.class,
                 () -> RequestMetricsConfiguration.builder().samplePercentage(-1).build());
@@ -46,6 +50,17 @@ class RequestMetricsTest {
                 () ->
                         RequestMetricsConfiguration.builder()
                                 .allowedCustomCommands(Collections.singleton("graph.query"))
+                                .build());
+        assertDoesNotThrow(
+                () ->
+                        RequestMetricsConfiguration.builder()
+                                .allowedCustomCommands(Collections.singleton(commandAtMaximumLength))
+                                .build());
+        assertThrows(
+                ConfigurationError.class,
+                () ->
+                        RequestMetricsConfiguration.builder()
+                                .allowedCustomCommands(Collections.singleton(commandOverMaximumLength))
                                 .build());
         assertThrows(IllegalArgumentException.class, () -> RequestMetrics.drain(0));
         assertThrows(IllegalArgumentException.class, () -> RequestMetrics.drain(10_001));

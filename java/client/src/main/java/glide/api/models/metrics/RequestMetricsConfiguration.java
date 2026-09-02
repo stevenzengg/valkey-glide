@@ -13,7 +13,7 @@ public final class RequestMetricsConfiguration {
     public static final int DEFAULT_BUFFER_CAPACITY = 16_384;
     private static final int MAX_BUFFER_CAPACITY = 1_000_000;
     private static final int MAX_ALLOWED_CUSTOM_COMMANDS = 64;
-    private static final Pattern CUSTOM_COMMAND_PATTERN = Pattern.compile("[A-Z][A-Z0-9._-]*");
+    private static final Pattern CUSTOM_COMMAND_PATTERN = Pattern.compile("[A-Z][A-Z0-9._-]{0,63}");
 
     private final int samplePercentage;
     private final int bufferCapacity;

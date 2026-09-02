@@ -662,6 +662,7 @@ fn validate_configuration(
     for (index, command) in allowed_custom_commands.iter().enumerate() {
         if command.is_empty()
             || command.len() > MAX_CUSTOM_COMMAND_LENGTH
+            || !matches!(command.first(), Some(byte) if byte.is_ascii_uppercase())
             || !command.iter().all(|byte| {
                 byte.is_ascii_uppercase() || byte.is_ascii_digit() || b"_.-".contains(byte)
             })

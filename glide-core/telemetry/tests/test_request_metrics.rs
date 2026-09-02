@@ -324,6 +324,9 @@ fn custom_command_configuration_is_validated_as_uppercase_ascii() {
 
     for invalid in [
         b"".as_slice(),
+        b"1GRAPH.QUERY".as_slice(),
+        b"_GRAPH.QUERY".as_slice(),
+        b".GRAPH.QUERY".as_slice(),
         b"graph.query".as_slice(),
         b"GRAPH QUERY".as_slice(),
         b"GRAPH/QUERY".as_slice(),
