@@ -64,7 +64,7 @@ public class RequestMetricsBenchmark {
     /** Parameterized command workload for sampled configurations and consumer behavior. */
     @State(Scope.Benchmark)
     public static class SampledCommandState extends ClientState {
-        @Param({"1", "10", "100"})
+        @Param({"1", "5", "100"})
         public int samplePercentage;
 
         @Param({"scheduled-drain", "fill-without-drain", "drain-2000"})

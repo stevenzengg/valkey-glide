@@ -141,6 +141,28 @@ public class RequestMetricsTests {
         }
     }
 
+    @Test
+    @SneakyThrows
+    public void lowercase_custom_command_uses_allow_list_label_and_zero_percent_emits_nothing() {
+        drainAll();
+        try (GlideClient client = GlideClient.createClient(commonClientConfig().build()).get()) {
+            assertEquals("PONG", client.customCommand(new String[] {"ping"}).get());
+
+            List<RequestMetricSample> samples = drainUntilSampleCount(1);
+            assertEquals(1, samples.size());
+            assertEquals("PING", samples.get(0).getOperation());
+
+            RequestMetrics.setSamplePercentage(0);
+            try {
+                assertEquals("PONG", client.customCommand(new String[] {"ping"}).get());
+                assertNoSamplesFor(250, TimeUnit.MILLISECONDS);
+            } finally {
+                RequestMetrics.setSamplePercentage(100);
+                drainAll();
+            }
+        }
+    }
+
     private static List<RequestMetricSample> drainAll() {
         List<RequestMetricSample> samples = new ArrayList<>();
         RequestMetricBatch batch;
