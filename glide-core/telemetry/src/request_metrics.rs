@@ -95,7 +95,7 @@ pub enum RequestMetricsConfigurationError {
     InvalidCapacity { capacity: usize },
     #[error("at most 64 custom commands are allowed, got {count}")]
     TooManyAllowedCustomCommands { count: usize },
-    #[error("custom command at index {index} must match [A-Z0-9_.-]{{1,64}}")]
+    #[error("custom command at index {index} must match [A-Z][A-Z0-9._-]{{0,63}}")]
     InvalidAllowedCustomCommand { index: usize },
     #[error("request metrics are already configured with a different capacity or allow-list")]
     ConfigurationMismatch,

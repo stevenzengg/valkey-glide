@@ -358,6 +358,19 @@ fn custom_command_configuration_is_validated_as_uppercase_ascii() {
 }
 
 #[test]
+fn invalid_custom_command_error_describes_the_enforced_pattern() {
+    let error = match RequestMetricsState::new(10, 1, &[b"1GRAPH.QUERY"]) {
+        Err(error) => error,
+        Ok(_) => panic!("a custom command must begin with an uppercase ASCII letter"),
+    };
+
+    assert_eq!(
+        error.to_string(),
+        "custom command at index 0 must match [A-Z][A-Z0-9._-]{0,63}"
+    );
+}
+
+#[test]
 fn custom_commands_use_allow_listed_identity_or_static_fallback_without_utf8() {
     let state = state(100, 1, &[b"GRAPH.QUERY"]);
 

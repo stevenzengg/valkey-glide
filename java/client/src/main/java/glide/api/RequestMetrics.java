@@ -78,7 +78,7 @@ public final class RequestMetrics {
                 statusMessage = "Request metrics allows at most 64 custom commands.";
                 break;
             case RequestMetricsResolver.STATUS_INVALID_ALLOWED_CUSTOM_COMMAND:
-                statusMessage = "Request metrics custom commands must match [A-Z0-9_.-]{1,64}.";
+                statusMessage = "Request metrics custom commands must match [A-Z][A-Z0-9._-]{0,63}.";
                 break;
             case RequestMetricsResolver.STATUS_CONFIGURATION_MISMATCH:
                 statusMessage =

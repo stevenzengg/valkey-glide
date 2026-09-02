@@ -52,6 +52,16 @@ class RequestMetricsTest {
                         RequestMetricsConfiguration.builder()
                                 .allowedCustomCommands(Collections.singleton("graph.query"))
                                 .build());
+        ConfigurationError invalidCustomCommand =
+                assertThrows(
+                        ConfigurationError.class,
+                        () ->
+                                RequestMetricsConfiguration.builder()
+                                        .allowedCustomCommands(Collections.singleton("1GRAPH.QUERY"))
+                                        .build());
+        assertEquals(
+                "Custom command names must match [A-Z][A-Z0-9._-]{0,63}",
+                invalidCustomCommand.getMessage());
         assertDoesNotThrow(
                 () ->
                         RequestMetricsConfiguration.builder()
@@ -187,7 +197,7 @@ class RequestMetricsTest {
         expectedMessages.put(1, "Request metrics sample percentage must be between 0 and 100.");
         expectedMessages.put(2, "Request metrics buffer capacity must be between 1 and 1000000.");
         expectedMessages.put(3, "Request metrics allows at most 64 custom commands.");
-        expectedMessages.put(4, "Request metrics custom commands must match [A-Z0-9_.-]{1,64}.");
+        expectedMessages.put(4, "Request metrics custom commands must match [A-Z][A-Z0-9._-]{0,63}.");
         expectedMessages.put(
                 5,
                 "Request metrics are already configured with a different buffer capacity or"

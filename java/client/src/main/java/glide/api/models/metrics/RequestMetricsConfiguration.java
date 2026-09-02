@@ -81,7 +81,7 @@ public final class RequestMetricsConfiguration {
             }
             for (String command : allowedCustomCommands) {
                 if (!CUSTOM_COMMAND_PATTERN.matcher(command).matches()) {
-                    throw new ConfigurationError("Custom command names must be uppercase");
+                    throw new ConfigurationError("Custom command names must match [A-Z][A-Z0-9._-]{0,63}");
                 }
             }
             return new RequestMetricsConfiguration(
