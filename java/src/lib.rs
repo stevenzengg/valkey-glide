@@ -156,21 +156,12 @@ impl Drop for SynchronousRequestMetricsGuard {
     }
 }
 
-fn start_request_metrics() -> SynchronousRequestMetricsGuard {
-    let pending = glide_core::native_request_metrics::request_metrics_state().and_then(|state| {
-        state
-            .start_pending()
-            .map(|pending| (Arc::clone(state), pending))
-    });
+fn start_request_metrics(selected: bool) -> SynchronousRequestMetricsGuard {
+    let pending = selected
+        .then(glide_core::native_request_metrics::request_metrics_state)
+        .flatten()
+        .map(|state| (Arc::clone(state), state.start_pending_preselected()));
     SynchronousRequestMetricsGuard::new(pending)
-}
-
-fn start_request_metrics_if_selected(selected: bool) -> SynchronousRequestMetricsGuard {
-    if selected {
-        start_request_metrics()
-    } else {
-        SynchronousRequestMetricsGuard::new(None)
-    }
 }
 
 fn request_metric_operation(
@@ -2645,7 +2636,7 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeCommandAsync
 ) {
     run_ffi(|| {
         let detailed_completion = request_metrics_sampled != 0;
-        let mut request_metrics_guard = start_request_metrics_if_selected(detailed_completion);
+        let mut request_metrics_guard = start_request_metrics(detailed_completion);
         let Some(jvm) = get_jvm_or_complete_error_mode(
             &mut env,
             callback_id,

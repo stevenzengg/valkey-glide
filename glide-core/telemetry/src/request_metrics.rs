@@ -207,18 +207,25 @@ impl RequestMetricsState {
             return None;
         }
 
-        Some(PendingRequestMetricContext {
+        Some(self.start_pending_preselected())
+    }
+
+    /// Starts a request already selected by a language binding without sampling again.
+    pub fn start_pending_preselected(self: &Arc<Self>) -> PendingRequestMetricContext {
+        PendingRequestMetricContext {
             started_at: Instant::now(),
             state: Arc::clone(self),
-        })
+        }
     }
 
     /// Resolves custom bytes to a pre-interned allow-list slot or the static fallback.
     pub fn custom_operation(&self, operation: &[u8]) -> BoundedOperation {
-        match self
-            .allowed_custom_commands
-            .binary_search_by(|candidate| candidate.as_ref().cmp(operation))
-        {
+        match self.allowed_custom_commands.binary_search_by(|candidate| {
+            candidate
+                .iter()
+                .copied()
+                .cmp(operation.iter().map(u8::to_ascii_uppercase))
+        }) {
             Ok(index) => BoundedOperation(BoundedOperationKind::AllowedCustom {
                 index: index as u8,
                 namespace: self.operation_namespace,

@@ -76,6 +76,17 @@ fn one_hundred_percent_returns_a_context_without_consulting_the_sampler() {
 }
 
 #[test]
+fn preselected_context_ignores_percentage_without_drawing_again() {
+    let state = state(0, 4, &[]);
+    let context = state
+        .start_pending_preselected()
+        .bind(BoundedOperation::known("PING"));
+
+    assert!(context.finish(RequestMetricResult::Success));
+    assert_eq!(state.drain(1).unwrap().samples().len(), 1);
+}
+
+#[test]
 fn ten_percent_sampling_uses_injected_percentiles_deterministically() {
     let state = state(10, 4, &[]);
     let mut sampler = SequenceSampler::new([0, 9, 10, 99]);
@@ -360,6 +371,20 @@ fn custom_commands_use_allow_listed_identity_or_static_fallback_without_utf8() {
         state.operation_bytes(invalid_utf8),
         CUSTOM_COMMAND.as_bytes()
     );
+}
+
+#[test]
+fn custom_operation_lookup_is_ascii_case_insensitive() {
+    let state = state(100, 4, &[b"GRAPH.GET_NODE"]);
+
+    for command in [
+        b"GRAPH.GET_NODE".as_slice(),
+        b"graph.get_node",
+        b"Graph.Get_Node",
+    ] {
+        let operation = state.custom_operation(command);
+        assert_eq!(state.operation_bytes(operation), b"GRAPH.GET_NODE");
+    }
 }
 
 #[test]
