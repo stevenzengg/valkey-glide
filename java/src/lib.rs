@@ -165,6 +165,14 @@ fn start_request_metrics() -> SynchronousRequestMetricsGuard {
     SynchronousRequestMetricsGuard::new(pending)
 }
 
+fn start_request_metrics_if_selected(selected: bool) -> SynchronousRequestMetricsGuard {
+    if selected {
+        start_request_metrics()
+    } else {
+        SynchronousRequestMetricsGuard::new(None)
+    }
+}
+
 fn request_metric_operation(
     state: &RequestMetricsState,
     request_type: jint,
@@ -869,11 +877,21 @@ fn get_registry_method_cache_safe(
 
 /// Complete a callback with an error directly on the calling (JNI) thread.
 /// Logs the error and propagates it to Java. Used in pre-spawn error paths.
-fn complete_callback_with_error_on_caller(env: &mut JNIEnv, callback_id: jlong, error_msg: &str) {
+fn complete_callback_with_error_on_caller_mode(
+    env: &mut JNIEnv,
+    callback_id: jlong,
+    error_msg: &str,
+    detailed_completion: bool,
+) {
     log::error!("{error_msg}");
     let error_code = 0; // RequestException (Unspecified)
-    if let Err(e) = complete_java_callback_with_error_code(env, callback_id, error_code, error_msg)
-    {
+    if let Err(e) = complete_java_callback_with_error_code(
+        env,
+        callback_id,
+        error_code,
+        error_msg,
+        detailed_completion,
+    ) {
         log::error!("Failed to complete callback {callback_id} with error: {e}");
     }
 }
@@ -884,13 +902,27 @@ fn get_jvm_or_complete_error(
     callback_id: jlong,
     fn_name: &str,
 ) -> Option<Arc<jni::JavaVM>> {
+    get_jvm_or_complete_error_mode(env, callback_id, fn_name, false)
+}
+
+fn get_jvm_or_complete_error_mode(
+    env: &mut JNIEnv,
+    callback_id: jlong,
+    fn_name: &str,
+    detailed_completion: bool,
+) -> Option<Arc<jni::JavaVM>> {
     match env.get_java_vm() {
         Ok(jvm) => Some(Arc::new(jvm)),
         Err(e) => match JVM.get().cloned() {
             Some(jvm) => Some(jvm),
             None => {
                 let msg = format!("JVM unavailable in {fn_name}: {e}");
-                complete_callback_with_error_on_caller(env, callback_id, &msg);
+                complete_callback_with_error_on_caller_mode(
+                    env,
+                    callback_id,
+                    &msg,
+                    detailed_completion,
+                );
                 None
             }
         },
@@ -2304,6 +2336,7 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeBatchAsync(
                     callback_id,
                     &format!("Failed to get request types length: {e}"),
                     0,
+                    false,
                 );
                 return Some(());
             }
@@ -2315,6 +2348,7 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeBatchAsync(
                 callback_id,
                 &format!("Failed to read request types: {e}"),
                 0,
+                false,
             );
             return Some(());
         }
@@ -2345,6 +2379,7 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeBatchAsync(
                     callback_id,
                     &format!("Failed to extract batch args: {e}"),
                     0,
+                    false,
                 );
                 return Some(());
             }
@@ -2606,11 +2641,17 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeCommandAsync
     route_param: JString,
     expect_utf8: jni::sys::jboolean,
     span_ptr: jlong,
+    request_metrics_sampled: jni::sys::jboolean,
 ) {
     run_ffi(|| {
-        let mut request_metrics_guard = start_request_metrics();
-        let Some(jvm) = get_jvm_or_complete_error(&mut env, callback_id, "executeCommandAsync")
-        else {
+        let detailed_completion = request_metrics_sampled != 0;
+        let mut request_metrics_guard = start_request_metrics_if_selected(detailed_completion);
+        let Some(jvm) = get_jvm_or_complete_error_mode(
+            &mut env,
+            callback_id,
+            "executeCommandAsync",
+            detailed_completion,
+        ) else {
             return Some(());
         };
 
@@ -2627,6 +2668,7 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeCommandAsync
                         callback_id,
                         "Client reached maximum inflight requests",
                         0,
+                        detailed_completion,
                     );
                     return Some(());
                 }
@@ -2637,6 +2679,7 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeCommandAsync
                         callback_id,
                         "Client circuit breaker is open - core unhealthy",
                         4,
+                        detailed_completion,
                     );
                     return Some(());
                 }
@@ -2666,6 +2709,7 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeCommandAsync
                     callback_id,
                     &format!("Failed to extract command args: {e}"),
                     0,
+                    detailed_completion,
                 );
                 return Some(());
             }
@@ -2834,6 +2878,7 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_executeCommandAsync
                 result,
                 !expect_utf8_bool,
                 request_metrics,
+                detailed_completion,
             );
         });
         request_metrics_guard.disarm_after_spawn();

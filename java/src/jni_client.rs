@@ -451,7 +451,9 @@ pub(crate) fn handle_push_notification(env: &mut JNIEnv, handle_id: jlong, push:
 pub(crate) struct MethodCache {
     async_handle_table_class: GlobalRef,
     complete_callback_method: JStaticMethodID,
+    complete_callback_for_native_method: JStaticMethodID,
     complete_error_with_code_method: JStaticMethodID,
+    complete_error_with_code_for_native_method: JStaticMethodID,
     fail_all_method: JStaticMethodID,
 }
 
@@ -477,6 +479,10 @@ pub(crate) fn get_method_cache(env: &mut JNIEnv) -> Result<MethodCache> {
         .map_err(|e| anyhow::anyhow!("Failed to create global class reference: {e}"))?;
 
     let complete_callback_method = env
+        .get_static_method_id(&class, "completeCallback", "(JLjava/lang/Object;)Z")
+        .map_err(|e| anyhow::anyhow!("Failed to get completeCallback method ID: {e}"))?;
+
+    let complete_callback_for_native_method = env
         .get_static_method_id(
             &class,
             "completeCallbackForNative",
@@ -485,6 +491,16 @@ pub(crate) fn get_method_cache(env: &mut JNIEnv) -> Result<MethodCache> {
         .map_err(|e| anyhow::anyhow!("Failed to get completeCallbackForNative method ID: {e}"))?;
 
     let complete_error_with_code_method = env
+        .get_static_method_id(
+            &class,
+            "completeCallbackWithErrorCode",
+            "(JILjava/lang/String;)Z",
+        )
+        .map_err(|e| {
+            anyhow::anyhow!("Failed to get completeCallbackWithErrorCode method ID: {e}")
+        })?;
+
+    let complete_error_with_code_for_native_method = env
         .get_static_method_id(
             &class,
             "completeCallbackWithErrorCodeForNative",
@@ -501,7 +517,9 @@ pub(crate) fn get_method_cache(env: &mut JNIEnv) -> Result<MethodCache> {
     let method_cache = MethodCache {
         async_handle_table_class: global_class,
         complete_callback_method,
+        complete_callback_for_native_method,
         complete_error_with_code_method,
+        complete_error_with_code_for_native_method,
         fail_all_method,
     };
 
@@ -524,6 +542,7 @@ struct CallbackJob<P> {
     callback_id: jlong,
     payload: P,
     request_metrics: Option<Arc<RequestMetricContext>>,
+    detailed_completion: bool,
     callback_queue: Option<PhaseTimer>,
 }
 
@@ -532,11 +551,13 @@ impl<P> CallbackJob<P> {
         callback_id: jlong,
         payload: P,
         request_metrics: Option<Arc<RequestMetricContext>>,
+        detailed_completion: bool,
     ) -> Self {
         Self {
             callback_id,
             payload,
             request_metrics,
+            detailed_completion,
             callback_queue: None,
         }
     }
@@ -768,6 +789,7 @@ fn process_callback_job_with_env(
         callback_id,
         payload,
         request_metrics,
+        detailed_completion,
         callback_queue,
     } = job;
     let JavaCallbackPayload {
@@ -872,7 +894,12 @@ fn process_callback_job_with_env(
             }
 
             let (command_succeeded, completion) = match java_result {
-                Ok(java_result) => match complete_java_callback(env, callback_id, &java_result) {
+                Ok(java_result) => match complete_java_callback(
+                    env,
+                    callback_id,
+                    &java_result,
+                    detailed_completion,
+                ) {
                     Ok(outcome) => {
                         if outcome == JavaCompletionOutcome::Completed {
                             log_structured(
@@ -943,6 +970,7 @@ fn process_callback_job_with_env(
                         callback_id,
                         error_code,
                         &error_msg,
+                        detailed_completion,
                     ) {
                         Ok(outcome) => {
                             if outcome == JavaCompletionOutcome::Completed {
@@ -1053,6 +1081,7 @@ fn process_callback_job_with_env(
                 callback_id,
                 error_code,
                 &error_msg,
+                detailed_completion,
             ) {
                 Ok(outcome) => {
                     if outcome == JavaCompletionOutcome::Completed {
@@ -1114,7 +1143,7 @@ pub fn complete_callback(
     result: CallbackResult,
     binary_mode: bool,
 ) {
-    complete_callback_with_metrics(jvm, callback_id, result, binary_mode, None);
+    complete_callback_with_metrics(jvm, callback_id, result, binary_mode, None, false);
 }
 
 /// Enqueue a callback carrying its sampled direct-request lifecycle.
@@ -1124,6 +1153,7 @@ pub fn complete_callback_with_metrics(
     result: CallbackResult,
     binary_mode: bool,
     request_metrics: Option<Arc<RequestMetricContext>>,
+    detailed_completion: bool,
 ) {
     match &result {
         Ok(server_value) => log_structured(
@@ -1158,6 +1188,7 @@ pub fn complete_callback_with_metrics(
             binary_mode,
         },
         request_metrics,
+        detailed_completion,
     );
     if let Err(e) = enqueue_callback_job(sender, job) {
         let error = e.to_string();
@@ -1275,14 +1306,25 @@ fn complete_java_callback(
     env: &mut JNIEnv,
     callback_id: jlong,
     result: &JObject,
+    detailed_completion: bool,
 ) -> Result<JavaCompletionOutcome> {
     let method_cache = get_method_cache(env)?;
+    let method = if detailed_completion {
+        method_cache.complete_callback_for_native_method
+    } else {
+        method_cache.complete_callback_method
+    };
+    let return_type = if detailed_completion {
+        jni::signature::ReturnType::Primitive(jni::signature::Primitive::Int)
+    } else {
+        jni::signature::ReturnType::Primitive(jni::signature::Primitive::Boolean)
+    };
 
     let completed = unsafe {
         env.call_static_method_unchecked(
             &method_cache.async_handle_table_class,
-            method_cache.complete_callback_method,
-            jni::signature::ReturnType::Primitive(jni::signature::Primitive::Int),
+            method,
+            return_type,
             &[
                 JValue::Long(callback_id).as_jni(),
                 JValue::Object(result).as_jni(),
@@ -1290,7 +1332,13 @@ fn complete_java_callback(
         )
     }?;
 
-    JavaCompletionOutcome::try_from(completed.i()?)
+    if detailed_completion {
+        JavaCompletionOutcome::try_from(completed.i()?)
+    } else if completed.z()? {
+        Ok(JavaCompletionOutcome::Completed)
+    } else {
+        Ok(JavaCompletionOutcome::Failure)
+    }
 }
 
 /// Complete Java CompletableFuture with error code and message using cached method IDs.
@@ -1299,9 +1347,16 @@ pub fn complete_java_callback_with_error_code(
     callback_id: jlong,
     error_code: i32,
     error: &str,
+    detailed_completion: bool,
 ) -> Result<()> {
-    complete_java_callback_with_error_code_for_native(env, callback_id, error_code, error)
-        .map(|_| ())
+    complete_java_callback_with_error_code_for_native(
+        env,
+        callback_id,
+        error_code,
+        error,
+        detailed_completion,
+    )
+    .map(|_| ())
 }
 
 fn complete_java_callback_with_error_code_for_native(
@@ -1309,16 +1364,27 @@ fn complete_java_callback_with_error_code_for_native(
     callback_id: jlong,
     error_code: i32,
     error: &str,
+    detailed_completion: bool,
 ) -> Result<JavaCompletionOutcome> {
     let method_cache = get_method_cache(env)?;
     env.push_local_frame(4)?;
     let completion = (|| -> Result<JavaCompletionOutcome> {
         let error_string = env.new_string(error)?;
+        let method = if detailed_completion {
+            method_cache.complete_error_with_code_for_native_method
+        } else {
+            method_cache.complete_error_with_code_method
+        };
+        let return_type = if detailed_completion {
+            jni::signature::ReturnType::Primitive(jni::signature::Primitive::Int)
+        } else {
+            jni::signature::ReturnType::Primitive(jni::signature::Primitive::Boolean)
+        };
         let completed = unsafe {
             env.call_static_method_unchecked(
                 &method_cache.async_handle_table_class,
-                method_cache.complete_error_with_code_method,
-                jni::signature::ReturnType::Primitive(jni::signature::Primitive::Int),
+                method,
+                return_type,
                 &[
                     JValue::Long(callback_id).as_jni(),
                     JValue::Int(error_code).as_jni(),
@@ -1326,7 +1392,13 @@ fn complete_java_callback_with_error_code_for_native(
                 ],
             )
         }?;
-        JavaCompletionOutcome::try_from(completed.i()?)
+        if detailed_completion {
+            JavaCompletionOutcome::try_from(completed.i()?)
+        } else if completed.z()? {
+            Ok(JavaCompletionOutcome::Completed)
+        } else {
+            Ok(JavaCompletionOutcome::Failure)
+        }
     })();
     unsafe { env.pop_local_frame(&JObject::null()) }?;
     completion
@@ -1782,6 +1854,7 @@ pub fn complete_error_sync(
     callback_id: jni::sys::jlong,
     message: &str,
     error_code: i32,
+    detailed_completion: bool,
 ) {
     let Ok(method_cache) = get_method_cache(env) else {
         log::error!(
@@ -1801,12 +1874,22 @@ pub fn complete_error_sync(
         return;
     };
 
-    // Call AsyncRegistry.completeCallbackWithErrorCodeForNative(callbackId, errorCode, errorMessage)
+    let method = if detailed_completion {
+        method_cache.complete_error_with_code_for_native_method
+    } else {
+        method_cache.complete_error_with_code_method
+    };
+    let return_type = if detailed_completion {
+        jni::signature::ReturnType::Primitive(jni::signature::Primitive::Int)
+    } else {
+        jni::signature::ReturnType::Primitive(jni::signature::Primitive::Boolean)
+    };
+
     let result = unsafe {
         env.call_static_method_unchecked(
             &method_cache.async_handle_table_class,
-            method_cache.complete_error_with_code_method,
-            jni::signature::ReturnType::Primitive(jni::signature::Primitive::Int),
+            method,
+            return_type,
             &[
                 jni::sys::jvalue { j: callback_id },
                 jni::sys::jvalue { i: error_code },
@@ -1928,12 +2011,12 @@ mod callback_metrics_tests {
 
         enqueue_callback_job(
             &sender,
-            CallbackJob::new(-9_000_001, (), Some(first_context)),
+            CallbackJob::new(-9_000_001, (), Some(first_context), true),
         )
         .unwrap();
         enqueue_callback_job(
             &sender,
-            CallbackJob::new(-9_000_002, (), Some(second_context)),
+            CallbackJob::new(-9_000_002, (), Some(second_context), true),
         )
         .unwrap();
 
@@ -1999,10 +2082,12 @@ mod callback_metrics_tests {
         let (sender, receiver) = mpsc::channel::<CallbackJob<()>>();
         drop(receiver);
 
-        let failed_job =
-            enqueue_callback_job(&sender, CallbackJob::new(-9_000_003, (), Some(context)))
-                .unwrap_err()
-                .0;
+        let failed_job = enqueue_callback_job(
+            &sender,
+            CallbackJob::new(-9_000_003, (), Some(context), true),
+        )
+        .unwrap_err()
+        .0;
         tokio::time::advance(Duration::from_millis(3)).await;
         let result = finish_callback_with_registry(
             &registry,
@@ -2217,7 +2302,7 @@ mod callback_metrics_tests {
     fn unsampled_production_job_constructs_no_timers_and_cleans_coordination() {
         let registry = CallbackCoordinationRegistry::default();
         let (sender, receiver) = mpsc::channel::<CallbackJob<()>>();
-        enqueue_callback_job(&sender, CallbackJob::new(-9_000_008, (), None)).unwrap();
+        enqueue_callback_job(&sender, CallbackJob::new(-9_000_008, (), None, false)).unwrap();
 
         let (job, callback_complete) = receive_callback_job(&receiver).unwrap();
 
@@ -2234,5 +2319,20 @@ mod callback_metrics_tests {
             CallbackCompletion::Java(JavaCompletionOutcome::Completed),
         );
         assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn callback_job_retains_selection_without_relying_on_native_context() {
+        let (sender, receiver) = mpsc::channel::<CallbackJob<()>>();
+        enqueue_callback_job(&sender, CallbackJob::new(-9_000_009, (), None, false)).unwrap();
+        enqueue_callback_job(&sender, CallbackJob::new(-9_000_010, (), None, true)).unwrap();
+
+        let (legacy, _) = receive_callback_job(&receiver).unwrap();
+        let (detailed, _) = receive_callback_job(&receiver).unwrap();
+
+        assert!(!legacy.detailed_completion);
+        assert!(detailed.detailed_completion);
+        assert!(legacy.request_metrics.is_none());
+        assert!(detailed.request_metrics.is_none());
     }
 }

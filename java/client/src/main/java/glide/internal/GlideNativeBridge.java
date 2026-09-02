@@ -48,7 +48,8 @@ public class GlideNativeBridge {
             int routeType,
             String routeParam,
             boolean expectUtf8Response,
-            long spanPtr);
+            long spanPtr,
+            boolean requestMetricsSampled);
 
     /**
      * Execute a batch of commands asynchronously, passing parameters directly via JNI.

@@ -15,6 +15,7 @@ import glide.api.models.metrics.RequestMetricResult;
 import glide.api.models.metrics.RequestMetricSample;
 import glide.api.models.metrics.RequestMetricsConfiguration;
 import glide.ffi.resolvers.RequestMetricsResolver;
+import glide.internal.GlideNativeBridge;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
@@ -219,5 +220,25 @@ class RequestMetricsTest {
         assertEquals(int.class, update.getReturnType());
         assertTrue(Modifier.isNative(drain.getModifiers()));
         assertEquals(byte[].class, drain.getReturnType());
+    }
+
+    @Test
+    void forwardsTheJavaSamplingDecisionThroughTheNativeCommandContract()
+            throws ReflectiveOperationException {
+        Method execute =
+                GlideNativeBridge.class.getDeclaredMethod(
+                        "executeCommandAsync",
+                        long.class,
+                        long.class,
+                        int.class,
+                        byte[][].class,
+                        boolean.class,
+                        int.class,
+                        String.class,
+                        boolean.class,
+                        long.class,
+                        boolean.class);
+
+        assertTrue(Modifier.isNative(execute.getModifiers()));
     }
 }

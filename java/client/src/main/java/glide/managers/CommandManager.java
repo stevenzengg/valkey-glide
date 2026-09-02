@@ -26,6 +26,7 @@ import glide.api.models.exceptions.RequestException;
 import glide.ffi.resolvers.ClusterScanCursorResolver;
 import glide.ffi.resolvers.OpenTelemetryResolver;
 import glide.internal.GlideCoreClient;
+import glide.internal.RequestMetricsSampling;
 import glide.utils.BufferUtils;
 import glide.utils.Java8Utils;
 import java.math.BigInteger;
@@ -709,6 +710,7 @@ public class CommandManager {
             if (OpenTelemetry.isInitialized() && OpenTelemetry.shouldSample()) {
                 spanPtr = OpenTelemetryResolver.createLeakedOtelSpan(requestType.name());
             }
+            boolean requestMetricsSampled = RequestMetricsSampling.shouldSample();
 
             return coreClient.executeCommandAsync(
                     requestType.getNumber(),
@@ -719,6 +721,7 @@ public class CommandManager {
                     expectUtf8Response,
                     coreClient.getRequestTimeoutMillis(),
                     spanPtr,
+                    requestMetricsSampled,
                     jniFuture ->
                             jniFuture
                                     .thenApply(result -> buildResponseFromJniResult(result, expectUtf8Response))
@@ -753,6 +756,7 @@ public class CommandManager {
             if (OpenTelemetry.isInitialized() && OpenTelemetry.shouldSample()) {
                 spanPtr = OpenTelemetryResolver.createLeakedOtelSpan(requestType.name());
             }
+            boolean requestMetricsSampled = RequestMetricsSampling.shouldSample();
 
             return coreClient.executeCommandAsync(
                     requestType.getNumber(),
@@ -763,6 +767,7 @@ public class CommandManager {
                     expectUtf8Response,
                     0,
                     spanPtr,
+                    requestMetricsSampled,
                     jniFuture ->
                             jniFuture
                                     .thenApply(result -> buildResponseFromJniResult(result, expectUtf8Response))

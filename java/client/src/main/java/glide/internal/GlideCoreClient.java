@@ -369,6 +369,7 @@ public class GlideCoreClient implements AutoCloseable {
             boolean expectUtf8Response,
             long timeoutMs,
             long spanPtr) {
+        boolean requestMetricsSampled = RequestMetricsSampling.shouldSample();
         return executeCommandAsync(
                 requestType,
                 args,
@@ -378,6 +379,7 @@ public class GlideCoreClient implements AutoCloseable {
                 expectUtf8Response,
                 timeoutMs,
                 spanPtr,
+                requestMetricsSampled,
                 future -> future);
     }
 
@@ -396,34 +398,61 @@ public class GlideCoreClient implements AutoCloseable {
             long timeoutMs,
             long spanPtr,
             Function<CompletableFuture<Object>, CompletableFuture<T>> terminalPipeline) {
+        return executeCommandAsync(
+                requestType,
+                args,
+                hasRoute,
+                routeType,
+                routeParam,
+                expectUtf8Response,
+                timeoutMs,
+                spanPtr,
+                RequestMetricsSampling.shouldSample(),
+                terminalPipeline);
+    }
+
+    /** Execute one command using the binding's immutable request-metrics selection. */
+    public <T> CompletableFuture<T> executeCommandAsync(
+            int requestType,
+            byte[][] args,
+            boolean hasRoute,
+            int routeType,
+            String routeParam,
+            boolean expectUtf8Response,
+            long timeoutMs,
+            long spanPtr,
+            boolean requestMetricsSampled,
+            Function<CompletableFuture<Object>, CompletableFuture<T>> terminalPipeline) {
         CompletableFuture<Object> future = new CompletableFuture<>();
-        CompletableFuture<T> terminalFuture;
-        try {
-            terminalFuture =
-                    Objects.requireNonNull(
-                            terminalPipeline.apply(future), "Terminal command future must not be null");
-        } catch (Exception e) {
-            CompletableFuture<T> errorFuture = new CompletableFuture<>();
-            errorFuture.completeExceptionally(e);
-            return errorFuture;
-        }
+        CompletableFuture<T> terminalFuture =
+                requestMetricsSampled ? applyTerminalPipeline(future, terminalPipeline) : null;
 
         try {
             long handle = nativeClientHandle.get();
             if (handle == 0) {
                 future.completeExceptionally(
                         new glide.api.models.exceptions.ClosingException("Client is closed"));
-                return terminalFuture;
+                return requestMetricsSampled
+                        ? terminalFuture
+                        : applyTerminalPipeline(future, terminalPipeline);
             }
 
             long correlationId;
             try {
-                correlationId =
-                        AsyncRegistry.register(
-                                future, terminalFuture, this.maxInflightRequests, handle, timeoutMs);
+                if (requestMetricsSampled) {
+                    correlationId =
+                            AsyncRegistry.register(
+                                    future, terminalFuture, this.maxInflightRequests, handle, timeoutMs, true);
+                } else {
+                    correlationId =
+                            AsyncRegistry.register(
+                                    future, future, this.maxInflightRequests, handle, timeoutMs, false);
+                }
             } catch (glide.api.models.exceptions.RequestException e) {
                 future.completeExceptionally(e);
-                return terminalFuture;
+                return requestMetricsSampled
+                        ? terminalFuture
+                        : applyTerminalPipeline(future, terminalPipeline);
             }
 
             GlideNativeBridge.executeCommandAsync(
@@ -435,13 +464,31 @@ public class GlideCoreClient implements AutoCloseable {
                     routeType,
                     routeParam,
                     expectUtf8Response,
-                    spanPtr);
+                    spanPtr,
+                    requestMetricsSampled);
 
-            return terminalFuture;
+            return requestMetricsSampled
+                    ? terminalFuture
+                    : applyTerminalPipeline(future, terminalPipeline);
 
         } catch (Exception e) {
             future.completeExceptionally(e);
-            return terminalFuture;
+            return requestMetricsSampled
+                    ? terminalFuture
+                    : applyTerminalPipeline(future, terminalPipeline);
+        }
+    }
+
+    private static <T> CompletableFuture<T> applyTerminalPipeline(
+            CompletableFuture<Object> future,
+            Function<CompletableFuture<Object>, CompletableFuture<T>> terminalPipeline) {
+        try {
+            return Objects.requireNonNull(
+                    terminalPipeline.apply(future), "Terminal command future must not be null");
+        } catch (Exception e) {
+            CompletableFuture<T> errorFuture = new CompletableFuture<>();
+            errorFuture.completeExceptionally(e);
+            return errorFuture;
         }
     }
 
