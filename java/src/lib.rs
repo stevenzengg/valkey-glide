@@ -494,15 +494,26 @@ pub(crate) fn has_in_flight_command(callback_id: jlong) -> bool {
     in_flight_commands().lock().contains_key(&callback_id)
 }
 
-fn take_timed_out_in_flight_command(callback_id: jlong) -> Option<InFlightCommand> {
+fn take_terminal_in_flight_command(
+    callback_id: jlong,
+    result: NativeRequestMetricResult,
+) -> Option<InFlightCommand> {
     let command = in_flight_commands().lock().remove(&callback_id);
     if let Some(request_metrics) = command
         .as_ref()
         .and_then(|command| command.request_metrics.as_ref())
     {
-        request_metrics.finish(NativeRequestMetricResult::Timeout);
+        request_metrics.finish(result);
     }
     command
+}
+
+fn take_timed_out_in_flight_command(callback_id: jlong) -> Option<InFlightCommand> {
+    take_terminal_in_flight_command(callback_id, NativeRequestMetricResult::Timeout)
+}
+
+fn cancel_in_flight_command(callback_id: jlong) -> bool {
+    take_terminal_in_flight_command(callback_id, NativeRequestMetricResult::Cancelled).is_some()
 }
 
 fn log_callback_marked_timed_out(callback_id: jlong) {
@@ -2235,6 +2246,16 @@ pub extern "system" fn Java_glide_internal_GlideNativeBridge_markTimedOut(
     native_owns_timeout as jni::sys::jboolean
 }
 
+/// Release native request bookkeeping after caller cancellation.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_glide_internal_GlideNativeBridge_markCancelled(
+    _env: JNIEnv,
+    _class: JClass,
+    callback_id: jlong,
+) -> jni::sys::jboolean {
+    cancel_in_flight_command(callback_id) as jni::sys::jboolean
+}
+
 /// Execute a batch (pipeline/transaction) asynchronously.
 /// Takes command data directly via JNI arrays.
 #[unsafe(no_mangle)]
@@ -3782,5 +3803,32 @@ mod request_metrics_tests {
         assert_eq!(sample.phase_durations[0].duration_nanos, 7);
         assert_eq!(sample.phase_durations[1].phase.value(), 12);
         assert!(sample.phase_durations[1].duration_nanos > 0);
+    }
+
+    #[test]
+    fn cancellation_releases_native_bookkeeping_and_finishes_the_sample_once() {
+        const CALLBACK_ID: jlong = -9_001;
+        let state = RequestMetricsState::new(100, 4, &[]).unwrap();
+        let context = state.start(BoundedOperation::known("PING")).unwrap();
+        track_pending_single_command(CALLBACK_ID, 17, 0, 0, false, false, Some(context.clone()));
+
+        assert!(has_in_flight_command(CALLBACK_ID));
+        assert!(cancel_in_flight_command(CALLBACK_ID));
+        assert!(!has_in_flight_command(CALLBACK_ID));
+
+        let first_drain = state.drain(4).unwrap();
+        assert_eq!(first_drain.samples().len(), 1);
+        assert_eq!(
+            first_drain.samples()[0].result(),
+            NativeRequestMetricResult::Cancelled
+        );
+        assert_eq!(
+            state.operation_bytes(first_drain.samples()[0].operation()),
+            b"PING"
+        );
+
+        assert!(!cancel_in_flight_command(CALLBACK_ID));
+        assert!(!context.finish(NativeRequestMetricResult::Success));
+        assert!(state.drain(4).unwrap().samples().is_empty());
     }
 }
