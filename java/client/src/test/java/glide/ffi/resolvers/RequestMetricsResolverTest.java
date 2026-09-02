@@ -9,6 +9,7 @@ import glide.api.RequestMetrics;
 import glide.api.models.exceptions.ConfigurationError;
 import glide.api.models.metrics.RequestMetricBatch;
 import glide.api.models.metrics.RequestMetricsConfiguration;
+import glide.internal.RequestMetricsSampling;
 import java.io.File;
 import java.net.URL;
 import java.net.URLClassLoader;
@@ -99,6 +100,9 @@ class RequestMetricsResolverTest {
         private IsolatedRequestMetricsLifecycle() {}
 
         public static void main(String[] arguments) {
+            require(
+                    RequestMetricsSampling.getSamplePercentage() == 0,
+                    "expected request metrics sampling to start disabled");
             requireStatus(
                     1, RequestMetricsResolver.configureRequestMetrics(-1, BUFFER_CAPACITY, new String[0]));
             requireStatus(2, RequestMetricsResolver.configureRequestMetrics(100, -1, new String[0]));
@@ -123,6 +127,9 @@ class RequestMetricsResolverTest {
                         "Request metrics have not been configured.".equals(error.getMessage()),
                         "unexpected not-configured message: " + error.getMessage());
             }
+            require(
+                    RequestMetricsSampling.getSamplePercentage() == 0,
+                    "failed configuration must not change Java sampling");
 
             Set<String> allowedCustomCommands =
                     IntStream.range(0, 63)
@@ -137,6 +144,9 @@ class RequestMetricsResolverTest {
                             .bufferCapacity(BUFFER_CAPACITY)
                             .allowedCustomCommands(allowedCustomCommands)
                             .build());
+            require(
+                    RequestMetricsSampling.getSamplePercentage() == 100,
+                    "successful configuration must update Java sampling");
 
             RequestMetricBatch batch = RequestMetrics.drain(10);
             require(batch.getSamples().isEmpty(), "expected empty initial drain");
@@ -145,7 +155,13 @@ class RequestMetricsResolverTest {
             require(!batch.getHasMore(), "expected hasMore=false");
 
             RequestMetrics.setSamplePercentage(0);
+            require(
+                    RequestMetricsSampling.getSamplePercentage() == 0,
+                    "disabling native metrics must disable Java sampling");
             RequestMetrics.setSamplePercentage(100);
+            require(
+                    RequestMetricsSampling.getSamplePercentage() == 100,
+                    "re-enabling native metrics must re-enable Java sampling");
             expectIllegalArgument(() -> RequestMetrics.drain(0));
             expectIllegalArgument(() -> RequestMetrics.drain(10_001));
             expectIllegalArgument(() -> RequestMetricsResolver.drainRequestMetrics(-1));

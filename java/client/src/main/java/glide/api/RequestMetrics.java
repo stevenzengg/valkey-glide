@@ -10,6 +10,7 @@ import glide.api.models.metrics.RequestMetricResult;
 import glide.api.models.metrics.RequestMetricSample;
 import glide.api.models.metrics.RequestMetricsConfiguration;
 import glide.ffi.resolvers.RequestMetricsResolver;
+import glide.internal.RequestMetricsSampling;
 import java.util.List;
 import java.util.Objects;
 import java.util.stream.Collectors;
@@ -23,7 +24,7 @@ public final class RequestMetrics {
     private RequestMetrics() {}
 
     /** Configures native request metrics collection. */
-    public static void configure(RequestMetricsConfiguration configuration) {
+    public static synchronized void configure(RequestMetricsConfiguration configuration) {
         RequestMetricsConfiguration config =
                 Objects.requireNonNull(configuration, "configuration must not be null");
         int status =
@@ -32,13 +33,15 @@ public final class RequestMetrics {
                         config.getBufferCapacity(),
                         config.getAllowedCustomCommands().stream().sorted().toArray(String[]::new));
         throwForNonzeroStatus(status, UNKNOWN_CONFIGURATION_ERROR_MESSAGE);
+        RequestMetricsSampling.updateSamplePercentage(config.getSamplePercentage());
     }
 
     /** Updates the percentage of requests sampled by native request metrics collection. */
-    public static void setSamplePercentage(int samplePercentage) {
+    public static synchronized void setSamplePercentage(int samplePercentage) {
         RequestMetricsConfiguration.validateSamplePercentage(samplePercentage);
         int status = RequestMetricsResolver.setRequestMetricsSamplePercentage(samplePercentage);
         throwForNonzeroStatus(status, UNKNOWN_CONFIGURATION_ERROR_MESSAGE);
+        RequestMetricsSampling.updateSamplePercentage(samplePercentage);
     }
 
     /** Drains at most {@code maxSamples} request metric samples without performing I/O. */
