@@ -321,7 +321,13 @@ public final class AsyncRegistry {
      */
     public static <T> long register(
             CompletableFuture<T> future, int maxInflightRequests, long clientHandle, long timeoutMillis) {
-        return register(future, future, maxInflightRequests, clientHandle, timeoutMillis);
+        return register(
+                future,
+                future,
+                maxInflightRequests,
+                clientHandle,
+                timeoutMillis,
+                GlideNativeBridge::markCancelled);
     }
 
     /**
@@ -335,11 +341,30 @@ public final class AsyncRegistry {
             int maxInflightRequests,
             long clientHandle,
             long timeoutMillis) {
+        return register(
+                future,
+                terminalFuture,
+                maxInflightRequests,
+                clientHandle,
+                timeoutMillis,
+                GlideNativeBridge::markCancelled);
+    }
+
+    static <T, R> long register(
+            CompletableFuture<T> future,
+            CompletableFuture<R> terminalFuture,
+            int maxInflightRequests,
+            long clientHandle,
+            long timeoutMillis,
+            LongPredicate cancellationNotifier) {
         if (future == null) {
             throw new IllegalArgumentException("Future cannot be null");
         }
         if (terminalFuture == null) {
             throw new IllegalArgumentException("Terminal future cannot be null");
+        }
+        if (cancellationNotifier == null) {
+            throw new IllegalArgumentException("Cancellation notifier cannot be null");
         }
 
         // Check shutdown flag before registering to prevent race conditions
@@ -398,7 +423,8 @@ public final class AsyncRegistry {
 
         // Set up cleanup on the original future
         // This ensures proper resource cleanup when completed
-        setupCleanup(correlationId, originalFuture, maxInflightRequests, clientHandle);
+        setupCleanup(
+                correlationId, originalFuture, maxInflightRequests, clientHandle, cancellationNotifier);
         if (terminalFuture != future) {
             terminalFuture.whenComplete(
                     (result, error) -> {
@@ -485,6 +511,29 @@ public final class AsyncRegistry {
         return true;
     }
 
+    /** Publish user cancellation before asking native code to release its request bookkeeping. */
+    static boolean completeCancellation(long correlationId, LongPredicate cancellationNotifier) {
+        CompletionState state = completionStates.get(correlationId);
+        if (state == null) {
+            return false;
+        }
+
+        synchronized (state) {
+            if (!state.future.isCancelled() || state.internallyCompletedAs != null) {
+                return false;
+            }
+            state.internallyCompletedAs = CompletionOutcome.CANCELLED;
+        }
+
+        try {
+            return cancellationNotifier.test(correlationId);
+        } catch (RuntimeException | LinkageError ignored) {
+            return false;
+        } finally {
+            completionStates.remove(correlationId, state);
+        }
+    }
+
     /**
      * Set up cleanup handler for when the future completes (success, error, or timeout). Performs
      * atomic cleanup to avoid races and leaks.
@@ -493,9 +542,13 @@ public final class AsyncRegistry {
             long correlationId,
             CompletableFuture<Object> future,
             int maxInflightRequests,
-            long clientHandle) {
+            long clientHandle,
+            LongPredicate cancellationNotifier) {
         future.whenComplete(
                 (result, error) -> {
+                    if (future.isCancelled()) {
+                        completeCancellation(correlationId, cancellationNotifier);
+                    }
                     logLifecycle(
                             error == null ? Logger.Level.DEBUG : Logger.Level.WARN,
                             correlationId,
@@ -818,6 +871,11 @@ public final class AsyncRegistry {
      */
     public static int getActiveFutureCount() {
         return activeFutures.size();
+    }
+
+    /** Returns retained terminal completion states. Intended for cancellation lifecycle tests. */
+    static int getCompletionStateCount() {
+        return completionStates.size();
     }
 
     /**

@@ -130,6 +130,9 @@ public class GlideNativeBridge {
     /** Mark a callback as timed out on the native side and report whether native owns its state. */
     public static native boolean markTimedOut(long callbackId);
 
+    /** Mark a callback as cancelled and release its native request bookkeeping. */
+    public static native boolean markCancelled(long callbackId);
+
     /** Get cache metrics */
     public static native void getCacheMetrics(long clientPtr, long callbackId, int metricsType);
 
