@@ -327,6 +327,7 @@ public final class AsyncRegistry {
                 maxInflightRequests,
                 clientHandle,
                 timeoutMillis,
+                false,
                 GlideNativeBridge::markCancelled);
     }
 
@@ -347,6 +348,25 @@ public final class AsyncRegistry {
                 maxInflightRequests,
                 clientHandle,
                 timeoutMillis,
+                true,
+                GlideNativeBridge::markCancelled);
+    }
+
+    /** Register with terminal outcome tracking only when request metrics selected this command. */
+    public static <T, R> long register(
+            CompletableFuture<T> future,
+            CompletableFuture<R> terminalFuture,
+            int maxInflightRequests,
+            long clientHandle,
+            long timeoutMillis,
+            boolean requestMetricsSampled) {
+        return register(
+                future,
+                terminalFuture,
+                maxInflightRequests,
+                clientHandle,
+                timeoutMillis,
+                requestMetricsSampled,
                 GlideNativeBridge::markCancelled);
     }
 
@@ -356,6 +376,7 @@ public final class AsyncRegistry {
             int maxInflightRequests,
             long clientHandle,
             long timeoutMillis,
+            boolean requestMetricsSampled,
             LongPredicate cancellationNotifier) {
         if (future == null) {
             throw new IllegalArgumentException("Future cannot be null");
@@ -389,7 +410,9 @@ public final class AsyncRegistry {
 
         // Store original future for completion by native code
         activeFutures.put(correlationId, originalFuture);
-        completionStates.put(correlationId, new CompletionState(originalFuture, terminalFuture));
+        if (requestMetricsSampled) {
+            completionStates.put(correlationId, new CompletionState(originalFuture, terminalFuture));
+        }
         registrationTimestamps.put(correlationId, System.nanoTime());
         logLifecycle(
                 Logger.Level.DEBUG,
@@ -418,14 +441,19 @@ public final class AsyncRegistry {
 
         // Schedule Java-side timeout if configured (0 = defer to Rust core timeout)
         if (timeoutMillis > 0) {
-            scheduleTimeout(correlationId, timeoutMillis);
+            scheduleTimeout(correlationId, originalFuture, timeoutMillis, requestMetricsSampled);
         }
 
         // Set up cleanup on the original future
         // This ensures proper resource cleanup when completed
         setupCleanup(
-                correlationId, originalFuture, maxInflightRequests, clientHandle, cancellationNotifier);
-        if (terminalFuture != future) {
+                correlationId,
+                originalFuture,
+                maxInflightRequests,
+                clientHandle,
+                requestMetricsSampled,
+                cancellationNotifier);
+        if (requestMetricsSampled && terminalFuture != future) {
             terminalFuture.whenComplete(
                     (result, error) -> {
                         if (terminalFuture.isCancelled()) {
@@ -455,12 +483,31 @@ public final class AsyncRegistry {
      * Schedule a cancellable timeout task. If the request doesn't complete within timeoutMillis, the
      * future is completed exceptionally with TimeoutException and the native layer is notified.
      */
-    private static void scheduleTimeout(long correlationId, long timeoutMillis) {
+    private static void scheduleTimeout(
+            long correlationId,
+            CompletableFuture<Object> future,
+            long timeoutMillis,
+            boolean requestMetricsSampled) {
         ScheduledFuture<?> task =
                 timeoutScheduler.schedule(
                         () -> {
                             timeoutTasks.remove(correlationId);
-                            completeTimeout(correlationId, timeoutMillis, GlideNativeBridge::markTimedOut);
+                            if (requestMetricsSampled) {
+                                completeTimeout(correlationId, timeoutMillis, GlideNativeBridge::markTimedOut);
+                            } else if (future.completeExceptionally(new TimeoutException("Request timed out"))) {
+                                logLifecycle(
+                                        Logger.Level.WARN,
+                                        correlationId,
+                                        "timed_out",
+                                        "\"timeout_ms\":" + timeoutMillis);
+                                GlideNativeBridge.markTimedOut(correlationId);
+                            } else {
+                                logLifecycle(
+                                        Logger.Level.DEBUG,
+                                        correlationId,
+                                        "timeout_skipped_already_completed",
+                                        "\"timeout_ms\":" + timeoutMillis);
+                            }
                         },
                         timeoutMillis,
                         TimeUnit.MILLISECONDS);
@@ -543,10 +590,11 @@ public final class AsyncRegistry {
             CompletableFuture<Object> future,
             int maxInflightRequests,
             long clientHandle,
+            boolean requestMetricsSampled,
             LongPredicate cancellationNotifier) {
         future.whenComplete(
                 (result, error) -> {
-                    if (future.isCancelled()) {
+                    if (requestMetricsSampled && future.isCancelled()) {
                         completeCancellation(correlationId, cancellationNotifier);
                     }
                     logLifecycle(
@@ -599,8 +647,23 @@ public final class AsyncRegistry {
      * @return true if completed, false if already done
      */
     public static boolean completeCallback(long correlationId, Object result) {
-        return completeCallbackForNative(correlationId, result)
-                == CompletionOutcome.COMPLETED.nativeCode;
+        CompletableFuture<Object> future = activeFutures.get(correlationId);
+        if (future == null) {
+            logLifecycle(Logger.Level.WARN, correlationId, "complete_success_missing_future");
+            return false;
+        }
+        logLifecycle(
+                Logger.Level.DEBUG,
+                correlationId,
+                "complete_success_attempt",
+                "\"result_type\":" + jsonString(result == null ? null : result.getClass().getName()));
+        boolean completed = future.complete(result);
+        logLifecycle(
+                completed ? Logger.Level.DEBUG : Logger.Level.WARN,
+                correlationId,
+                completed ? "complete_success" : "complete_success_already_completed",
+                "\"result_type\":" + jsonString(result == null ? null : result.getClass().getName()));
+        return completed;
     }
 
     /**
@@ -652,10 +715,48 @@ public final class AsyncRegistry {
      */
     public static boolean completeCallbackWithErrorCode(
             long correlationId, int errorTypeCode, String errorMessage) {
-        int outcome =
-                completeCallbackWithErrorCodeForNative(correlationId, errorTypeCode, errorMessage);
-        return outcome == CompletionOutcome.COMPLETED.nativeCode
-                || outcome == CompletionOutcome.NATIVE_TIMEOUT.nativeCode;
+        CompletableFuture<Object> future = activeFutures.get(correlationId);
+        if (future == null) {
+            logLifecycle(
+                    Logger.Level.WARN,
+                    correlationId,
+                    "complete_error_missing_future",
+                    "\"error_type_code\":"
+                            + errorTypeCode
+                            + ",\"error_message\":"
+                            + jsonString(errorMessage));
+            return false;
+        }
+
+        String msg =
+                (errorMessage == null || errorMessage.trim().isEmpty())
+                        ? "Unknown error from native code"
+                        : errorMessage;
+
+        logRateLimitedNativeError(correlationId, errorTypeCode, msg);
+        RuntimeException exception = exceptionForNativeError(errorTypeCode, msg);
+        logLifecycle(
+                Logger.Level.WARN,
+                correlationId,
+                "complete_error_attempt",
+                "\"error_type_code\":"
+                        + errorTypeCode
+                        + ",\"exception_type\":"
+                        + jsonString(exception.getClass().getName())
+                        + ",\"error_message\":"
+                        + jsonString(msg));
+        boolean completed = future.completeExceptionally(exception);
+        logLifecycle(
+                Logger.Level.WARN,
+                correlationId,
+                completed ? "complete_error" : "complete_error_already_completed",
+                "\"error_type_code\":"
+                        + errorTypeCode
+                        + ",\"exception_type\":"
+                        + jsonString(exception.getClass().getName())
+                        + ",\"error_message\":"
+                        + jsonString(msg));
+        return completed;
     }
 
     /** Complete an exceptional callback and return its exact terminal outcome to native code. */
@@ -679,49 +780,8 @@ public final class AsyncRegistry {
                         ? "Unknown error from native code"
                         : errorMessage;
 
-        // Log elapsed time for timeout and disconnect errors (rate-limited)
-        if (errorTypeCode == 2 || errorTypeCode == 3) {
-            Long registeredAt = registrationTimestamps.get(correlationId);
-            if (registeredAt != null) {
-                long elapsedMs = (System.nanoTime() - registeredAt) / 1_000_000;
-                boolean isTimeout = errorTypeCode == 2;
-                AtomicLong lastLogRef = isTimeout ? lastTimeoutLogNs : lastDisconnectLogNs;
-                AtomicLong suppressedRef = isTimeout ? suppressedTimeoutLogs : suppressedDisconnectLogs;
-                String errorTypeName = isTimeout ? "Timeout" : "Disconnect";
-
-                long now = System.nanoTime();
-                long lastLog = lastLogRef.get();
-                if (now - lastLog >= LOG_RATE_LIMIT_NS && lastLogRef.compareAndSet(lastLog, now)) {
-                    long suppressed = suppressedRef.getAndSet(0);
-                    String suffix = suppressed > 0 ? " (suppressed " + suppressed + " similar)" : "";
-                    Logger.log(
-                            Logger.Level.WARN,
-                            "AsyncRegistry",
-                            errorTypeName + " after " + elapsedMs + "ms: " + msg + suffix);
-                } else {
-                    suppressedRef.incrementAndGet();
-                }
-            }
-        }
-
-        RuntimeException ex;
-        switch (errorTypeCode) {
-            case 2:
-                ex = new TimeoutException(msg);
-                break;
-            case 3:
-                ex = new ClosingException(msg);
-                break;
-            case 1:
-                ex = new ExecAbortException(msg);
-                break;
-            case 4:
-                ex = new CircuitBreakerException(msg);
-                break;
-            default:
-                ex = new RequestException(msg);
-                break;
-        }
+        logRateLimitedNativeError(correlationId, errorTypeCode, msg);
+        RuntimeException ex = exceptionForNativeError(errorTypeCode, msg);
 
         logLifecycle(
                 Logger.Level.WARN,
@@ -756,6 +816,51 @@ public final class AsyncRegistry {
                         + ",\"completion_outcome\":"
                         + jsonString(outcome.name()));
         return outcome.nativeCode;
+    }
+
+    private static RuntimeException exceptionForNativeError(int errorTypeCode, String message) {
+        switch (errorTypeCode) {
+            case 2:
+                return new TimeoutException(message);
+            case 3:
+                return new ClosingException(message);
+            case 1:
+                return new ExecAbortException(message);
+            case 4:
+                return new CircuitBreakerException(message);
+            default:
+                return new RequestException(message);
+        }
+    }
+
+    private static void logRateLimitedNativeError(
+            long correlationId, int errorTypeCode, String message) {
+        if (errorTypeCode != 2 && errorTypeCode != 3) {
+            return;
+        }
+        Long registeredAt = registrationTimestamps.get(correlationId);
+        if (registeredAt == null) {
+            return;
+        }
+
+        long elapsedMs = (System.nanoTime() - registeredAt) / 1_000_000;
+        boolean isTimeout = errorTypeCode == 2;
+        AtomicLong lastLogRef = isTimeout ? lastTimeoutLogNs : lastDisconnectLogNs;
+        AtomicLong suppressedRef = isTimeout ? suppressedTimeoutLogs : suppressedDisconnectLogs;
+        String errorTypeName = isTimeout ? "Timeout" : "Disconnect";
+
+        long now = System.nanoTime();
+        long lastLog = lastLogRef.get();
+        if (now - lastLog >= LOG_RATE_LIMIT_NS && lastLogRef.compareAndSet(lastLog, now)) {
+            long suppressed = suppressedRef.getAndSet(0);
+            String suffix = suppressed > 0 ? " (suppressed " + suppressed + " similar)" : "";
+            Logger.log(
+                    Logger.Level.WARN,
+                    "AsyncRegistry",
+                    errorTypeName + " after " + elapsedMs + "ms: " + message + suffix);
+        } else {
+            suppressedRef.incrementAndGet();
+        }
     }
 
     /** Get current pending operation count. */
@@ -797,6 +902,7 @@ public final class AsyncRegistry {
                         state.future.cancel(true);
                     }
                 });
+        activeFutures.values().forEach(future -> future.cancel(true));
         activeFutures.clear();
         completionStates.clear();
     }
@@ -824,6 +930,9 @@ public final class AsyncRegistry {
                         state.future.completeExceptionally(new ClosingException(msg));
                     }
                 });
+        activeFutures
+                .values()
+                .forEach(future -> future.completeExceptionally(new ClosingException(msg)));
         activeFutures.clear();
         completionStates.clear();
         registrationTimestamps.clear();

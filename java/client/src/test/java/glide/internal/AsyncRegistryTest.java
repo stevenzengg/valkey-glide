@@ -34,6 +34,29 @@ public class AsyncRegistryTest {
     }
 
     @Test
+    void unselectedRegistrationUsesOnlyLegacyFutureState() {
+        CompletableFuture<Object> future = new CompletableFuture<>();
+
+        long id = AsyncRegistry.register(future, future, 0, 17L, 0, false);
+
+        assertEquals(0, AsyncRegistry.getCompletionStateCount());
+        assertTrue(AsyncRegistry.completeCallback(id, "response"));
+        assertEquals("response", future.join());
+    }
+
+    @Test
+    void selectedRegistrationRetainsDetailedTerminalState() {
+        CompletableFuture<Object> root = new CompletableFuture<>();
+        CompletableFuture<String> terminal = root.thenApply(Object::toString);
+
+        long id = AsyncRegistry.register(root, terminal, 0, 17L, 0, true);
+
+        assertEquals(1, AsyncRegistry.getCompletionStateCount());
+        assertEquals(COMPLETED, AsyncRegistry.completeCallbackForNative(id, "response"));
+        assertEquals(0, AsyncRegistry.getCompletionStateCount());
+    }
+
+    @Test
     void failAllWithError_completesAllPendingFutures() {
         CompletableFuture<Object> f1 = new CompletableFuture<>();
         CompletableFuture<Object> f2 = new CompletableFuture<>();
@@ -302,6 +325,7 @@ public class AsyncRegistryTest {
                         0,
                         17L,
                         0,
+                        true,
                         id -> {
                             notifiedId.set(id);
                             return true;
@@ -320,7 +344,7 @@ public class AsyncRegistryTest {
                         ignored -> {
                             throw new IllegalStateException("handler failed");
                         });
-        long failedId = AsyncRegistry.register(handlerFailureRoot, failedCommand, 0, 17L, 0);
+        long failedId = AsyncRegistry.register(handlerFailureRoot, failedCommand, 0, 17L, 0, true);
 
         assertEquals(FAILURE, AsyncRegistry.completeCallbackForNative(failedId, "response"));
         assertTrue(failedCommand.isCompletedExceptionally());
@@ -330,7 +354,7 @@ public class AsyncRegistryTest {
     void nativeTimeoutDeliveryHasADistinctTerminalOutcome() {
         CompletableFuture<Object> root = new CompletableFuture<>();
         CompletableFuture<String> command = root.thenApply(Object::toString);
-        long correlationId = AsyncRegistry.register(root, command, 0, 17L, 0);
+        long correlationId = AsyncRegistry.register(root, command, 0, 17L, 0, true);
 
         assertEquals(
                 NATIVE_TIMEOUT,
@@ -571,7 +595,7 @@ public class AsyncRegistryTest {
 
     private static long register(
             CompletableFuture<Object> future, LongPredicate cancellationNotifier) {
-        return AsyncRegistry.register(future, future, 0, 17, 0, cancellationNotifier);
+        return AsyncRegistry.register(future, future, 0, 17, 0, true, cancellationNotifier);
     }
 
     private static void await(CountDownLatch latch) {
