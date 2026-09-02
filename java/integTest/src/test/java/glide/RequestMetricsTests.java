@@ -22,6 +22,7 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
@@ -47,7 +48,7 @@ public class RequestMetricsTests {
                 RequestMetricsConfiguration.builder()
                         .samplePercentage(100)
                         .bufferCapacity(32)
-                        .allowedCustomCommands(new HashSet<>(Arrays.asList("GRAPH.QUERY", "PING")))
+                        .allowedCustomCommands(new HashSet<>(Arrays.asList("BLPOP", "GRAPH.QUERY", "PING")))
                         .build());
         drainAll();
     }
@@ -119,6 +120,27 @@ public class RequestMetricsTests {
         assertFalse(secondDrain.getHasMore());
     }
 
+    @Test
+    @SneakyThrows
+    public void cancellation_emits_once_while_the_server_command_finishes_in_the_background() {
+        drainAll();
+        String blockingKey = "request-metrics-cancelled-blpop-" + System.nanoTime();
+
+        try (GlideClient client = GlideClient.createClient(commonClientConfig().build()).get()) {
+            CompletableFuture<Object> command =
+                    client.customCommand(new String[] {"BLPOP", blockingKey, "0.1"});
+
+            assertTrue(command.cancel(false));
+
+            List<RequestMetricSample> samples = drainUntilSampleCount(1);
+            assertEquals(1, samples.size());
+            assertEquals("BLPOP", samples.get(0).getOperation());
+            assertEquals(RequestMetricResult.CANCELLED, samples.get(0).getResult());
+
+            assertNoSamplesFor(500, TimeUnit.MILLISECONDS);
+        }
+    }
+
     private static List<RequestMetricSample> drainAll() {
         List<RequestMetricSample> samples = new ArrayList<>();
         RequestMetricBatch batch;
@@ -144,5 +166,14 @@ public class RequestMetricsTests {
             }
         } while (samples.size() < expectedCount || batch.getHasMore());
         return samples;
+    }
+
+    private static void assertNoSamplesFor(long duration, TimeUnit unit) {
+        long deadline = System.nanoTime() + unit.toNanos(duration);
+        do {
+            RequestMetricBatch batch = RequestMetrics.drain(32);
+            assertTrue(batch.getSamples().isEmpty(), () -> "Unexpected late samples: " + batch);
+            LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(10));
+        } while (System.nanoTime() < deadline);
     }
 }

@@ -89,6 +89,8 @@ Multi-node fan-out currently retains only the outer request lifecycle phases. Fa
 
 Timeout and cancellation can overlap native response or callback work. Whichever terminal path wins finalizes the request once; late work cannot reclassify it or add phases. Active phase timers are closed at finalization so a terminal sample remains internally consistent.
 
+Cancelling the Java command future releases its Java completion state and native in-flight metrics bookkeeping, then finalizes a sampled request as `CANCELLED`. This bookkeeping operation does not abort the spawned Rust future, retract bytes already written to the socket, or cancel work already running on the server. The underlying command may therefore finish in the background, but its late callback cannot emit a second sample or change the recorded result.
+
 ## Current scope
 
 Sampling currently covers one direct Java command per request. Batch and transaction execution, scripts, scan lifecycles, and child network work in multi-node fan-out are outside this initial scope. Custom commands sent through the direct-command path are sampled, subject to the bounded labeling rules above. The schema and consumer API are designed so these other request shapes can be added later without making command producers perform network I/O.
