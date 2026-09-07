@@ -999,7 +999,7 @@ impl Client {
         client: ClientWrapper,
         compression_manager: Option<Arc<CompressionManager>>,
     ) -> RedisResult<Value> {
-        let raw_value = match client {
+        let raw_result = match client {
             ClientWrapper::Standalone(mut client) => client.send_command(&cmd).await,
             ClientWrapper::Cluster { mut client, .. } => {
                 let final_routing = if let Some(RoutingInfo::SingleNode(
@@ -1027,7 +1027,11 @@ impl Client {
                 client.route_command(&cmd, final_routing).await
             }
             ClientWrapper::Lazy(_) => unreachable!("Lazy client should have been initialized"),
-        }?;
+        };
+        let core_decode_timer = cmd.request_metrics().map(|context| {
+            context.start_phase(telemetrylib::request_metrics::RequestMetricPhase::CoreDecode)
+        });
+        let raw_value = raw_result?;
 
         // Post-process: decompress and convert to expected type.
         // Done after the mutable borrow on cmd is released.
@@ -1065,6 +1069,9 @@ impl Client {
 
         let expected_type = expected_type_for_cmd(&cmd);
         let value = convert_to_expected_type(processed_value, expected_type)?;
+        if let Some(core_decode_timer) = core_decode_timer {
+            core_decode_timer.finish();
+        }
 
         if self_clone.is_client_set_name_command(&cmd) {
             self_clone.handle_client_set_name_command(&cmd).await?;

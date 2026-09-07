@@ -30,6 +30,211 @@ pub mod testing {
     pub use super::connections_container::ConnectionDetails;
     pub use super::connections_logic::*;
 }
+
+#[cfg(test)]
+mod request_metrics_tests {
+    use super::*;
+    use futures::channel::oneshot as futures_oneshot;
+    use futures_util::task::noop_waker_ref;
+    use telemetrylib::request_metrics::{
+        BoundedOperation, RequestMetricContext, RequestMetricPhase, RequestMetricResult,
+        RequestMetricsState,
+    };
+
+    fn context() -> (Arc<RequestMetricsState>, Arc<RequestMetricContext>) {
+        let state = RequestMetricsState::new(100, 1, &[]).unwrap();
+        let context = state
+            .start(BoundedOperation::known("GET"))
+            .expect("100% sampling must create a context");
+        (state, context)
+    }
+
+    fn info(context: Arc<RequestMetricContext>) -> RequestInfo<MultiplexedConnection> {
+        let mut command = cmd("GET");
+        command.arg("key").set_request_metrics(Some(context));
+        RequestInfo {
+            cmd: CmdArg::Cmd {
+                cmd: Arc::new(command),
+                routing: InternalSingleNodeRouting::Random.into(),
+            },
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ordinary_retry_intervals_accumulate_and_finalize_pending_delay() {
+        let (state, context) = context();
+        let info = info(Arc::clone(&context));
+        let mut task_context = task::Context::from_waker(noop_waker_ref());
+
+        for (index, millis) in [2, 7].into_iter().enumerate() {
+            let (delay_sender, delay_receiver) = futures_oneshot::channel::<()>();
+            let (response_sender, _response_receiver) = oneshot::channel();
+            let delay = delay_receiver.map(|_| ()).boxed();
+            let mut request = Box::pin(Request {
+                retry_params: RetryParams::default(),
+                request: Some(PendingRequest {
+                    retry: 1,
+                    sender: response_sender,
+                    info: info.clone(),
+                }),
+                core: iam_token_refresh_tests::build_inner(None, None),
+                future: request_retry_sleep(delay, &info),
+            });
+
+            assert!(request.as_mut().poll(&mut task_context).is_pending());
+            tokio::time::advance(Duration::from_millis(millis)).await;
+            if index == 1 {
+                assert!(context.finish(RequestMetricResult::Cancelled));
+            }
+            delay_sender.send(()).unwrap();
+            assert!(matches!(
+                request.as_mut().poll(&mut task_context),
+                Poll::Ready(Next::Retry { .. })
+            ));
+        }
+
+        let sample = state.drain(1).unwrap().samples()[0].clone();
+        assert_eq!(
+            sample.phase_duration(RequestMetricPhase::RetryBackoff),
+            9_000_000
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_wait_intervals_accumulate_and_finalize_pending_future() {
+        let (state, context) = context();
+        let mut task_context = task::Context::from_waker(noop_waker_ref());
+
+        for (index, millis) in [3, 5].into_iter().enumerate() {
+            let (delay_sender, delay_receiver) = futures_oneshot::channel::<u8>();
+            let mut connection = Box::pin(time_connection_wait(
+                Some(&context),
+                delay_receiver.map(|value| value.unwrap()),
+            ));
+
+            assert!(connection.as_mut().poll(&mut task_context).is_pending());
+            tokio::time::advance(Duration::from_millis(millis)).await;
+            if index == 1 {
+                assert!(context.finish(RequestMetricResult::Cancelled));
+            }
+            delay_sender.send(index as u8).unwrap();
+            assert_eq!(
+                connection.as_mut().poll(&mut task_context),
+                Poll::Ready(index as u8)
+            );
+        }
+
+        let sample = state.drain(1).unwrap().samples()[0].clone();
+        assert_eq!(
+            sample.phase_duration(RequestMetricPhase::ConnectionWait),
+            8_000_000
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_slot_pending_delay_is_closed_by_finalization() {
+        let (state, context) = context();
+        let info = info(Arc::clone(&context));
+        let (delay_sender, delay_receiver) = futures_oneshot::channel::<()>();
+        let (response_sender, _response_receiver) = oneshot::channel();
+        let delay = delay_receiver.map(|_| ()).boxed();
+        let mut request = Box::pin(Request {
+            retry_params: RetryParams::default(),
+            request: Some(PendingRequest {
+                retry: 1,
+                sender: response_sender,
+                info: info.clone(),
+            }),
+            core: iam_token_refresh_tests::build_inner(None, None),
+            future: refresh_slots_retry_sleep(delay, &info),
+        });
+        let mut task_context = task::Context::from_waker(noop_waker_ref());
+
+        assert!(request.as_mut().poll(&mut task_context).is_pending());
+        tokio::time::advance(Duration::from_millis(4)).await;
+        assert!(context.finish(RequestMetricResult::Cancelled));
+        tokio::time::advance(Duration::from_millis(9)).await;
+        delay_sender.send(()).unwrap();
+        assert!(matches!(
+            request.as_mut().poll(&mut task_context),
+            Poll::Ready(Next::Retry { .. })
+        ));
+
+        let sample = state.drain(1).unwrap().samples()[0].clone();
+        assert_eq!(
+            sample.phase_duration(RequestMetricPhase::RetryBackoff),
+            4_000_000
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn primary_busy_loading_pending_delay_is_closed_by_finalization() {
+        let (state, context) = context();
+        let (delay_sender, delay_receiver) = futures_oneshot::channel::<()>();
+        let delay = delay_receiver.map(|_| ()).boxed();
+        let mut loading_delay = Box::pin(primary_loading_retry_sleep(
+            delay,
+            Some(Arc::clone(&context)),
+        ));
+        let mut task_context = task::Context::from_waker(noop_waker_ref());
+
+        assert!(loading_delay.as_mut().poll(&mut task_context).is_pending());
+        tokio::time::advance(Duration::from_millis(6)).await;
+        assert!(context.finish(RequestMetricResult::Cancelled));
+        tokio::time::advance(Duration::from_millis(10)).await;
+        delay_sender.send(()).unwrap();
+        assert!(loading_delay.as_mut().poll(&mut task_context).is_ready());
+        drop(loading_delay);
+
+        let sample = state.drain(1).unwrap().samples()[0].clone();
+        assert_eq!(
+            sample.phase_duration(RequestMetricPhase::RetryBackoff),
+            6_000_000
+        );
+    }
+
+    #[test]
+    fn routing_work_does_not_record_retry_backoff() {
+        let (state, context) = context();
+        let info = info(Arc::clone(&context));
+        let (response_sender, _response_receiver) = oneshot::channel();
+        let mut request = Box::pin(Request {
+            retry_params: RetryParams::default(),
+            request: Some(PendingRequest {
+                retry: 1,
+                sender: response_sender,
+                info,
+            }),
+            core: iam_token_refresh_tests::build_inner(None, None),
+            future: RequestState::UpdateMoved {
+                future: Box::pin(async { Ok(()) }),
+            },
+        });
+        let mut task_context = task::Context::from_waker(noop_waker_ref());
+
+        assert!(matches!(
+            request.as_mut().poll(&mut task_context),
+            Poll::Ready(Next::Retry { .. })
+        ));
+        assert!(context.finish(RequestMetricResult::Success));
+
+        let sample = state.drain(1).unwrap().samples()[0].clone();
+        assert_eq!(sample.phase_duration(RequestMetricPhase::RetryBackoff), 0);
+    }
+
+    #[test]
+    fn fanout_child_command_drops_outer_request_metrics() {
+        let (_state, context) = context();
+        let mut command = cmd("FLUSHALL");
+        command.set_request_metrics(Some(context));
+        let command = Arc::new(command);
+
+        let child = command_without_request_metrics(&command);
+
+        assert!(child.request_metrics().is_none());
+        assert_eq!(child.get_packed_command(), command.get_packed_command());
+    }
+}
 use crate::{
     client::GlideConnectionOptions,
     cluster,
@@ -75,6 +280,7 @@ use tokio::task::JoinHandle;
 
 #[cfg(feature = "tokio-comp")]
 use crate::aio::DisconnectNotifier;
+use telemetrylib::request_metrics::{PhaseTimer, RequestMetricContext, RequestMetricPhase};
 use telemetrylib::{GlideOpenTelemetry, GlideSpan, Telemetry};
 
 use crate::{
@@ -871,6 +1077,16 @@ fn boxed_sleep(duration: Duration) -> BoxFuture<'static, ()> {
     Box::pin(tokio::time::sleep(duration))
 }
 
+fn command_without_request_metrics(command: &Arc<Cmd>) -> Arc<Cmd> {
+    if command.request_metrics().is_none() {
+        return Arc::clone(command);
+    }
+
+    let mut child = command.as_ref().clone();
+    child.set_request_metrics(None);
+    Arc::new(child)
+}
+
 #[derive(Debug, Display)]
 pub(crate) enum Response {
     Single(Value),
@@ -947,6 +1163,15 @@ struct RequestInfo<C> {
 }
 
 impl<C> RequestInfo<C> {
+    fn request_metrics(&self) -> Option<&Arc<RequestMetricContext>> {
+        match &self.cmd {
+            CmdArg::Cmd { cmd, .. } => cmd.request_metrics(),
+            CmdArg::Pipeline { .. } | CmdArg::ClusterScan { .. } | CmdArg::OperationRequest(_) => {
+                None
+            }
+        }
+    }
+
     fn set_redirect(&mut self, redirect: Option<Redirect>) {
         if let Some(redirect) = redirect {
             match &mut self.cmd {
@@ -1036,11 +1261,56 @@ pin_project! {
         Sleep {
             #[pin]
             sleep: BoxFuture<'static, ()>,
+            retry_backoff: Option<PhaseTimer>,
         },
         UpdateMoved {
             #[pin]
             future: BoxFuture<'static, RedisResult<()>>,
         },
+    }
+}
+
+fn request_retry_sleep<C>(
+    sleep: BoxFuture<'static, ()>,
+    info: &RequestInfo<C>,
+) -> RequestState<BoxFuture<'static, OperationResult>> {
+    RequestState::Sleep {
+        sleep,
+        retry_backoff: info
+            .request_metrics()
+            .map(|context| context.start_phase(RequestMetricPhase::RetryBackoff)),
+    }
+}
+
+fn refresh_slots_retry_sleep<C>(
+    sleep: BoxFuture<'static, ()>,
+    info: &RequestInfo<C>,
+) -> RequestState<BoxFuture<'static, OperationResult>> {
+    request_retry_sleep(sleep, info)
+}
+
+async fn time_connection_wait<T>(
+    request_metrics: Option<&Arc<RequestMetricContext>>,
+    future: impl Future<Output = T>,
+) -> T {
+    let connection_wait =
+        request_metrics.map(|context| context.start_phase(RequestMetricPhase::ConnectionWait));
+    let result = future.await;
+    if let Some(connection_wait) = connection_wait {
+        connection_wait.finish();
+    }
+    result
+}
+
+async fn primary_loading_retry_sleep(
+    sleep: BoxFuture<'static, ()>,
+    request_metrics: Option<Arc<RequestMetricContext>>,
+) {
+    let retry_backoff =
+        request_metrics.map(|context| context.start_phase(RequestMetricPhase::RetryBackoff));
+    sleep.await;
+    if let Some(retry_backoff) = retry_backoff {
+        retry_backoff.finish();
     }
 }
 
@@ -1189,7 +1459,7 @@ mod iam_token_refresh_tests {
     }
 
     /// Helper to build a minimal InnerCore with the given password and IAM provider.
-    fn build_inner(
+    pub(super) fn build_inner(
         initial_password: Option<String>,
         provider: Option<Arc<dyn crate::client::IAMTokenProvider>>,
     ) -> Arc<InnerCore<crate::aio::MultiplexedConnection>> {
@@ -1331,8 +1601,14 @@ where
         }
         let future = match this.future.as_mut().project() {
             RequestStateProj::Future { future } => future,
-            RequestStateProj::Sleep { sleep } => {
+            RequestStateProj::Sleep {
+                sleep,
+                retry_backoff,
+            } => {
                 ready!(sleep.poll(cx));
+                if let Some(retry_backoff) = retry_backoff.take() {
+                    retry_backoff.finish();
+                }
                 return Next::Retry {
                     request: self.project().request.take().unwrap(),
                 }
@@ -1522,9 +1798,10 @@ where
                     RetryMethod::WaitAndRetry => {
                         let sleep_duration = this.retry_params.wait_time_for_retry(request.retry);
                         // Sleep and retry.
-                        this.future.set(RequestState::Sleep {
-                            sleep: boxed_sleep(sleep_duration),
-                        });
+                        this.future.set(request_retry_sleep(
+                            boxed_sleep(sleep_duration),
+                            &request.info,
+                        ));
                         self.poll(cx)
                     }
                     RetryMethod::Reconnect | RetryMethod::ReconnectAndRetry => {
@@ -3106,23 +3383,24 @@ where
                 MultipleNodeRoutingInfo::AllNodes => into_channels(
                     connections_container
                         .all_node_connections()
-                        .map(|tuple| Some((cmd.clone(), tuple))),
+                        .map(|tuple| Some((command_without_request_metrics(cmd), tuple))),
                 ),
                 MultipleNodeRoutingInfo::AllMasters => into_channels(
                     connections_container
                         .all_primary_connections()
-                        .map(|tuple| Some((cmd.clone(), tuple))),
+                        .map(|tuple| Some((command_without_request_metrics(cmd), tuple))),
                 ),
                 MultipleNodeRoutingInfo::MultiSlot((slots, _)) => {
                     into_channels(slots.iter().map(|(route, indices)| {
                         connections_container
                             .connection_for_route(route)
                             .map(|tuple| {
-                                let new_cmd =
+                                let mut new_cmd =
                                     crate::cluster_routing::command_for_multi_slot_indices(
                                         cmd.as_ref(),
                                         indices.iter(),
                                     );
+                                new_cmd.set_request_metrics(None);
                                 (Arc::new(new_cmd), tuple)
                             })
                     }))
@@ -3159,9 +3437,12 @@ where
         };
         log_trace_lazy!("cluster", "route request to single node");
 
-        let (address, mut conn) = Self::get_connection(routing, core, Some(cmd.clone()))
-            .await
-            .map_err(|err| (OperationTarget::NotFound, err))?;
+        let connection = time_connection_wait(
+            cmd.request_metrics(),
+            Self::get_connection(routing, core, Some(cmd.clone())),
+        )
+        .await;
+        let (address, mut conn) = connection.map_err(|err| (OperationTarget::NotFound, err))?;
         if let Some(span) = cmd.span() {
             set_routed_node_on_span(&span, &address);
         }
@@ -3889,7 +4170,15 @@ where
         retry: u32,
         retry_params: RetryParams,
     ) -> OperationResult {
-        Self::handle_loading_error(core.clone(), address, retry, retry_params).await;
+        let request_metrics = info.request_metrics().cloned();
+        Self::handle_loading_error_with_metrics(
+            core.clone(),
+            address,
+            retry,
+            retry_params,
+            request_metrics,
+        )
+        .await;
         Self::try_request(info, core).await
     }
 
@@ -3898,6 +4187,16 @@ where
         address: String,
         retry: u32,
         retry_params: RetryParams,
+    ) {
+        Self::handle_loading_error_with_metrics(core, address, retry, retry_params, None).await;
+    }
+
+    async fn handle_loading_error_with_metrics(
+        core: Core<C>,
+        address: String,
+        retry: u32,
+        retry_params: RetryParams,
+        request_metrics: Option<Arc<RequestMetricContext>>,
     ) {
         let is_primary = core.conn_lock.read().is_primary(&address);
 
@@ -3908,7 +4207,7 @@ where
         } else {
             // If the connection is primary, just sleep and retry
             let sleep_duration = retry_params.wait_time_for_retry(retry);
-            boxed_sleep(sleep_duration).await;
+            primary_loading_retry_sleep(boxed_sleep(sleep_duration), request_metrics).await;
         }
     }
 
@@ -3993,8 +4292,7 @@ where
                     > = if let Some(moved_redirect) = moved_redirect {
                         // Resolve the redirect address through the address resolver to translate
                         // internal cluster hostnames to externally-reachable addresses.
-                        let resolved_address =
-                            self.inner.resolve_address(&moved_redirect.address);
+                        let resolved_address = self.inner.resolve_address(&moved_redirect.address);
                         Some(RequestState::UpdateMoved {
                             future: Box::pin(ClusterConnInner::update_upon_moved_error(
                                 self.inner.clone(),
@@ -4004,9 +4302,10 @@ where
                         })
                     } else if let Some(ref request) = request {
                         match sleep_duration {
-                            Some(sleep_duration) => Some(RequestState::Sleep {
-                                sleep: boxed_sleep(sleep_duration),
-                            }),
+                            Some(sleep_duration) => Some(refresh_slots_retry_sleep(
+                                boxed_sleep(sleep_duration),
+                                &request.info,
+                            )),
                             None => Some(RequestState::Future {
                                 future: Box::pin(Self::try_request(
                                     request.info.clone(),

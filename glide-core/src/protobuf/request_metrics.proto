@@ -1,0 +1,45 @@
+syntax = "proto3";
+package request_metrics;
+
+enum RequestMetricResult {
+  REQUEST_METRIC_RESULT_UNSPECIFIED = 0;
+  REQUEST_METRIC_RESULT_SUCCESS = 1;
+  REQUEST_METRIC_RESULT_FAILURE = 2;
+  REQUEST_METRIC_RESULT_TIMEOUT = 3;
+  REQUEST_METRIC_RESULT_CANCELLED = 4;
+}
+
+enum RequestMetricPhase {
+  REQUEST_METRIC_PHASE_UNSPECIFIED = 0;
+  REQUEST_METRIC_PHASE_JNI_INGRESS = 1;
+  REQUEST_METRIC_PHASE_CLIENT_QUEUE = 2;
+  REQUEST_METRIC_PHASE_COMMAND_PREPARE = 3;
+  REQUEST_METRIC_PHASE_CONNECTION_WAIT = 4;
+  REQUEST_METRIC_PHASE_PIPELINE_QUEUE = 5;
+  REQUEST_METRIC_PHASE_SOCKET_WRITE = 6;
+  REQUEST_METRIC_PHASE_RESPONSE_WAIT = 7;
+  REQUEST_METRIC_PHASE_RETRY_BACKOFF = 8;
+  REQUEST_METRIC_PHASE_CORE_DECODE = 9;
+  REQUEST_METRIC_PHASE_CALLBACK_QUEUE = 10;
+  REQUEST_METRIC_PHASE_CALLBACK_COMPLETE = 11;
+  REQUEST_METRIC_PHASE_TOTAL = 12;
+}
+
+message RequestMetricPhaseDuration {
+  RequestMetricPhase phase = 1;
+  uint64 duration_nanos = 2;
+}
+
+message RequestMetricSample {
+  string operation = 1;
+  RequestMetricResult result = 2;
+  uint32 attempt_count = 3;
+  repeated RequestMetricPhaseDuration phase_durations = 4;
+}
+
+message RequestMetricBatch {
+  repeated RequestMetricSample samples = 1;
+  uint64 dropped_samples = 2;
+  uint64 remaining_samples = 3;
+  bool has_more = 4;
+}

@@ -7,11 +7,12 @@ use futures_util::{
 #[cfg(feature = "aio")]
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::{borrow::Borrow, fmt, io};
+use std::{borrow::Borrow, fmt, io, sync::Arc};
 
 use crate::pipeline::Pipeline;
 use crate::types::{from_owned_redis_value, FromRedisValue, RedisResult, RedisWrite, ToRedisArgs};
 use crate::{cache::glide_cache::CachedKeyType, connection::ConnectionLike};
+use telemetrylib::request_metrics::RequestMetricContext;
 use telemetrylib::GlideSpan;
 
 /// An argument to a redis command
@@ -51,6 +52,8 @@ pub struct Cmd {
     no_response: bool,
     /// The span associated with this command
     span: Option<GlideSpan>,
+    /// The sampled native request lifecycle shared by routing/retry clones.
+    request_metrics: Option<Arc<RequestMetricContext>>,
     //  A flag indicating whether this is a fenced command  (will have PING appended to ensure ordering)
     is_fenced: bool,
     /// Whether this is a blocking command (e.g. XREAD BLOCK, BLPOP). When true,
@@ -85,6 +88,7 @@ impl Clone for Cmd {
             cursor: self.cursor,
             no_response: self.no_response,
             span: self.span.clone(),
+            request_metrics: self.request_metrics.clone(),
             is_fenced: self.is_fenced,
             is_blocking: self.is_blocking,
             response_timeout: self.response_timeout,
@@ -533,6 +537,7 @@ impl Cmd {
             cursor: None,
             no_response: false,
             span: None,
+            request_metrics: None,
             is_fenced: false,
             is_blocking: false,
             response_timeout: None,
@@ -551,6 +556,7 @@ impl Cmd {
             cursor: None,
             no_response: false,
             span: None,
+            request_metrics: None,
             is_fenced: false,
             is_blocking: false,
             response_timeout: None,
@@ -613,6 +619,24 @@ impl Cmd {
     pub fn set_span(&mut self, span: Option<GlideSpan>) -> &mut Cmd {
         self.span = span;
         self
+    }
+
+    /// Associates a sampled native request lifecycle with this command.
+    #[doc(hidden)]
+    #[inline]
+    pub fn set_request_metrics(
+        &mut self,
+        request_metrics: Option<Arc<RequestMetricContext>>,
+    ) -> &mut Cmd {
+        self.request_metrics = request_metrics;
+        self
+    }
+
+    /// Returns the sampled native request lifecycle associated with this command.
+    #[doc(hidden)]
+    #[inline]
+    pub fn request_metrics(&self) -> Option<&Arc<RequestMetricContext>> {
+        self.request_metrics.as_ref()
     }
 
     /// Works similar to `arg` but adds a cursor argument.  This is always
@@ -1069,7 +1093,9 @@ pub fn pipe() -> Pipeline {
 #[cfg(feature = "cluster")]
 mod tests {
     use super::Cmd;
+    use std::sync::Arc;
     use std::time::Duration;
+    use telemetrylib::request_metrics::{BoundedOperation, RequestMetricsState};
 
     #[test]
     fn test_cmd_arg_idx() {
@@ -1142,6 +1168,33 @@ mod tests {
 
         let cloned = cmd.clone();
         assert!(cloned.is_blocking(), "clone must preserve is_blocking=true");
+    }
+
+    #[test]
+    fn retry_clone_preserves_request_metrics_context_and_command_state() {
+        let state = RequestMetricsState::new(100, 1, &[]).unwrap();
+        let context = state
+            .start(BoundedOperation::known("GET"))
+            .expect("100% sampling must create a context");
+        let mut command = Cmd::new();
+        command
+            .arg("GET")
+            .arg("key")
+            .cursor_arg(7)
+            .set_no_response(true)
+            .set_fenced(true)
+            .set_request_metrics(Some(Arc::clone(&context)));
+
+        let retry = command.clone();
+
+        assert!(Arc::ptr_eq(
+            retry.request_metrics().unwrap(),
+            command.request_metrics().unwrap()
+        ));
+        assert_eq!(retry.get_packed_command(), command.get_packed_command());
+        assert_eq!(retry.is_no_response(), command.is_no_response());
+        assert_eq!(retry.is_fenced(), command.is_fenced());
+        assert_eq!(retry.cursor, command.cursor);
     }
 
     mod segmented_packing {

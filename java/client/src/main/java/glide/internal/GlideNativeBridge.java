@@ -48,7 +48,8 @@ public class GlideNativeBridge {
             int routeType,
             String routeParam,
             boolean expectUtf8Response,
-            long spanPtr);
+            long spanPtr,
+            boolean requestMetricsSampled);
 
     /**
      * Execute a batch of commands asynchronously, passing parameters directly via JNI.
@@ -127,8 +128,11 @@ public class GlideNativeBridge {
             boolean expectUtf8Response,
             long callbackId);
 
-    /** Mark a callback as timed out on the native side. */
-    public static native void markTimedOut(long callbackId);
+    /** Mark a callback as timed out on the native side and report whether native owns its state. */
+    public static native boolean markTimedOut(long callbackId);
+
+    /** Mark a callback as cancelled and release its native request bookkeeping. */
+    public static native boolean markCancelled(long callbackId);
 
     /** Get cache metrics */
     public static native void getCacheMetrics(long clientPtr, long callbackId, int metricsType);

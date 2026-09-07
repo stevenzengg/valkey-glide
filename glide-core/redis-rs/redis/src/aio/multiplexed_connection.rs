@@ -28,9 +28,10 @@ use std::fmt;
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{self, Poll};
 use std::time::Duration;
+use telemetrylib::request_metrics::{PhaseTimer, RequestMetricContext, RequestMetricPhase};
 
 // Default connection timeout in ms
 const DEFAULT_CONNECTION_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(2000);
@@ -242,11 +243,127 @@ struct InFlight {
     response_aggregate: ResponseAggregate,
     is_fenced: bool,
     fenced_result: Option<RedisResult<Value>>,
+    request_metrics: Option<Arc<AttemptMetricCompletion>>,
+}
+
+impl InFlight {
+    fn finish_response_metrics(&self) {
+        if let Some(request_metrics) = &self.request_metrics {
+            request_metrics.finish();
+        }
+    }
+}
+
+struct PipelineMessageMetrics {
+    pipeline_queue: PhaseTimer,
+    context: Arc<RequestMetricContext>,
+    attempt_completion: Arc<AttemptMetricCompletion>,
+}
+
+enum AttemptMetricState {
+    Pending,
+    Active {
+        socket_write: PhaseTimer,
+        response_wait: PhaseTimer,
+    },
+    Finished,
+}
+
+struct AttemptMetricCompletion {
+    state: Mutex<AttemptMetricState>,
+}
+
+impl AttemptMetricCompletion {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(AttemptMetricState::Pending),
+        }
+    }
+
+    fn start_attempt<F>(
+        &self,
+        context: &Arc<RequestMetricContext>,
+        start_send: F,
+    ) -> RedisResult<Option<PhaseTimer>>
+    where
+        F: FnOnce() -> RedisResult<()>,
+    {
+        let mut state = self.state.lock().expect("attempt metrics mutex poisoned");
+        if matches!(*state, AttemptMetricState::Finished) {
+            return start_send().map(|()| None);
+        }
+        debug_assert!(matches!(*state, AttemptMetricState::Pending));
+
+        context.increment_attempt_count();
+        let socket_write = context.start_phase(RequestMetricPhase::SocketWrite);
+        let response_wait = context.start_phase(RequestMetricPhase::ResponseWait);
+        match start_send() {
+            Ok(()) => {
+                let pending_flush = socket_write.clone();
+                *state = AttemptMetricState::Active {
+                    socket_write,
+                    response_wait,
+                };
+                Ok(Some(pending_flush))
+            }
+            Err(err) => {
+                socket_write.finish();
+                response_wait.finish();
+                *state = AttemptMetricState::Finished;
+                Err(err)
+            }
+        }
+    }
+
+    fn finish(&self) -> bool {
+        let mut state = self.state.lock().expect("attempt metrics mutex poisoned");
+        match &*state {
+            AttemptMetricState::Pending => {
+                *state = AttemptMetricState::Finished;
+                false
+            }
+            AttemptMetricState::Active {
+                socket_write,
+                response_wait,
+            } => {
+                socket_write.finish();
+                response_wait.finish();
+                *state = AttemptMetricState::Finished;
+                true
+            }
+            AttemptMetricState::Finished => false,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_active(&self) -> bool {
+        matches!(
+            *self.state.lock().expect("attempt metrics mutex poisoned"),
+            AttemptMetricState::Active { .. }
+        )
+    }
+}
+
+struct AttemptMetricGuard(Option<Arc<AttemptMetricCompletion>>);
+
+impl AttemptMetricGuard {
+    fn finish(&mut self) {
+        if let Some(completion) = self.0.take() {
+            completion.finish();
+        }
+    }
+}
+
+impl Drop for AttemptMetricGuard {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 // A single message sent through the pipeline
 struct PipelineMessage<S> {
     input: S,
+    request_metrics: Option<PipelineMessageMetrics>,
     output: PipelineOutput,
     // If `None`, this is a single request, not a pipeline of multiple requests.
     pipeline_response_count: Option<usize>,
@@ -296,11 +413,18 @@ pin_project! {
         response_sync_lost: bool,
         cache: Option<Arc<dyn GlideCache>>,
         progress: Arc<AtomicU64>,
+        pending_flush_metrics: Vec<PhaseTimer>,
     }
 
         impl<T> PinnedDrop for PipelineSink<T> {
         fn drop(this: Pin<&mut Self>) {
             let this = this.project();
+            for entry in this.in_flight.drain(..) {
+                entry.finish_response_metrics();
+            }
+            for timer in this.pending_flush_metrics.drain(..) {
+                timer.finish();
+            }
             let push_manager = this.push_manager.load();
             let address = push_manager.get_address();
 
@@ -339,6 +463,13 @@ where
             response_sync_lost: false,
             cache,
             progress,
+            pending_flush_metrics: Vec::new(),
+        }
+    }
+
+    fn finish_pending_socket_writes(mut self: Pin<&mut Self>) {
+        for timer in self.as_mut().project().pending_flush_metrics.drain(..) {
+            timer.finish();
         }
     }
 
@@ -376,6 +507,7 @@ where
                     crate::ErrorKind::ProtocolDesync,
                     "Response synchronization lost - connection must be reestablished",
                 ));
+                entry.finish_response_metrics();
                 entry.output.send(Err(err)).ok();
             }
             return;
@@ -423,6 +555,7 @@ where
 
         match &mut entry.response_aggregate {
             ResponseAggregate::SingleCommand => {
+                entry.finish_response_metrics();
                 entry
                     .output
                     .send(result.and_then(|v| v.extract_error()))
@@ -470,6 +603,7 @@ where
                 // `Err` means that the receiver was dropped in which case it does not
                 // care about the output and we can continue by just dropping the value
                 // and sender
+                entry.finish_response_metrics();
                 entry.output.send(response).ok();
             }
         }
@@ -508,6 +642,7 @@ where
             // This means the fenced command had no response
             Ok(Value::SimpleString(ref s)) if s == "PONG" || s == "pong" => {
                 // Return Ok(Nil) to indicate success with no data
+                entry.finish_response_metrics();
                 entry.output.send(Ok(Value::Nil)).ok();
             }
 
@@ -556,12 +691,14 @@ where
                 "Expected PONG for fenced command but received different response",
                 format!("Response synchronization lost. Got: {:?}", pong_result),
             ));
+            entry.finish_response_metrics();
             entry.output.send(Err(err)).ok();
             return;
         }
 
         // ✅ Got PONG as expected, return the stored result
         let final_result = stored_result.and_then(|v| v.extract_error());
+        entry.finish_response_metrics();
         entry.output.send(final_result).ok();
     }
 }
@@ -606,12 +743,18 @@ where
         mut self: Pin<&mut Self>,
         PipelineMessage {
             input,
+            request_metrics,
             output,
             pipeline_response_count,
             is_transaction,
             is_fenced,
         }: PipelineMessage<SinkItem>,
     ) -> Result<(), Self::Error> {
+        let request_metrics = request_metrics.map(|request_metrics| {
+            request_metrics.pipeline_queue.finish();
+            (request_metrics.context, request_metrics.attempt_completion)
+        });
+
         // A message was pulled from the channel into the sink, so a channel slot
         // just freed: the writer is making progress. Producers waiting on a full
         // channel use this as a liveness signal to tell backpressure from a dead
@@ -648,8 +791,18 @@ where
             return Err(());
         }
 
-        match self_.sink_stream.start_send(input) {
-            Ok(()) => {
+        let start_result = match request_metrics.as_ref() {
+            Some((context, completion)) => completion
+                .start_attempt(context, || self_.sink_stream.start_send(input))
+                .map(|pending_flush| (pending_flush, Some(Arc::clone(completion)))),
+            None => self_.sink_stream.start_send(input).map(|()| (None, None)),
+        };
+
+        match start_result {
+            Ok((pending_flush, request_metrics)) => {
+                if let Some(socket_write) = pending_flush {
+                    self_.pending_flush_metrics.push(socket_write);
+                }
                 let response_aggregate =
                     ResponseAggregate::new(pipeline_response_count, is_transaction);
                 let entry = InFlight {
@@ -657,6 +810,7 @@ where
                     response_aggregate,
                     is_fenced,
                     fenced_result: None,
+                    request_metrics,
                 };
 
                 self_.in_flight.push_back(entry);
@@ -673,33 +827,34 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut task::Context,
     ) -> Poll<Result<(), Self::Error>> {
-        let flush_result = self
-            .as_mut()
-            .project()
-            .sink_stream
-            .poll_flush(cx)
-            .map_err(|err| {
-                self.as_mut().send_result(Err(err));
-            })?;
-        if flush_result.is_ready() {
-            self.poll_read(cx)
-        } else {
-            // Flush is blocked (TCP send buffer full). Drain incoming responses
-            // so the server can free its send buffer and unblock our writes.
-            // Without this, a TCP deadlock occurs with large payloads.
-            // See https://github.com/redis-rs/redis-rs/issues/1955.
-            //
-            // Note: upstream redis-rs calls poll_read unconditionally at the top
-            // and removes the ready!/poll_read-after-flush pattern. We keep
-            // poll_read only in the Pending path (and retain the post-flush
-            // poll_read for throughput) because unconditional poll_read registers
-            // the read waker on every call, causing spurious wakeups that starve
-            // concurrent request processing and exhaust the inflight request
-            // limit unique to valkey-glide.
-            if matches!(self.as_mut().poll_read(cx), Poll::Ready(Err(()))) {
-                return Poll::Ready(Err(()));
+        match self.as_mut().project().sink_stream.poll_flush(cx) {
+            Poll::Ready(Ok(())) => {
+                self.as_mut().finish_pending_socket_writes();
+                self.poll_read(cx)
             }
-            Poll::Pending
+            Poll::Ready(Err(err)) => {
+                self.as_mut().finish_pending_socket_writes();
+                self.as_mut().send_result(Err(err));
+                Poll::Ready(Err(()))
+            }
+            Poll::Pending => {
+                // Flush is blocked (TCP send buffer full). Drain incoming responses
+                // so the server can free its send buffer and unblock our writes.
+                // Without this, a TCP deadlock occurs with large payloads.
+                // See https://github.com/redis-rs/redis-rs/issues/1955.
+                //
+                // Note: upstream redis-rs calls poll_read unconditionally at the top
+                // and removes the ready!/poll_read-after-flush pattern. We keep
+                // poll_read only in the Pending path (and retain the post-flush
+                // poll_read for throughput) because unconditional poll_read registers
+                // the read waker on every call, causing spurious wakeups that starve
+                // concurrent request processing and exhaust the inflight request
+                // limit unique to valkey-glide.
+                if matches!(self.as_mut().poll_read(cx), Poll::Ready(Err(()))) {
+                    return Poll::Ready(Err(()));
+                }
+                Poll::Pending
+            }
         }
     }
 
@@ -802,6 +957,7 @@ where
     }
 
     // `None` means that the stream was out of items causing that poll loop to shut down.
+    #[cfg(test)]
     async fn send_single(
         &mut self,
         item: SinkItem,
@@ -809,8 +965,28 @@ where
         is_fenced: bool,
         is_blocking: bool,
     ) -> RedisResult<Value> {
-        self.send_recv(item, None, timeout, true, is_fenced, is_blocking)
+        self.send_single_with_metrics(item, None, timeout, is_fenced, is_blocking)
             .await
+    }
+
+    async fn send_single_with_metrics(
+        &mut self,
+        item: SinkItem,
+        request_metrics: Option<Arc<RequestMetricContext>>,
+        timeout: Duration,
+        is_fenced: bool,
+        is_blocking: bool,
+    ) -> RedisResult<Value> {
+        self.send_recv_with_metrics(
+            item,
+            None,
+            request_metrics,
+            timeout,
+            true,
+            is_fenced,
+            is_blocking,
+        )
+        .await
     }
 
     async fn send_recv(
@@ -823,7 +999,44 @@ where
         is_fenced: bool,
         is_blocking: bool,
     ) -> Result<Value, RedisError> {
+        self.send_recv_with_metrics(
+            input,
+            pipeline_response_count,
+            None,
+            timeout,
+            is_atomic,
+            is_fenced,
+            is_blocking,
+        )
+        .await
+    }
+
+    async fn send_recv_with_metrics(
+        &mut self,
+        input: SinkItem,
+        pipeline_response_count: Option<usize>,
+        request_metrics: Option<Arc<RequestMetricContext>>,
+        timeout: Duration,
+        is_atomic: bool,
+        is_fenced: bool,
+        is_blocking: bool,
+    ) -> Result<Value, RedisError> {
         let (sender, receiver) = oneshot::channel();
+        let (request_metrics, attempt_completion) = match request_metrics {
+            Some(context) => {
+                let attempt_completion = Arc::new(AttemptMetricCompletion::new());
+                (
+                    Some(PipelineMessageMetrics {
+                        pipeline_queue: context.start_phase(RequestMetricPhase::PipelineQueue),
+                        context,
+                        attempt_completion: Arc::clone(&attempt_completion),
+                    }),
+                    Some(attempt_completion),
+                )
+            }
+            None => (None, None),
+        };
+        let mut attempt_guard = AttemptMetricGuard(attempt_completion);
 
         // Acquire a slot in the bounded pipeline channel, distinguishing a
         // slow-but-live connection from a dead one. We poll for capacity in short
@@ -902,6 +1115,7 @@ where
         };
         permit.send(PipelineMessage {
             input,
+            request_metrics,
             pipeline_response_count,
             output: sender,
             is_transaction: is_atomic,
@@ -939,7 +1153,7 @@ where
                 )
             );
         }
-        match recv_result {
+        let result = match recv_result {
             Ok(Ok(result)) => result,
             Ok(Err(err)) => {
                 // The `sender` was dropped, likely indicating a failure in the stream.
@@ -952,7 +1166,9 @@ where
                 )))
             }
             Err(elapsed) => Err(elapsed.into()),
-        }
+        };
+        attempt_guard.finish();
+        result
     }
 
     /// Sets `PushManager` of Pipeline
@@ -1093,9 +1309,10 @@ impl MultiplexedConnection {
             }
         }
         let timeout = cmd.response_timeout().unwrap_or(self.response_timeout);
+        let request_metrics = cmd.request_metrics().cloned();
         let result = self
             .pipeline
-            .send_single(
+            .send_single_with_metrics(
                 // Commands with no out-of-line payloads skip the segmented
                 // representation entirely (see SendBuf::Contiguous).
                 if cmd.has_out_of_line_args() {
@@ -1103,6 +1320,7 @@ impl MultiplexedConnection {
                 } else {
                     crate::cmd::SendBuf::Contiguous(cmd.get_packed_command())
                 },
+                request_metrics,
                 timeout,
                 cmd.is_fenced(),
                 cmd.is_blocking(),
@@ -2406,5 +2624,639 @@ mod tests {
             f.abort();
         }
         driver.abort();
+    }
+}
+#[cfg(test)]
+mod request_metrics_tests {
+    use super::*;
+    use futures_util::task::{noop_waker_ref, waker, ArcWake};
+    use std::time::Duration;
+    use telemetrylib::request_metrics::{
+        BoundedOperation, RequestMetricContext, RequestMetricPhase, RequestMetricResult,
+        RequestMetricsState,
+    };
+    use tokio::sync::oneshot::error::TryRecvError;
+
+    #[derive(Default)]
+    struct TestTransport {
+        sent: usize,
+        fail_send: bool,
+        fail_flush: bool,
+    }
+
+    impl Stream for TestTransport {
+        type Item = RedisResult<Value>;
+
+        fn poll_next(
+            self: Pin<&mut Self>,
+            _cx: &mut task::Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            Poll::Pending
+        }
+    }
+
+    impl Sink<Vec<u8>> for TestTransport {
+        type Error = RedisError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut task::Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(mut self: Pin<&mut Self>, _item: Vec<u8>) -> Result<(), Self::Error> {
+            self.sent += 1;
+            if self.fail_send {
+                Err(RedisError::from((
+                    crate::ErrorKind::IoError,
+                    "test send failure",
+                )))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut task::Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            if self.fail_flush {
+                Poll::Ready(Err(RedisError::from((
+                    crate::ErrorKind::IoError,
+                    "test flush failure",
+                ))))
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut task::Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn state() -> Arc<RequestMetricsState> {
+        RequestMetricsState::new(100, 8, &[]).unwrap()
+    }
+
+    fn context(state: &Arc<RequestMetricsState>) -> Arc<RequestMetricContext> {
+        state
+            .start(BoundedOperation::known("GET"))
+            .expect("100% sampling must create a context")
+    }
+
+    fn sink() -> PipelineSink<TestTransport> {
+        PipelineSink::new::<Vec<u8>>(
+            TestTransport::default(),
+            Arc::new(ArcSwap::new(Arc::new(PushManager::default()))),
+            None,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            Arc::new(AtomicU64::new(0)),
+        )
+    }
+
+    fn message(
+        context: Option<Arc<RequestMetricContext>>,
+        pipeline_response_count: Option<usize>,
+        is_fenced: bool,
+    ) -> (
+        PipelineMessage<Vec<u8>>,
+        oneshot::Receiver<RedisResult<Value>>,
+    ) {
+        let (output, receiver) = oneshot::channel();
+        let request_metrics = context.map(|context| {
+            let attempt_completion = Arc::new(AttemptMetricCompletion::new());
+            PipelineMessageMetrics {
+                pipeline_queue: context.start_phase(RequestMetricPhase::PipelineQueue),
+                context,
+                attempt_completion,
+            }
+        });
+        (
+            PipelineMessage {
+                input: vec![1],
+                request_metrics,
+                output,
+                pipeline_response_count,
+                is_transaction: false,
+                is_fenced,
+            },
+            receiver,
+        )
+    }
+
+    fn finish_sample(
+        state: &Arc<RequestMetricsState>,
+        context: &RequestMetricContext,
+    ) -> telemetrylib::request_metrics::RequestMetricSample {
+        assert!(context.finish(RequestMetricResult::Success));
+        state.drain(1).unwrap().samples()[0].clone()
+    }
+
+    struct FinishContextOnWake(Arc<RequestMetricContext>);
+
+    impl ArcWake for FinishContextOnWake {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.finish(RequestMetricResult::Failure);
+        }
+    }
+
+    fn observe_terminal_on_wake(
+        receiver: &mut Pin<Box<oneshot::Receiver<RedisResult<Value>>>>,
+        context: Arc<RequestMetricContext>,
+    ) {
+        let waker = waker(Arc::new(FinishContextOnWake(context)));
+        let mut task_context = task::Context::from_waker(&waker);
+        assert!(receiver.as_mut().poll(&mut task_context).is_pending());
+    }
+
+    fn drain_sample(
+        state: &Arc<RequestMetricsState>,
+    ) -> telemetrylib::request_metrics::RequestMetricSample {
+        state.drain(1).unwrap().samples()[0].clone()
+    }
+
+    #[test]
+    fn start_send_finishes_queue_and_starts_socket_response_and_attempt() {
+        let state = state();
+        let context = context(&state);
+        let (message, _receiver) = message(Some(Arc::clone(&context)), None, false);
+        let mut sink = sink();
+
+        Pin::new(&mut sink).start_send(message).unwrap();
+        assert_eq!(sink.pending_flush_metrics.len(), 1);
+        assert_eq!(sink.in_flight.len(), 1);
+        Pin::new(&mut sink).send_result(Ok(Value::Okay));
+
+        let sample = finish_sample(&state, &context);
+        assert!(sample.phase_duration(RequestMetricPhase::PipelineQueue) > 0);
+        assert!(sample.phase_duration(RequestMetricPhase::SocketWrite) > 0);
+        assert!(sample.phase_duration(RequestMetricPhase::ResponseWait) > 0);
+        assert_eq!(sample.attempt_count(), 1);
+    }
+
+    #[test]
+    fn successful_flush_finishes_every_sampled_socket_write() {
+        let state = state();
+        let first = context(&state);
+        let second = context(&state);
+        let mut sink = sink();
+        Pin::new(&mut sink)
+            .start_send(message(Some(Arc::clone(&first)), None, false).0)
+            .unwrap();
+        Pin::new(&mut sink)
+            .start_send(message(Some(Arc::clone(&second)), None, false).0)
+            .unwrap();
+        assert_eq!(sink.pending_flush_metrics.len(), 2);
+
+        let mut task_context = task::Context::from_waker(noop_waker_ref());
+        assert!(Pin::new(&mut sink)
+            .poll_flush(&mut task_context)
+            .is_pending());
+        assert!(sink.pending_flush_metrics.is_empty());
+        Pin::new(&mut sink).send_result(Ok(Value::Okay));
+        Pin::new(&mut sink).send_result(Ok(Value::Okay));
+
+        let first = finish_sample(&state, &first);
+        let second = finish_sample(&state, &second);
+        assert!(first.phase_duration(RequestMetricPhase::SocketWrite) > 0);
+        assert!(second.phase_duration(RequestMetricPhase::SocketWrite) > 0);
+    }
+
+    #[test]
+    fn response_before_flush_finishes_shared_socket_timer_once() {
+        let state = state();
+        let context = context(&state);
+        let mut sink = sink();
+        Pin::new(&mut sink)
+            .start_send(message(Some(Arc::clone(&context)), None, false).0)
+            .unwrap();
+
+        Pin::new(&mut sink).send_result(Ok(Value::Okay));
+        assert_eq!(sink.pending_flush_metrics.len(), 1);
+        assert!(!sink.pending_flush_metrics[0].finish());
+        let sample = finish_sample(&state, &context);
+        assert!(sample.phase_duration(RequestMetricPhase::SocketWrite) > 0);
+
+        let mut task_context = task::Context::from_waker(noop_waker_ref());
+        assert!(Pin::new(&mut sink)
+            .poll_flush(&mut task_context)
+            .is_pending());
+        assert!(sink.pending_flush_metrics.is_empty());
+    }
+
+    #[test]
+    fn flush_error_closes_socket_and_response_timers() {
+        let state = state();
+        let context = context(&state);
+        let mut sink = sink();
+        sink.sink_stream.fail_flush = true;
+        let (message, mut receiver) = message(Some(Arc::clone(&context)), None, false);
+        Pin::new(&mut sink).start_send(message).unwrap();
+
+        let mut task_context = task::Context::from_waker(noop_waker_ref());
+        assert!(matches!(
+            Pin::new(&mut sink).poll_flush(&mut task_context),
+            Poll::Ready(Err(()))
+        ));
+        assert!(receiver.try_recv().unwrap().is_err());
+        assert!(sink.pending_flush_metrics.is_empty());
+
+        let sample = finish_sample(&state, &context);
+        assert!(sample.phase_duration(RequestMetricPhase::SocketWrite) > 0);
+        assert!(sample.phase_duration(RequestMetricPhase::ResponseWait) > 0);
+    }
+
+    #[test]
+    fn start_send_failure_closes_attempt_phases_before_waking_receiver() {
+        let state = state();
+        let context = context(&state);
+        let mut sink = sink();
+        sink.sink_stream.fail_send = true;
+        let (message, receiver) = message(Some(Arc::clone(&context)), None, false);
+        let mut receiver = Box::pin(receiver);
+        observe_terminal_on_wake(&mut receiver, Arc::clone(&context));
+
+        assert!(Pin::new(&mut sink).start_send(message).is_err());
+
+        let sample = drain_sample(&state);
+        assert!(sample.phase_duration(RequestMetricPhase::SocketWrite) > 0);
+        assert!(sample.phase_duration(RequestMetricPhase::ResponseWait) > 0);
+        assert_eq!(sample.attempt_count(), 1);
+    }
+
+    #[test]
+    fn sink_drop_closes_attempt_phases_before_waking_receiver() {
+        let state = state();
+        let context = context(&state);
+        let mut sink = sink();
+        let (message, receiver) = message(Some(Arc::clone(&context)), None, false);
+        let mut receiver = Box::pin(receiver);
+        observe_terminal_on_wake(&mut receiver, Arc::clone(&context));
+        Pin::new(&mut sink).start_send(message).unwrap();
+
+        drop(sink);
+
+        let sample = drain_sample(&state);
+        assert!(sample.phase_duration(RequestMetricPhase::SocketWrite) > 0);
+        assert!(sample.phase_duration(RequestMetricPhase::ResponseWait) > 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_after_accept_closes_attempt_phases_before_finalization() {
+        let state = state();
+        let context = context(&state);
+        let (mut pipeline, driver) = Pipeline::new(TestTransport::default(), None, None);
+        let mut request = Box::pin(pipeline.send_single_with_metrics(
+            vec![1],
+            Some(Arc::clone(&context)),
+            Duration::MAX,
+            false,
+            false,
+        ));
+        let mut driver = Box::pin(driver);
+        let mut task_context = task::Context::from_waker(noop_waker_ref());
+
+        assert!(request.as_mut().poll(&mut task_context).is_pending());
+        assert!(driver.as_mut().poll(&mut task_context).is_pending());
+        tokio::time::advance(Duration::from_millis(4)).await;
+        drop(request);
+
+        let sample = finish_sample(&state, &context);
+        assert_eq!(sample.phase_duration(RequestMetricPhase::SocketWrite), 1);
+        assert_eq!(
+            sample.phase_duration(RequestMetricPhase::ResponseWait),
+            4_000_000
+        );
+        assert_eq!(sample.attempt_count(), 1);
+
+        drop(driver);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_after_accept_closes_attempt_phases_before_returning_error() {
+        let state = state();
+        let context = context(&state);
+        let (mut pipeline, driver) = Pipeline::new(TestTransport::default(), None, None);
+        let mut request = Box::pin(pipeline.send_single_with_metrics(
+            vec![1],
+            Some(Arc::clone(&context)),
+            Duration::from_secs(5),
+            false,
+            false,
+        ));
+        let mut driver = Box::pin(driver);
+        let mut task_context = task::Context::from_waker(noop_waker_ref());
+
+        assert!(request.as_mut().poll(&mut task_context).is_pending());
+        assert!(driver.as_mut().poll(&mut task_context).is_pending());
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(request.await.unwrap_err().kind(), crate::ErrorKind::IoError);
+
+        let sample = finish_sample(&state, &context);
+        assert_eq!(sample.phase_duration(RequestMetricPhase::SocketWrite), 1);
+        assert_eq!(
+            sample.phase_duration(RequestMetricPhase::ResponseWait),
+            5_000_000_000
+        );
+        assert_eq!(sample.attempt_count(), 1);
+
+        drop(driver);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_driver_drop_finishes_pipeline_queue_before_waking_receiver() {
+        let state = state();
+        let context = context(&state);
+        let (mut pipeline, driver) = Pipeline::new(TestTransport::default(), None, None);
+        let mut request = Box::pin(pipeline.send_single_with_metrics(
+            vec![1],
+            Some(Arc::clone(&context)),
+            Duration::MAX,
+            false,
+            false,
+        ));
+        let waker = waker(Arc::new(FinishContextOnWake(Arc::clone(&context))));
+        let mut task_context = task::Context::from_waker(&waker);
+        assert!(request.as_mut().poll(&mut task_context).is_pending());
+
+        drop(driver);
+
+        let sample = drain_sample(&state);
+        assert!(sample.phase_duration(RequestMetricPhase::PipelineQueue) > 0);
+        assert_eq!(sample.phase_duration(RequestMetricPhase::SocketWrite), 0);
+        assert_eq!(sample.phase_duration(RequestMetricPhase::ResponseWait), 0);
+        assert_eq!(sample.attempt_count(), 0);
+
+        drop(request);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_after_enqueue_closes_queue_before_late_start_send() {
+        let state = state();
+        let context = context(&state);
+        let (mut pipeline, driver) = Pipeline::new(TestTransport::default(), None, None);
+        let mut request = Box::pin(pipeline.send_single_with_metrics(
+            vec![1],
+            Some(Arc::clone(&context)),
+            Duration::MAX,
+            false,
+            false,
+        ));
+        let mut driver = Box::pin(driver);
+        let mut task_context = task::Context::from_waker(noop_waker_ref());
+
+        assert!(request.as_mut().poll(&mut task_context).is_pending());
+        tokio::time::advance(Duration::from_millis(6)).await;
+        drop(request);
+        assert!(context.finish(RequestMetricResult::Cancelled));
+
+        tokio::time::advance(Duration::from_millis(13)).await;
+        assert!(driver.as_mut().poll(&mut task_context).is_pending());
+        drop(driver);
+
+        let sample = drain_sample(&state);
+        assert_eq!(
+            sample.phase_duration(RequestMetricPhase::PipelineQueue),
+            6_000_000
+        );
+        assert_eq!(sample.phase_duration(RequestMetricPhase::SocketWrite), 0);
+        assert_eq!(sample.phase_duration(RequestMetricPhase::ResponseWait), 0);
+        assert_eq!(sample.attempt_count(), 0);
+    }
+
+    #[test]
+    fn dropping_sink_closes_in_flight_timers() {
+        let state = state();
+        let context = context(&state);
+        let mut sink = sink();
+        Pin::new(&mut sink)
+            .start_send(message(Some(Arc::clone(&context)), None, false).0)
+            .unwrap();
+
+        drop(sink);
+
+        let sample = finish_sample(&state, &context);
+        assert!(sample.phase_duration(RequestMetricPhase::SocketWrite) > 0);
+        assert!(sample.phase_duration(RequestMetricPhase::ResponseWait) > 0);
+    }
+
+    #[test]
+    fn response_wait_ends_only_after_pipeline_and_fence_are_complete() {
+        let state = state();
+        let pipeline_context = context(&state);
+        let fence_context = context(&state);
+        let mut sink = sink();
+        let (pipeline, mut pipeline_receiver) =
+            message(Some(Arc::clone(&pipeline_context)), Some(2), false);
+        let pipeline_completion = Arc::clone(
+            &pipeline
+                .request_metrics
+                .as_ref()
+                .unwrap()
+                .attempt_completion,
+        );
+        let (fence, mut fence_receiver) = message(Some(Arc::clone(&fence_context)), None, true);
+        let fence_completion =
+            Arc::clone(&fence.request_metrics.as_ref().unwrap().attempt_completion);
+        Pin::new(&mut sink).start_send(pipeline).unwrap();
+        Pin::new(&mut sink).start_send(fence).unwrap();
+
+        Pin::new(&mut sink).send_result(Ok(Value::Int(1)));
+        assert_eq!(pipeline_receiver.try_recv(), Err(TryRecvError::Empty));
+        assert!(pipeline_completion.is_active());
+        Pin::new(&mut sink).send_result(Ok(Value::Int(2)));
+        assert!(pipeline_receiver.try_recv().unwrap().is_ok());
+        assert!(!pipeline_completion.is_active());
+
+        Pin::new(&mut sink).send_result(Ok(Value::Int(3)));
+        assert_eq!(fence_receiver.try_recv(), Err(TryRecvError::Empty));
+        assert!(fence_completion.is_active());
+        Pin::new(&mut sink).send_result(Ok(Value::SimpleString("PONG".into())));
+        assert!(fence_receiver.try_recv().unwrap().is_ok());
+        assert!(!fence_completion.is_active());
+
+        let pipeline = finish_sample(&state, &pipeline_context);
+        let fence = finish_sample(&state, &fence_context);
+        assert!(pipeline.phase_duration(RequestMetricPhase::ResponseWait) > 0);
+        assert!(fence.phase_duration(RequestMetricPhase::ResponseWait) > 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retried_context_accumulates_two_controlled_accepted_attempts() {
+        let state = state();
+        let context = context(&state);
+        let mut sink = sink();
+        for millis in [3, 5] {
+            Pin::new(&mut sink)
+                .start_send(message(Some(Arc::clone(&context)), None, false).0)
+                .unwrap();
+            tokio::time::advance(Duration::from_millis(millis)).await;
+            Pin::new(&mut sink).send_result(Ok(Value::Okay));
+        }
+        assert_eq!(sink.sink_stream.sent, 2);
+
+        let sample = finish_sample(&state, &context);
+        assert_eq!(
+            sample.phase_duration(RequestMetricPhase::SocketWrite),
+            8_000_000
+        );
+        assert_eq!(
+            sample.phase_duration(RequestMetricPhase::ResponseWait),
+            8_000_000
+        );
+        assert_eq!(sample.attempt_count(), 2);
+    }
+
+    #[test]
+    fn unsampled_message_never_enters_pending_flush_metrics() {
+        let mut sink = sink();
+        Pin::new(&mut sink)
+            .start_send(message(None, None, false).0)
+            .unwrap();
+
+        assert!(sink.pending_flush_metrics.is_empty());
+        assert!(sink.in_flight[0].request_metrics.is_none());
+    }
+
+    #[test]
+    fn closed_output_finishes_queue_without_fabricating_an_attempt() {
+        let state = state();
+        let context = context(&state);
+        let (message, receiver) = message(Some(Arc::clone(&context)), None, false);
+        drop(receiver);
+        let mut sink = sink();
+
+        Pin::new(&mut sink).start_send(message).unwrap();
+
+        let sample = finish_sample(&state, &context);
+        assert!(sample.phase_duration(RequestMetricPhase::PipelineQueue) > 0);
+        assert_eq!(sample.phase_duration(RequestMetricPhase::SocketWrite), 0);
+        assert_eq!(sample.phase_duration(RequestMetricPhase::ResponseWait), 0);
+        assert_eq!(sample.attempt_count(), 0);
+        assert!(sink.pending_flush_metrics.is_empty());
+        assert!(sink.in_flight.is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_channel_failure_records_only_pipeline_queue() {
+        let state = state();
+        let context = context(&state);
+        let (mut pipeline, driver) = Pipeline::new(TestTransport::default(), None, None);
+        drop(driver);
+
+        let result = pipeline
+            .send_single_with_metrics(
+                vec![1],
+                Some(Arc::clone(&context)),
+                Duration::MAX,
+                false,
+                false,
+            )
+            .await;
+        assert_eq!(result.unwrap_err().kind(), crate::ErrorKind::FatalSendError);
+
+        let sample = finish_sample(&state, &context);
+        assert!(sample.phase_duration(RequestMetricPhase::PipelineQueue) > 0);
+        assert_eq!(sample.phase_duration(RequestMetricPhase::SocketWrite), 0);
+        assert_eq!(sample.phase_duration(RequestMetricPhase::ResponseWait), 0);
+        assert_eq!(sample.attempt_count(), 0);
+    }
+
+    #[test]
+    fn finished_metrics_never_suppress_the_underlying_send() {
+        let state = state();
+        let context = context(&state);
+        let (message, _receiver) = message(Some(Arc::clone(&context)), None, false);
+        let completion = Arc::clone(&message.request_metrics.as_ref().unwrap().attempt_completion);
+        assert!(!completion.finish());
+        assert!(context.finish(RequestMetricResult::Cancelled));
+        let mut sink = sink();
+
+        Pin::new(&mut sink).start_send(message).unwrap();
+
+        assert_eq!(sink.sink_stream.sent, 1);
+        assert_eq!(sink.in_flight.len(), 1);
+        assert!(sink.pending_flush_metrics.is_empty());
+        let sample = drain_sample(&state);
+        assert_eq!(sample.attempt_count(), 0);
+        assert_eq!(sample.phase_duration(RequestMetricPhase::SocketWrite), 0);
+        assert_eq!(sample.phase_duration(RequestMetricPhase::ResponseWait), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_channel_records_the_controlled_pipeline_permit_wait() {
+        let state = state();
+        let context = context(&state);
+        let (mut pipeline, driver) = Pipeline::new(TestTransport::default(), None, None);
+        for _ in 0..50 {
+            pipeline
+                .sender
+                .try_send(message(None, None, false).0)
+                .unwrap();
+        }
+        let mut request = Box::pin(pipeline.send_single_with_metrics(
+            vec![1],
+            Some(Arc::clone(&context)),
+            Duration::MAX,
+            false,
+            false,
+        ));
+        let mut task_context = task::Context::from_waker(noop_waker_ref());
+
+        assert!(request.as_mut().poll(&mut task_context).is_pending());
+        tokio::time::advance(Duration::from_millis(9)).await;
+        drop(request);
+
+        let sample = finish_sample(&state, &context);
+        assert_eq!(
+            sample.phase_duration(RequestMetricPhase::PipelineQueue),
+            9_000_000
+        );
+        assert_eq!(sample.attempt_count(), 0);
+
+        drop(driver);
+    }
+
+    #[test]
+    fn protocol_desync_closes_current_and_subsequent_attempts_before_errors() {
+        let state = state();
+        let first_context = context(&state);
+        let second_context = context(&state);
+        let mut sink = sink();
+        let (first, mut first_receiver) = message(Some(Arc::clone(&first_context)), None, true);
+        let first_completion =
+            Arc::clone(&first.request_metrics.as_ref().unwrap().attempt_completion);
+        let (second, mut second_receiver) = message(Some(Arc::clone(&second_context)), None, false);
+        let second_completion =
+            Arc::clone(&second.request_metrics.as_ref().unwrap().attempt_completion);
+        Pin::new(&mut sink).start_send(first).unwrap();
+        Pin::new(&mut sink).start_send(second).unwrap();
+
+        Pin::new(&mut sink).send_result(Ok(Value::Int(1)));
+        assert!(first_completion.is_active());
+        Pin::new(&mut sink).send_result(Ok(Value::Int(2)));
+        assert_eq!(
+            first_receiver.try_recv().unwrap().unwrap_err().kind(),
+            crate::ErrorKind::ProtocolDesync
+        );
+        assert!(!first_completion.is_active());
+
+        Pin::new(&mut sink).send_result(Ok(Value::Okay));
+        assert_eq!(
+            second_receiver.try_recv().unwrap().unwrap_err().kind(),
+            crate::ErrorKind::ProtocolDesync
+        );
+        assert!(!second_completion.is_active());
+
+        let first = finish_sample(&state, &first_context);
+        let second = finish_sample(&state, &second_context);
+        assert!(first.phase_duration(RequestMetricPhase::ResponseWait) > 0);
+        assert!(second.phase_duration(RequestMetricPhase::ResponseWait) > 0);
     }
 }

@@ -1925,6 +1925,8 @@ version = "0.1.0"
 dependencies = [
  "file-rotate",
  "once_cell",
+ "serde",
+ "serde_json",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -3196,6 +3198,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "rand 0.9.4",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

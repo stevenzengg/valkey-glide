@@ -26,6 +26,7 @@ import glide.api.models.exceptions.RequestException;
 import glide.ffi.resolvers.ClusterScanCursorResolver;
 import glide.ffi.resolvers.OpenTelemetryResolver;
 import glide.internal.GlideCoreClient;
+import glide.internal.RequestMetricsSampling;
 import glide.utils.BufferUtils;
 import glide.utils.Java8Utils;
 import java.math.BigInteger;
@@ -709,22 +710,23 @@ public class CommandManager {
             if (OpenTelemetry.isInitialized() && OpenTelemetry.shouldSample()) {
                 spanPtr = OpenTelemetryResolver.createLeakedOtelSpan(requestType.name());
             }
+            boolean requestMetricsSampled = RequestMetricsSampling.shouldSample();
 
-            CompletableFuture<Object> jniFuture =
-                    coreClient.executeCommandAsync(
-                            requestType.getNumber(),
-                            args,
-                            routeArgs.hasRoute,
-                            routeArgs.routeType,
-                            routeArgs.routeParam,
-                            expectUtf8Response,
-                            coreClient.getRequestTimeoutMillis(),
-                            spanPtr);
-
-            return jniFuture
-                    .thenApply(result -> buildResponseFromJniResult(result, expectUtf8Response))
-                    .thenApply(response -> applyHandlerWithCleanup(response, responseHandler))
-                    .exceptionally(this::exceptionHandler);
+            return coreClient.executeCommandAsync(
+                    requestType.getNumber(),
+                    args,
+                    routeArgs.hasRoute,
+                    routeArgs.routeType,
+                    routeArgs.routeParam,
+                    expectUtf8Response,
+                    coreClient.getRequestTimeoutMillis(),
+                    spanPtr,
+                    requestMetricsSampled,
+                    jniFuture ->
+                            jniFuture
+                                    .thenApply(result -> buildResponseFromJniResult(result, expectUtf8Response))
+                                    .thenApply(response -> applyHandlerWithCleanup(response, responseHandler))
+                                    .exceptionally(this::exceptionHandler));
         } catch (Exception e) {
             CompletableFuture<T> errorFuture = new CompletableFuture<T>();
             errorFuture.completeExceptionally(e);
@@ -754,22 +756,23 @@ public class CommandManager {
             if (OpenTelemetry.isInitialized() && OpenTelemetry.shouldSample()) {
                 spanPtr = OpenTelemetryResolver.createLeakedOtelSpan(requestType.name());
             }
+            boolean requestMetricsSampled = RequestMetricsSampling.shouldSample();
 
-            CompletableFuture<Object> jniFuture =
-                    coreClient.executeCommandAsync(
-                            requestType.getNumber(),
-                            args,
-                            routeArgs.hasRoute,
-                            routeArgs.routeType,
-                            routeArgs.routeParam,
-                            expectUtf8Response,
-                            0,
-                            spanPtr);
-
-            return jniFuture
-                    .thenApply(result -> buildResponseFromJniResult(result, expectUtf8Response))
-                    .thenApply(response -> applyHandlerWithCleanup(response, responseHandler))
-                    .exceptionally(this::exceptionHandler);
+            return coreClient.executeCommandAsync(
+                    requestType.getNumber(),
+                    args,
+                    routeArgs.hasRoute,
+                    routeArgs.routeType,
+                    routeArgs.routeParam,
+                    expectUtf8Response,
+                    0,
+                    spanPtr,
+                    requestMetricsSampled,
+                    jniFuture ->
+                            jniFuture
+                                    .thenApply(result -> buildResponseFromJniResult(result, expectUtf8Response))
+                                    .thenApply(response -> applyHandlerWithCleanup(response, responseHandler))
+                                    .exceptionally(this::exceptionHandler));
         } catch (Exception e) {
             CompletableFuture<T> errorFuture = new CompletableFuture<T>();
             errorFuture.completeExceptionally(e);

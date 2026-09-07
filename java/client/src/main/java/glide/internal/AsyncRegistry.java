@@ -16,6 +16,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongPredicate;
 
 /**
  * Async registry for correlating native callbacks with Java {@link CompletableFuture}s.
@@ -53,6 +54,65 @@ public final class AsyncRegistry {
     /** Thread-safe storage for active futures. Using ConcurrentHashMap for lock-free operations. */
     private static final ConcurrentHashMap<Long, CompletableFuture<Object>> activeFutures =
             new ConcurrentHashMap<>(estimateInitialCapacity());
+
+    /**
+     * Terminal state retained until the native callback consumes the exact completion outcome.
+     * Cleanup can run synchronously inside {@code CompletableFuture.complete*}, so the active-future
+     * table cannot also own this native delivery handshake.
+     */
+    private static final ConcurrentHashMap<Long, CompletionState> completionStates =
+            new ConcurrentHashMap<>(estimateInitialCapacity());
+
+    private enum CompletionOutcome {
+        COMPLETED(0),
+        TIMEOUT(1),
+        CANCELLED(2),
+        FAILURE(3),
+        TIMEOUT_MARK_MISSED(4),
+        NATIVE_TIMEOUT(5);
+
+        private final int nativeCode;
+
+        CompletionOutcome(int nativeCode) {
+            this.nativeCode = nativeCode;
+        }
+
+        private boolean acceptedNativeDelivery() {
+            return this == COMPLETED || this == NATIVE_TIMEOUT;
+        }
+    }
+
+    private static final class CompletionState {
+        private final CompletableFuture<Object> future;
+        private final CompletableFuture<?> terminalFuture;
+        private CompletionOutcome internallyCompletedAs;
+
+        private CompletionState(CompletableFuture<Object> future, CompletableFuture<?> terminalFuture) {
+            this.future = future;
+            this.terminalFuture = terminalFuture;
+        }
+
+        private CompletionOutcome acceptedCompletionOutcome(CompletionOutcome deliveredAs) {
+            if (terminalFuture != future && terminalFuture.isCancelled()) {
+                return CompletionOutcome.CANCELLED;
+            }
+            if (deliveredAs != CompletionOutcome.NATIVE_TIMEOUT
+                    && terminalFuture != future
+                    && terminalFuture.isCompletedExceptionally()) {
+                return CompletionOutcome.FAILURE;
+            }
+            return deliveredAs;
+        }
+
+        private CompletionOutcome rejectedCompletionOutcome() {
+            if (internallyCompletedAs != null) {
+                return internallyCompletedAs;
+            }
+            return terminalFuture.isCancelled() || future.isCancelled()
+                    ? CompletionOutcome.CANCELLED
+                    : CompletionOutcome.FAILURE;
+        }
+    }
 
     /** Scheduled timeout tasks mapped by correlation ID for cancellation on completion. */
     private static final ConcurrentHashMap<Long, ScheduledFuture<?>> timeoutTasks =
@@ -261,8 +321,71 @@ public final class AsyncRegistry {
      */
     public static <T> long register(
             CompletableFuture<T> future, int maxInflightRequests, long clientHandle, long timeoutMillis) {
+        return register(
+                future,
+                future,
+                maxInflightRequests,
+                clientHandle,
+                timeoutMillis,
+                false,
+                GlideNativeBridge::markCancelled);
+    }
+
+    /**
+     * Register a native completion future and the terminal command future returned to the caller. The
+     * terminal future lets callback metrics include synchronous response handling and preserve
+     * caller-visible cancellation/failure outcomes.
+     */
+    public static <T, R> long register(
+            CompletableFuture<T> future,
+            CompletableFuture<R> terminalFuture,
+            int maxInflightRequests,
+            long clientHandle,
+            long timeoutMillis) {
+        return register(
+                future,
+                terminalFuture,
+                maxInflightRequests,
+                clientHandle,
+                timeoutMillis,
+                true,
+                GlideNativeBridge::markCancelled);
+    }
+
+    /** Register with terminal outcome tracking only when request metrics selected this command. */
+    public static <T, R> long register(
+            CompletableFuture<T> future,
+            CompletableFuture<R> terminalFuture,
+            int maxInflightRequests,
+            long clientHandle,
+            long timeoutMillis,
+            boolean requestMetricsSampled) {
+        return register(
+                future,
+                terminalFuture,
+                maxInflightRequests,
+                clientHandle,
+                timeoutMillis,
+                requestMetricsSampled,
+                GlideNativeBridge::markCancelled);
+    }
+
+    static <T, R> long register(
+            CompletableFuture<T> future,
+            CompletableFuture<R> terminalFuture,
+            int maxInflightRequests,
+            long clientHandle,
+            long timeoutMillis,
+            boolean requestMetricsSampled,
+            LongPredicate cancellationNotifier) {
         if (future == null) {
             throw new IllegalArgumentException("Future cannot be null");
+        }
+        if (terminalFuture == null) {
+            throw new IllegalArgumentException("Terminal future cannot be null");
+        }
+        if (cancellationNotifier == null) {
+            throw new IllegalArgumentException("Cancellation notifier cannot be null");
         }
 
         // Check shutdown flag before registering to prevent race conditions
@@ -287,6 +410,9 @@ public final class AsyncRegistry {
 
         // Store original future for completion by native code
         activeFutures.put(correlationId, originalFuture);
+        if (requestMetricsSampled) {
+            completionStates.put(correlationId, new CompletionState(originalFuture, terminalFuture));
+        }
         registrationTimestamps.put(correlationId, System.nanoTime());
         logLifecycle(
                 Logger.Level.DEBUG,
@@ -303,6 +429,7 @@ public final class AsyncRegistry {
         // If shutdown started between our first check and the put(), clean up and fail
         if (isShutdown.get()) {
             activeFutures.remove(correlationId);
+            completionStates.remove(correlationId);
             registrationTimestamps.remove(correlationId);
             if (maxInflightRequests > 0) {
                 decrementInflightCount(clientHandle);
@@ -314,12 +441,26 @@ public final class AsyncRegistry {
 
         // Schedule Java-side timeout if configured (0 = defer to Rust core timeout)
         if (timeoutMillis > 0) {
-            scheduleTimeout(correlationId, originalFuture, timeoutMillis);
+            scheduleTimeout(correlationId, originalFuture, timeoutMillis, requestMetricsSampled);
         }
 
         // Set up cleanup on the original future
         // This ensures proper resource cleanup when completed
-        setupCleanup(correlationId, originalFuture, maxInflightRequests, clientHandle);
+        setupCleanup(
+                correlationId,
+                originalFuture,
+                maxInflightRequests,
+                clientHandle,
+                requestMetricsSampled,
+                cancellationNotifier);
+        if (requestMetricsSampled && terminalFuture != future) {
+            terminalFuture.whenComplete(
+                    (result, error) -> {
+                        if (terminalFuture.isCancelled()) {
+                            originalFuture.cancel(false);
+                        }
+                    });
+        }
 
         return correlationId;
     }
@@ -343,12 +484,17 @@ public final class AsyncRegistry {
      * future is completed exceptionally with TimeoutException and the native layer is notified.
      */
     private static void scheduleTimeout(
-            long correlationId, CompletableFuture<Object> future, long timeoutMillis) {
+            long correlationId,
+            CompletableFuture<Object> future,
+            long timeoutMillis,
+            boolean requestMetricsSampled) {
         ScheduledFuture<?> task =
                 timeoutScheduler.schedule(
                         () -> {
                             timeoutTasks.remove(correlationId);
-                            if (future.completeExceptionally(new TimeoutException("Request timed out"))) {
+                            if (requestMetricsSampled) {
+                                completeTimeout(correlationId, timeoutMillis, GlideNativeBridge::markTimedOut);
+                            } else if (future.completeExceptionally(new TimeoutException("Request timed out"))) {
                                 logLifecycle(
                                         Logger.Level.WARN,
                                         correlationId,
@@ -369,6 +515,73 @@ public final class AsyncRegistry {
     }
 
     /**
+     * Publish a Java timeout outcome before notifying native code. The injected notifier is the
+     * production native timeout boundary and keeps the race independently testable.
+     */
+    static boolean completeTimeout(
+            long correlationId, long timeoutMillis, LongPredicate timeoutNotifier) {
+        CompletionState state = completionStates.get(correlationId);
+        if (state == null) {
+            logLifecycle(
+                    Logger.Level.DEBUG,
+                    correlationId,
+                    "timeout_skipped_missing_state",
+                    "\"timeout_ms\":" + timeoutMillis);
+            return false;
+        }
+
+        boolean completed;
+        synchronized (state) {
+            completed = state.future.completeExceptionally(new TimeoutException("Request timed out"));
+            if (completed) {
+                state.internallyCompletedAs = CompletionOutcome.TIMEOUT;
+                logLifecycle(
+                        Logger.Level.WARN, correlationId, "timed_out", "\"timeout_ms\":" + timeoutMillis);
+                boolean nativeOwnsTimeout = timeoutNotifier.test(correlationId);
+                if (nativeOwnsTimeout) {
+                    completionStates.remove(correlationId, state);
+                } else {
+                    // Publish the missed mark before a concurrent native completion can query the
+                    // state. Otherwise it could return TIMEOUT after the only mark already failed.
+                    state.internallyCompletedAs = CompletionOutcome.TIMEOUT_MARK_MISSED;
+                }
+            }
+        }
+        if (!completed) {
+            logLifecycle(
+                    Logger.Level.DEBUG,
+                    correlationId,
+                    "timeout_skipped_already_completed",
+                    "\"timeout_ms\":" + timeoutMillis);
+            return false;
+        }
+        return true;
+    }
+
+    /** Publish user cancellation before asking native code to release its request bookkeeping. */
+    static boolean completeCancellation(long correlationId, LongPredicate cancellationNotifier) {
+        CompletionState state = completionStates.get(correlationId);
+        if (state == null) {
+            return false;
+        }
+
+        synchronized (state) {
+            if (!state.future.isCancelled() || state.internallyCompletedAs != null) {
+                return false;
+            }
+            state.internallyCompletedAs = CompletionOutcome.CANCELLED;
+        }
+
+        try {
+            return cancellationNotifier.test(correlationId);
+        } catch (RuntimeException | LinkageError ignored) {
+            return false;
+        } finally {
+            completionStates.remove(correlationId, state);
+        }
+    }
+
+    /**
      * Set up cleanup handler for when the future completes (success, error, or timeout). Performs
      * atomic cleanup to avoid races and leaks.
      */
@@ -376,9 +589,14 @@ public final class AsyncRegistry {
             long correlationId,
             CompletableFuture<Object> future,
             int maxInflightRequests,
-            long clientHandle) {
+            long clientHandle,
+            boolean requestMetricsSampled,
+            LongPredicate cancellationNotifier) {
         future.whenComplete(
                 (result, error) -> {
+                    if (requestMetricsSampled && future.isCancelled()) {
+                        completeCancellation(correlationId, cancellationNotifier);
+                    }
                     logLifecycle(
                             error == null ? Logger.Level.DEBUG : Logger.Level.WARN,
                             correlationId,
@@ -434,9 +652,6 @@ public final class AsyncRegistry {
             logLifecycle(Logger.Level.WARN, correlationId, "complete_success_missing_future");
             return false;
         }
-        // complete() returns false if already completed
-        // This prevents IllegalStateException from completing twice
-        // Note: cleanup happens automatically in whenComplete()
         logLifecycle(
                 Logger.Level.DEBUG,
                 correlationId,
@@ -449,6 +664,44 @@ public final class AsyncRegistry {
                 completed ? "complete_success" : "complete_success_already_completed",
                 "\"result_type\":" + jsonString(result == null ? null : result.getClass().getName()));
         return completed;
+    }
+
+    /**
+     * Complete a callback and return its exact terminal outcome to native code. The per-entry monitor
+     * spans {@link CompletableFuture#complete(Object)} and synchronous dependent work, then reads any
+     * competing timeout, cancellation, or shutdown outcome.
+     */
+    public static int completeCallbackForNative(long correlationId, Object result) {
+        CompletionState state = completionStates.get(correlationId);
+        if (state == null) {
+            logLifecycle(Logger.Level.WARN, correlationId, "complete_success_missing_future");
+            return CompletionOutcome.FAILURE.nativeCode;
+        }
+
+        logLifecycle(
+                Logger.Level.DEBUG,
+                correlationId,
+                "complete_success_attempt",
+                "\"result_type\":" + jsonString(result == null ? null : result.getClass().getName()));
+        CompletionOutcome outcome;
+        synchronized (state) {
+            outcome =
+                    state.future.complete(result)
+                            ? state.acceptedCompletionOutcome(CompletionOutcome.COMPLETED)
+                            : state.rejectedCompletionOutcome();
+        }
+        completionStates.remove(correlationId, state);
+        logLifecycle(
+                outcome == CompletionOutcome.COMPLETED ? Logger.Level.DEBUG : Logger.Level.WARN,
+                correlationId,
+                outcome == CompletionOutcome.COMPLETED
+                        ? "complete_success"
+                        : "complete_success_already_completed",
+                "\"result_type\":"
+                        + jsonString(result == null ? null : result.getClass().getName())
+                        + ",\"completion_outcome\":"
+                        + jsonString(outcome.name()));
+        return outcome.nativeCode;
     }
 
     /**
@@ -480,49 +733,55 @@ public final class AsyncRegistry {
                         ? "Unknown error from native code"
                         : errorMessage;
 
-        // Log elapsed time for timeout and disconnect errors (rate-limited)
-        if (errorTypeCode == 2 || errorTypeCode == 3) {
-            Long registeredAt = registrationTimestamps.get(correlationId);
-            if (registeredAt != null) {
-                long elapsedMs = (System.nanoTime() - registeredAt) / 1_000_000;
-                boolean isTimeout = errorTypeCode == 2;
-                AtomicLong lastLogRef = isTimeout ? lastTimeoutLogNs : lastDisconnectLogNs;
-                AtomicLong suppressedRef = isTimeout ? suppressedTimeoutLogs : suppressedDisconnectLogs;
-                String errorTypeName = isTimeout ? "Timeout" : "Disconnect";
+        logRateLimitedNativeError(correlationId, errorTypeCode, msg);
+        RuntimeException exception = exceptionForNativeError(errorTypeCode, msg);
+        logLifecycle(
+                Logger.Level.WARN,
+                correlationId,
+                "complete_error_attempt",
+                "\"error_type_code\":"
+                        + errorTypeCode
+                        + ",\"exception_type\":"
+                        + jsonString(exception.getClass().getName())
+                        + ",\"error_message\":"
+                        + jsonString(msg));
+        boolean completed = future.completeExceptionally(exception);
+        logLifecycle(
+                Logger.Level.WARN,
+                correlationId,
+                completed ? "complete_error" : "complete_error_already_completed",
+                "\"error_type_code\":"
+                        + errorTypeCode
+                        + ",\"exception_type\":"
+                        + jsonString(exception.getClass().getName())
+                        + ",\"error_message\":"
+                        + jsonString(msg));
+        return completed;
+    }
 
-                long now = System.nanoTime();
-                long lastLog = lastLogRef.get();
-                if (now - lastLog >= LOG_RATE_LIMIT_NS && lastLogRef.compareAndSet(lastLog, now)) {
-                    long suppressed = suppressedRef.getAndSet(0);
-                    String suffix = suppressed > 0 ? " (suppressed " + suppressed + " similar)" : "";
-                    Logger.log(
-                            Logger.Level.WARN,
-                            "AsyncRegistry",
-                            errorTypeName + " after " + elapsedMs + "ms: " + msg + suffix);
-                } else {
-                    suppressedRef.incrementAndGet();
-                }
-            }
+    /** Complete an exceptional callback and return its exact terminal outcome to native code. */
+    public static int completeCallbackWithErrorCodeForNative(
+            long correlationId, int errorTypeCode, String errorMessage) {
+        CompletionState state = completionStates.get(correlationId);
+        if (state == null) {
+            logLifecycle(
+                    Logger.Level.WARN,
+                    correlationId,
+                    "complete_error_missing_future",
+                    "\"error_type_code\":"
+                            + errorTypeCode
+                            + ",\"error_message\":"
+                            + jsonString(errorMessage));
+            return CompletionOutcome.FAILURE.nativeCode;
         }
 
-        RuntimeException ex;
-        switch (errorTypeCode) {
-            case 2:
-                ex = new TimeoutException(msg);
-                break;
-            case 3:
-                ex = new ClosingException(msg);
-                break;
-            case 1:
-                ex = new ExecAbortException(msg);
-                break;
-            case 4:
-                ex = new CircuitBreakerException(msg);
-                break;
-            default:
-                ex = new RequestException(msg);
-                break;
-        }
+        String msg =
+                (errorMessage == null || errorMessage.trim().isEmpty())
+                        ? "Unknown error from native code"
+                        : errorMessage;
+
+        logRateLimitedNativeError(correlationId, errorTypeCode, msg);
+        RuntimeException ex = exceptionForNativeError(errorTypeCode, msg);
 
         logLifecycle(
                 Logger.Level.WARN,
@@ -534,18 +793,74 @@ public final class AsyncRegistry {
                         + jsonString(ex.getClass().getName())
                         + ",\"error_message\":"
                         + jsonString(msg));
-        boolean completed = future.completeExceptionally(ex);
+        CompletionOutcome outcome;
+        synchronized (state) {
+            CompletionOutcome deliveredAs =
+                    errorTypeCode == 2 ? CompletionOutcome.NATIVE_TIMEOUT : CompletionOutcome.COMPLETED;
+            outcome =
+                    state.future.completeExceptionally(ex)
+                            ? state.acceptedCompletionOutcome(deliveredAs)
+                            : state.rejectedCompletionOutcome();
+        }
+        completionStates.remove(correlationId, state);
         logLifecycle(
                 Logger.Level.WARN,
                 correlationId,
-                completed ? "complete_error" : "complete_error_already_completed",
+                outcome.acceptedNativeDelivery() ? "complete_error" : "complete_error_already_completed",
                 "\"error_type_code\":"
                         + errorTypeCode
                         + ",\"exception_type\":"
                         + jsonString(ex.getClass().getName())
                         + ",\"error_message\":"
-                        + jsonString(msg));
-        return completed;
+                        + jsonString(msg)
+                        + ",\"completion_outcome\":"
+                        + jsonString(outcome.name()));
+        return outcome.nativeCode;
+    }
+
+    private static RuntimeException exceptionForNativeError(int errorTypeCode, String message) {
+        switch (errorTypeCode) {
+            case 2:
+                return new TimeoutException(message);
+            case 3:
+                return new ClosingException(message);
+            case 1:
+                return new ExecAbortException(message);
+            case 4:
+                return new CircuitBreakerException(message);
+            default:
+                return new RequestException(message);
+        }
+    }
+
+    private static void logRateLimitedNativeError(
+            long correlationId, int errorTypeCode, String message) {
+        if (errorTypeCode != 2 && errorTypeCode != 3) {
+            return;
+        }
+        Long registeredAt = registrationTimestamps.get(correlationId);
+        if (registeredAt == null) {
+            return;
+        }
+
+        long elapsedMs = (System.nanoTime() - registeredAt) / 1_000_000;
+        boolean isTimeout = errorTypeCode == 2;
+        AtomicLong lastLogRef = isTimeout ? lastTimeoutLogNs : lastDisconnectLogNs;
+        AtomicLong suppressedRef = isTimeout ? suppressedTimeoutLogs : suppressedDisconnectLogs;
+        String errorTypeName = isTimeout ? "Timeout" : "Disconnect";
+
+        long now = System.nanoTime();
+        long lastLog = lastLogRef.get();
+        if (now - lastLog >= LOG_RATE_LIMIT_NS && lastLogRef.compareAndSet(lastLog, now)) {
+            long suppressed = suppressedRef.getAndSet(0);
+            String suffix = suppressed > 0 ? " (suppressed " + suppressed + " similar)" : "";
+            Logger.log(
+                    Logger.Level.WARN,
+                    "AsyncRegistry",
+                    errorTypeName + " after " + elapsedMs + "ms: " + message + suffix);
+        } else {
+            suppressedRef.incrementAndGet();
+        }
     }
 
     /** Get current pending operation count. */
@@ -570,14 +885,26 @@ public final class AsyncRegistry {
         timeoutTasks.values().forEach(task -> task.cancel(false));
         timeoutTasks.clear();
 
-        // Cancel user futures with interrupt (may be blocked waiting)
-        activeFutures.values().forEach(future -> future.cancel(true));
-        activeFutures.clear();
+        cancelPendingForShutdown();
         registrationTimestamps.clear();
         clientInflightCounts.clear();
 
         // Shutdown the timeout scheduler
         timeoutScheduler.shutdownNow();
+    }
+
+    /** Publish shutdown as failure before cancelling pending futures. */
+    static void cancelPendingForShutdown() {
+        completionStates.forEach(
+                (correlationId, state) -> {
+                    synchronized (state) {
+                        state.internallyCompletedAs = CompletionOutcome.FAILURE;
+                        state.future.cancel(true);
+                    }
+                });
+        activeFutures.values().forEach(future -> future.cancel(true));
+        activeFutures.clear();
+        completionStates.clear();
     }
 
     /**
@@ -596,8 +923,18 @@ public final class AsyncRegistry {
                 (errorMessage == null || errorMessage.isEmpty())
                         ? "Native callback infrastructure failed"
                         : errorMessage;
-        activeFutures.forEach((id, future) -> future.completeExceptionally(new ClosingException(msg)));
+        completionStates.forEach(
+                (correlationId, state) -> {
+                    synchronized (state) {
+                        state.internallyCompletedAs = CompletionOutcome.FAILURE;
+                        state.future.completeExceptionally(new ClosingException(msg));
+                    }
+                });
+        activeFutures
+                .values()
+                .forEach(future -> future.completeExceptionally(new ClosingException(msg)));
         activeFutures.clear();
+        completionStates.clear();
         registrationTimestamps.clear();
 
         timeoutTasks.values().forEach(task -> task.cancel(false));
@@ -619,6 +956,7 @@ public final class AsyncRegistry {
         timeoutTasks.values().forEach(task -> task.cancel(false));
         timeoutTasks.clear();
         activeFutures.clear();
+        completionStates.clear();
         registrationTimestamps.clear();
         clientInflightCounts.clear();
         nextId.set(1);
@@ -642,6 +980,11 @@ public final class AsyncRegistry {
      */
     public static int getActiveFutureCount() {
         return activeFutures.size();
+    }
+
+    /** Returns retained terminal completion states. Intended for cancellation lifecycle tests. */
+    static int getCompletionStateCount() {
+        return completionStates.size();
     }
 
     /**

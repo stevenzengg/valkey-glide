@@ -19,9 +19,10 @@ opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "metrics", "expe
 opentelemetry-otlp = { version = "0.32", features = ["http-proto", "http-json", "reqwest-client", "grpc-tonic"] }
 once_cell = "1"
 logger_core = { path = "../../logger_core" }
+rand = "0.9"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "test-util", "time"] }
 tempfile = "3"
 # `testing` exposes `InMemoryMetricExporter`, used by the metrics export tests to
 # drive real SDK aggregation (the 0.32 metric data types are no longer

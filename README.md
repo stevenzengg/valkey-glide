@@ -70,6 +70,7 @@ Visit our official Valkey GLIDE's documentation [site](https://glide.valkey.io/o
 - [Ruby](https://github.com/valkey-io/valkey-glide-ruby)
 
 **General Concepts:**
+- [Java request-phase metrics](./docs/request-metrics.md)
 - [Custom Command](https://glide.valkey.io/concepts/client-features/custom-commands/)
 - [Connection Management](https://glide.valkey.io/how-to/connection-management/)
 - [Multi-Slot Command Handling](https://glide.valkey.io/concepts/client-features/multi-slot-command-handling/)

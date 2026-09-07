@@ -449,6 +449,469 @@ fn get_two_word_command(first: &str, second: &str) -> Cmd {
     cmd
 }
 
+#[derive(Clone, Copy)]
+enum RequestMetricCommand {
+    Custom,
+    Named(&'static str),
+}
+
+impl RequestType {
+    /// Returns the fixed command identity shared by command construction and request metrics.
+    fn request_metric_command(&self) -> Option<RequestMetricCommand> {
+        match self {
+            RequestType::InvalidRequest => None,
+            RequestType::CustomCommand => Some(RequestMetricCommand::Custom),
+            RequestType::Get => Some(RequestMetricCommand::Named("GET")),
+            RequestType::Set => Some(RequestMetricCommand::Named("SET")),
+            RequestType::Ping => Some(RequestMetricCommand::Named("PING")),
+            RequestType::Info => Some(RequestMetricCommand::Named("INFO")),
+            RequestType::Del => Some(RequestMetricCommand::Named("DEL")),
+            RequestType::Select => Some(RequestMetricCommand::Named("SELECT")),
+            RequestType::ConfigGet => Some(RequestMetricCommand::Named("CONFIG GET")),
+            RequestType::ConfigSet => Some(RequestMetricCommand::Named("CONFIG SET")),
+            RequestType::ConfigResetStat => Some(RequestMetricCommand::Named("CONFIG RESETSTAT")),
+            RequestType::ConfigRewrite => Some(RequestMetricCommand::Named("CONFIG REWRITE")),
+            RequestType::Auth => Some(RequestMetricCommand::Named("AUTH")),
+            RequestType::ClientCaching => Some(RequestMetricCommand::Named("CLIENT CACHING")),
+            RequestType::ClientGetName => Some(RequestMetricCommand::Named("CLIENT GETNAME")),
+            RequestType::ClientGetRedir => Some(RequestMetricCommand::Named("CLIENT GETREDIR")),
+            RequestType::ClientId => Some(RequestMetricCommand::Named("CLIENT ID")),
+            RequestType::ClientInfo => Some(RequestMetricCommand::Named("CLIENT INFO")),
+            RequestType::ClientKillSimple => Some(RequestMetricCommand::Named("CLIENT KILL")),
+            RequestType::ClientKill => Some(RequestMetricCommand::Named("CLIENT KILL")),
+            RequestType::ClientList => Some(RequestMetricCommand::Named("CLIENT LIST")),
+            RequestType::ClientNoEvict => Some(RequestMetricCommand::Named("CLIENT NO-EVICT")),
+            RequestType::ClientNoTouch => Some(RequestMetricCommand::Named("CLIENT NO-TOUCH")),
+            RequestType::ClientPause => Some(RequestMetricCommand::Named("CLIENT PAUSE")),
+            RequestType::ClientReply => Some(RequestMetricCommand::Named("CLIENT REPLY")),
+            RequestType::ClientSetInfo => Some(RequestMetricCommand::Named("CLIENT SETINFO")),
+            RequestType::ClientSetName => Some(RequestMetricCommand::Named("CLIENT SETNAME")),
+            RequestType::ClientTracking => Some(RequestMetricCommand::Named("CLIENT TRACKING")),
+            RequestType::ClientTrackingInfo => {
+                Some(RequestMetricCommand::Named("CLIENT TRACKINGINFO"))
+            }
+            RequestType::ClientUnblock => Some(RequestMetricCommand::Named("CLIENT UNBLOCK")),
+            RequestType::ClientUnpause => Some(RequestMetricCommand::Named("CLIENT UNPAUSE")),
+            RequestType::Hello => Some(RequestMetricCommand::Named("HELLO")),
+            RequestType::Quit => Some(RequestMetricCommand::Named("QUIT")),
+            RequestType::Reset => Some(RequestMetricCommand::Named("RESET")),
+            RequestType::Expire => Some(RequestMetricCommand::Named("EXPIRE")),
+            RequestType::HSet => Some(RequestMetricCommand::Named("HSET")),
+            RequestType::HGet => Some(RequestMetricCommand::Named("HGET")),
+            RequestType::HDel => Some(RequestMetricCommand::Named("HDEL")),
+            RequestType::HExists => Some(RequestMetricCommand::Named("HEXISTS")),
+            RequestType::MSet => Some(RequestMetricCommand::Named("MSET")),
+            RequestType::MGet => Some(RequestMetricCommand::Named("MGET")),
+            RequestType::Incr => Some(RequestMetricCommand::Named("INCR")),
+            RequestType::IncrBy => Some(RequestMetricCommand::Named("INCRBY")),
+            RequestType::IncrByFloat => Some(RequestMetricCommand::Named("INCRBYFLOAT")),
+            RequestType::Decr => Some(RequestMetricCommand::Named("DECR")),
+            RequestType::DecrBy => Some(RequestMetricCommand::Named("DECRBY")),
+            RequestType::HGetAll => Some(RequestMetricCommand::Named("HGETALL")),
+            RequestType::HMSet => Some(RequestMetricCommand::Named("HMSET")),
+            RequestType::HMGet => Some(RequestMetricCommand::Named("HMGET")),
+            RequestType::HIncrBy => Some(RequestMetricCommand::Named("HINCRBY")),
+            RequestType::HIncrByFloat => Some(RequestMetricCommand::Named("HINCRBYFLOAT")),
+            RequestType::LPush => Some(RequestMetricCommand::Named("LPUSH")),
+            RequestType::LPop => Some(RequestMetricCommand::Named("LPOP")),
+            RequestType::RPush => Some(RequestMetricCommand::Named("RPUSH")),
+            RequestType::RPop => Some(RequestMetricCommand::Named("RPOP")),
+            RequestType::LLen => Some(RequestMetricCommand::Named("LLEN")),
+            RequestType::LRem => Some(RequestMetricCommand::Named("LREM")),
+            RequestType::LRange => Some(RequestMetricCommand::Named("LRANGE")),
+            RequestType::LTrim => Some(RequestMetricCommand::Named("LTRIM")),
+            RequestType::SAdd => Some(RequestMetricCommand::Named("SADD")),
+            RequestType::SRem => Some(RequestMetricCommand::Named("SREM")),
+            RequestType::SMembers => Some(RequestMetricCommand::Named("SMEMBERS")),
+            RequestType::SCard => Some(RequestMetricCommand::Named("SCARD")),
+            RequestType::PExpireAt => Some(RequestMetricCommand::Named("PEXPIREAT")),
+            RequestType::PExpire => Some(RequestMetricCommand::Named("PEXPIRE")),
+            RequestType::ExpireAt => Some(RequestMetricCommand::Named("EXPIREAT")),
+            RequestType::Exists => Some(RequestMetricCommand::Named("EXISTS")),
+            RequestType::Unlink => Some(RequestMetricCommand::Named("UNLINK")),
+            RequestType::TTL => Some(RequestMetricCommand::Named("TTL")),
+            RequestType::ZAdd => Some(RequestMetricCommand::Named("ZADD")),
+            RequestType::ZRem => Some(RequestMetricCommand::Named("ZREM")),
+            RequestType::ZRange => Some(RequestMetricCommand::Named("ZRANGE")),
+            RequestType::ZCard => Some(RequestMetricCommand::Named("ZCARD")),
+            RequestType::ZCount => Some(RequestMetricCommand::Named("ZCOUNT")),
+            RequestType::ZIncrBy => Some(RequestMetricCommand::Named("ZINCRBY")),
+            RequestType::ZScore => Some(RequestMetricCommand::Named("ZSCORE")),
+            RequestType::Type => Some(RequestMetricCommand::Named("TYPE")),
+            RequestType::HLen => Some(RequestMetricCommand::Named("HLEN")),
+            RequestType::Echo => Some(RequestMetricCommand::Named("ECHO")),
+            RequestType::ZPopMin => Some(RequestMetricCommand::Named("ZPOPMIN")),
+            RequestType::Strlen => Some(RequestMetricCommand::Named("STRLEN")),
+            RequestType::LIndex => Some(RequestMetricCommand::Named("LINDEX")),
+            RequestType::ZPopMax => Some(RequestMetricCommand::Named("ZPOPMAX")),
+            RequestType::XAck => Some(RequestMetricCommand::Named("XACK")),
+            RequestType::XAdd => Some(RequestMetricCommand::Named("XADD")),
+            RequestType::XReadGroup => Some(RequestMetricCommand::Named("XREADGROUP")),
+            RequestType::XRead => Some(RequestMetricCommand::Named("XREAD")),
+            RequestType::XGroupCreate => Some(RequestMetricCommand::Named("XGROUP CREATE")),
+            RequestType::XGroupDestroy => Some(RequestMetricCommand::Named("XGROUP DESTROY")),
+            RequestType::XTrim => Some(RequestMetricCommand::Named("XTRIM")),
+            RequestType::HSetNX => Some(RequestMetricCommand::Named("HSETNX")),
+            RequestType::SIsMember => Some(RequestMetricCommand::Named("SISMEMBER")),
+            RequestType::HVals => Some(RequestMetricCommand::Named("HVALS")),
+            RequestType::HSetEx => Some(RequestMetricCommand::Named("HSETEX")),
+            RequestType::HGetEx => Some(RequestMetricCommand::Named("HGETEX")),
+            RequestType::HExpire => Some(RequestMetricCommand::Named("HEXPIRE")),
+            RequestType::HExpireAt => Some(RequestMetricCommand::Named("HEXPIREAT")),
+            RequestType::HPExpire => Some(RequestMetricCommand::Named("HPEXPIRE")),
+            RequestType::HPExpireAt => Some(RequestMetricCommand::Named("HPEXPIREAT")),
+            RequestType::HPersist => Some(RequestMetricCommand::Named("HPERSIST")),
+            RequestType::HTtl => Some(RequestMetricCommand::Named("HTTL")),
+            RequestType::HPTtl => Some(RequestMetricCommand::Named("HPTTL")),
+            RequestType::HExpireTime => Some(RequestMetricCommand::Named("HEXPIRETIME")),
+            RequestType::HPExpireTime => Some(RequestMetricCommand::Named("HPEXPIRETIME")),
+            RequestType::PTTL => Some(RequestMetricCommand::Named("PTTL")),
+            RequestType::ZRemRangeByRank => Some(RequestMetricCommand::Named("ZREMRANGEBYRANK")),
+            RequestType::Persist => Some(RequestMetricCommand::Named("PERSIST")),
+            RequestType::ZRemRangeByScore => Some(RequestMetricCommand::Named("ZREMRANGEBYSCORE")),
+            RequestType::Time => Some(RequestMetricCommand::Named("TIME")),
+            RequestType::ZRank => Some(RequestMetricCommand::Named("ZRANK")),
+            RequestType::Rename => Some(RequestMetricCommand::Named("RENAME")),
+            RequestType::Keys => Some(RequestMetricCommand::Named("KEYS")),
+            RequestType::Migrate => Some(RequestMetricCommand::Named("MIGRATE")),
+            RequestType::DBSize => Some(RequestMetricCommand::Named("DBSIZE")),
+            RequestType::BgRewriteAof => Some(RequestMetricCommand::Named("BGREWRITEAOF")),
+            RequestType::BgSave => Some(RequestMetricCommand::Named("BGSAVE")),
+            RequestType::FailOver => Some(RequestMetricCommand::Named("FAILOVER")),
+            RequestType::BRPop => Some(RequestMetricCommand::Named("BRPOP")),
+            RequestType::HKeys => Some(RequestMetricCommand::Named("HKEYS")),
+            RequestType::PfAdd => Some(RequestMetricCommand::Named("PFADD")),
+            RequestType::PfCount => Some(RequestMetricCommand::Named("PFCOUNT")),
+            RequestType::PfMerge => Some(RequestMetricCommand::Named("PFMERGE")),
+            RequestType::RPushX => Some(RequestMetricCommand::Named("RPUSHX")),
+            RequestType::LPushX => Some(RequestMetricCommand::Named("LPUSHX")),
+            RequestType::BLPop => Some(RequestMetricCommand::Named("BLPOP")),
+            RequestType::LInsert => Some(RequestMetricCommand::Named("LINSERT")),
+            RequestType::SPop => Some(RequestMetricCommand::Named("SPOP")),
+            RequestType::ZMScore => Some(RequestMetricCommand::Named("ZMSCORE")),
+            RequestType::ZDiff => Some(RequestMetricCommand::Named("ZDIFF")),
+            RequestType::ZDiffStore => Some(RequestMetricCommand::Named("ZDIFFSTORE")),
+            RequestType::SetRange => Some(RequestMetricCommand::Named("SETRANGE")),
+            RequestType::ZRemRangeByLex => Some(RequestMetricCommand::Named("ZREMRANGEBYLEX")),
+            RequestType::ZLexCount => Some(RequestMetricCommand::Named("ZLEXCOUNT")),
+            RequestType::Append => Some(RequestMetricCommand::Named("APPEND")),
+            RequestType::SDiffStore => Some(RequestMetricCommand::Named("SDIFFSTORE")),
+            RequestType::SInter => Some(RequestMetricCommand::Named("SINTER")),
+            RequestType::SInterStore => Some(RequestMetricCommand::Named("SINTERSTORE")),
+            RequestType::SUnionStore => Some(RequestMetricCommand::Named("SUNIONSTORE")),
+            RequestType::ZRangeStore => Some(RequestMetricCommand::Named("ZRANGESTORE")),
+            RequestType::GetRange => Some(RequestMetricCommand::Named("GETRANGE")),
+            RequestType::SMove => Some(RequestMetricCommand::Named("SMOVE")),
+            RequestType::SMIsMember => Some(RequestMetricCommand::Named("SMISMEMBER")),
+            RequestType::ZUnionStore => Some(RequestMetricCommand::Named("ZUNIONSTORE")),
+            RequestType::LastSave => Some(RequestMetricCommand::Named("LASTSAVE")),
+            RequestType::Monitor => Some(RequestMetricCommand::Named("MONITOR")),
+            RequestType::GeoAdd => Some(RequestMetricCommand::Named("GEOADD")),
+            RequestType::GeoHash => Some(RequestMetricCommand::Named("GEOHASH")),
+            RequestType::ObjectEncoding => Some(RequestMetricCommand::Named("OBJECT ENCODING")),
+            RequestType::ObjectFreq => Some(RequestMetricCommand::Named("OBJECT FREQ")),
+            RequestType::ObjectIdleTime => Some(RequestMetricCommand::Named("OBJECT IDLETIME")),
+            RequestType::GeoDist => Some(RequestMetricCommand::Named("GEODIST")),
+            RequestType::SDiff => Some(RequestMetricCommand::Named("SDIFF")),
+            RequestType::ObjectRefCount => Some(RequestMetricCommand::Named("OBJECT REFCOUNT")),
+            RequestType::Lolwut => Some(RequestMetricCommand::Named("LOLWUT")),
+            RequestType::GeoPos => Some(RequestMetricCommand::Named("GEOPOS")),
+            RequestType::BZPopMax => Some(RequestMetricCommand::Named("BZPOPMAX")),
+            RequestType::RenameNX => Some(RequestMetricCommand::Named("RENAMENX")),
+            RequestType::Touch => Some(RequestMetricCommand::Named("TOUCH")),
+            RequestType::ZRevRank => Some(RequestMetricCommand::Named("ZREVRANK")),
+            RequestType::ZInterStore => Some(RequestMetricCommand::Named("ZINTERSTORE")),
+            RequestType::HRandField => Some(RequestMetricCommand::Named("HRANDFIELD")),
+            RequestType::ZUnion => Some(RequestMetricCommand::Named("ZUNION")),
+            RequestType::BZPopMin => Some(RequestMetricCommand::Named("BZPOPMIN")),
+            RequestType::FlushAll => Some(RequestMetricCommand::Named("FLUSHALL")),
+            RequestType::PSync => Some(RequestMetricCommand::Named("PSYNC")),
+            RequestType::ReplConf => Some(RequestMetricCommand::Named("REPLCONF")),
+            RequestType::ReplicaOf => Some(RequestMetricCommand::Named("REPLICAOF")),
+            RequestType::RestoreAsking => Some(RequestMetricCommand::Named("RESTORE-ASKING")),
+            RequestType::Role => Some(RequestMetricCommand::Named("ROLE")),
+            RequestType::Save => Some(RequestMetricCommand::Named("SAVE")),
+            RequestType::ShutDown => Some(RequestMetricCommand::Named("SHUTDOWN")),
+            RequestType::SlaveOf => Some(RequestMetricCommand::Named("SLAVEOF")),
+            RequestType::SlowLogGet => Some(RequestMetricCommand::Named("SLOWLOG GET")),
+            RequestType::SlowLogLen => Some(RequestMetricCommand::Named("SLOWLOG LEN")),
+            RequestType::SlowLogReset => Some(RequestMetricCommand::Named("SLOWLOG RESET")),
+            RequestType::SwapDb => Some(RequestMetricCommand::Named("SWAPDB")),
+            RequestType::Sync => Some(RequestMetricCommand::Named("SYNC")),
+            RequestType::ZRandMember => Some(RequestMetricCommand::Named("ZRANDMEMBER")),
+            RequestType::BitCount => Some(RequestMetricCommand::Named("BITCOUNT")),
+            RequestType::BZMPop => Some(RequestMetricCommand::Named("BZMPOP")),
+            RequestType::LMPop => Some(RequestMetricCommand::Named("LMPOP")),
+            RequestType::BLMPop => Some(RequestMetricCommand::Named("BLMPOP")),
+            RequestType::SetBit => Some(RequestMetricCommand::Named("SETBIT")),
+            RequestType::ZInterCard => Some(RequestMetricCommand::Named("ZINTERCARD")),
+            RequestType::ZMPop => Some(RequestMetricCommand::Named("ZMPOP")),
+            RequestType::GetBit => Some(RequestMetricCommand::Named("GETBIT")),
+            RequestType::ZInter => Some(RequestMetricCommand::Named("ZINTER")),
+            RequestType::FunctionLoad => Some(RequestMetricCommand::Named("FUNCTION LOAD")),
+            RequestType::FunctionList => Some(RequestMetricCommand::Named("FUNCTION LIST")),
+            RequestType::FunctionDelete => Some(RequestMetricCommand::Named("FUNCTION DELETE")),
+            RequestType::FunctionFlush => Some(RequestMetricCommand::Named("FUNCTION FLUSH")),
+            RequestType::FCall => Some(RequestMetricCommand::Named("FCALL")),
+            RequestType::BitPos => Some(RequestMetricCommand::Named("BITPOS")),
+            RequestType::BitOp => Some(RequestMetricCommand::Named("BITOP")),
+            RequestType::HStrlen => Some(RequestMetricCommand::Named("HSTRLEN")),
+            RequestType::ExpireTime => Some(RequestMetricCommand::Named("EXPIRETIME")),
+            RequestType::PExpireTime => Some(RequestMetricCommand::Named("PEXPIRETIME")),
+            RequestType::XLen => Some(RequestMetricCommand::Named("XLEN")),
+            RequestType::FunctionKill => Some(RequestMetricCommand::Named("FUNCTION KILL")),
+            RequestType::FunctionStats => Some(RequestMetricCommand::Named("FUNCTION STATS")),
+            RequestType::FCallReadOnly => Some(RequestMetricCommand::Named("FCALL_RO")),
+            RequestType::FlushDB => Some(RequestMetricCommand::Named("FLUSHDB")),
+            RequestType::LSet => Some(RequestMetricCommand::Named("LSET")),
+            RequestType::XDel => Some(RequestMetricCommand::Named("XDEL")),
+            RequestType::XRange => Some(RequestMetricCommand::Named("XRANGE")),
+            RequestType::LMove => Some(RequestMetricCommand::Named("LMOVE")),
+            RequestType::BLMove => Some(RequestMetricCommand::Named("BLMOVE")),
+            RequestType::GetDel => Some(RequestMetricCommand::Named("GETDEL")),
+            RequestType::SRandMember => Some(RequestMetricCommand::Named("SRANDMEMBER")),
+            RequestType::BitField => Some(RequestMetricCommand::Named("BITFIELD")),
+            RequestType::BitFieldReadOnly => Some(RequestMetricCommand::Named("BITFIELD_RO")),
+            RequestType::Move => Some(RequestMetricCommand::Named("MOVE")),
+            RequestType::SInterCard => Some(RequestMetricCommand::Named("SINTERCARD")),
+            RequestType::Copy => Some(RequestMetricCommand::Named("COPY")),
+            RequestType::Sort => Some(RequestMetricCommand::Named("SORT")),
+            RequestType::XRevRange => Some(RequestMetricCommand::Named("XREVRANGE")),
+            RequestType::MSetNX => Some(RequestMetricCommand::Named("MSETNX")),
+            RequestType::LPos => Some(RequestMetricCommand::Named("LPOS")),
+            RequestType::LCS => Some(RequestMetricCommand::Named("LCS")),
+            RequestType::GeoSearch => Some(RequestMetricCommand::Named("GEOSEARCH")),
+            RequestType::SUnion => Some(RequestMetricCommand::Named("SUNION")),
+            RequestType::Watch => Some(RequestMetricCommand::Named("WATCH")),
+            RequestType::UnWatch => Some(RequestMetricCommand::Named("UNWATCH")),
+            RequestType::Discard => Some(RequestMetricCommand::Named("DISCARD")),
+            RequestType::Exec => Some(RequestMetricCommand::Named("EXEC")),
+            RequestType::Multi => Some(RequestMetricCommand::Named("MULTI")),
+            RequestType::GeoSearchStore => Some(RequestMetricCommand::Named("GEOSEARCHSTORE")),
+            RequestType::Publish => Some(RequestMetricCommand::Named("PUBLISH")),
+            RequestType::SPublish => Some(RequestMetricCommand::Named("SPUBLISH")),
+            RequestType::XGroupCreateConsumer => {
+                Some(RequestMetricCommand::Named("XGROUP CREATECONSUMER"))
+            }
+            RequestType::XGroupDelConsumer => {
+                Some(RequestMetricCommand::Named("XGROUP DELCONSUMER"))
+            }
+            RequestType::RandomKey => Some(RequestMetricCommand::Named("RANDOMKEY")),
+            RequestType::GetEx => Some(RequestMetricCommand::Named("GETEX")),
+            RequestType::Dump => Some(RequestMetricCommand::Named("DUMP")),
+            RequestType::Restore => Some(RequestMetricCommand::Named("RESTORE")),
+            RequestType::SortReadOnly => Some(RequestMetricCommand::Named("SORT_RO")),
+            RequestType::FunctionDump => Some(RequestMetricCommand::Named("FUNCTION DUMP")),
+            RequestType::FunctionRestore => Some(RequestMetricCommand::Named("FUNCTION RESTORE")),
+            RequestType::XPending => Some(RequestMetricCommand::Named("XPENDING")),
+            RequestType::XGroupSetId => Some(RequestMetricCommand::Named("XGROUP SETID")),
+            RequestType::SScan => Some(RequestMetricCommand::Named("SSCAN")),
+            RequestType::ZScan => Some(RequestMetricCommand::Named("ZSCAN")),
+            RequestType::HScan => Some(RequestMetricCommand::Named("HSCAN")),
+            RequestType::XAutoClaim => Some(RequestMetricCommand::Named("XAUTOCLAIM")),
+            RequestType::XInfoGroups => Some(RequestMetricCommand::Named("XINFO GROUPS")),
+            RequestType::XInfoConsumers => Some(RequestMetricCommand::Named("XINFO CONSUMERS")),
+            RequestType::XInfoStream => Some(RequestMetricCommand::Named("XINFO STREAM")),
+            RequestType::Wait => Some(RequestMetricCommand::Named("WAIT")),
+            RequestType::WaitAof => Some(RequestMetricCommand::Named("WAITAOF")),
+            RequestType::XClaim => Some(RequestMetricCommand::Named("XCLAIM")),
+            RequestType::Scan => Some(RequestMetricCommand::Named("SCAN")),
+            RequestType::PubSubChannels => Some(RequestMetricCommand::Named("PUBSUB CHANNELS")),
+            RequestType::PubSubNumSub => Some(RequestMetricCommand::Named("PUBSUB NUMSUB")),
+            RequestType::PubSubNumPat => Some(RequestMetricCommand::Named("PUBSUB NUMPAT")),
+            RequestType::PubSubShardChannels => {
+                Some(RequestMetricCommand::Named("PUBSUB SHARDCHANNELS"))
+            }
+            RequestType::PubSubShardNumSub => {
+                Some(RequestMetricCommand::Named("PUBSUB SHARDNUMSUB"))
+            }
+            RequestType::EvalReadOnly => Some(RequestMetricCommand::Named("EVAL_RO")),
+            RequestType::EvalShaReadOnly => Some(RequestMetricCommand::Named("EVALSHA_RO")),
+            RequestType::ScriptDebug => Some(RequestMetricCommand::Named("SCRIPT DEBUG")),
+            RequestType::ScriptExists => Some(RequestMetricCommand::Named("SCRIPT EXISTS")),
+            RequestType::ScriptFlush => Some(RequestMetricCommand::Named("SCRIPT FLUSH")),
+            RequestType::ScriptKill => Some(RequestMetricCommand::Named("SCRIPT KILL")),
+            RequestType::ScriptShow => Some(RequestMetricCommand::Named("SCRIPT SHOW")),
+            RequestType::JsonArrAppend => Some(RequestMetricCommand::Named("JSON.ARRAPPEND")),
+            RequestType::JsonArrIndex => Some(RequestMetricCommand::Named("JSON.ARRINDEX")),
+            RequestType::JsonArrInsert => Some(RequestMetricCommand::Named("JSON.ARRINSERT")),
+            RequestType::JsonArrLen => Some(RequestMetricCommand::Named("JSON.ARRLEN")),
+            RequestType::JsonArrPop => Some(RequestMetricCommand::Named("JSON.ARRPOP")),
+            RequestType::JsonArrTrim => Some(RequestMetricCommand::Named("JSON.ARRTRIM")),
+            RequestType::JsonClear => Some(RequestMetricCommand::Named("JSON.CLEAR")),
+            RequestType::JsonDebug => Some(RequestMetricCommand::Named("JSON.DEBUG")),
+            RequestType::JsonDel => Some(RequestMetricCommand::Named("JSON.DEL")),
+            RequestType::JsonForget => Some(RequestMetricCommand::Named("JSON.FORGET")),
+            RequestType::JsonGet => Some(RequestMetricCommand::Named("JSON.GET")),
+            RequestType::JsonMGet => Some(RequestMetricCommand::Named("JSON.MGET")),
+            RequestType::JsonNumIncrBy => Some(RequestMetricCommand::Named("JSON.NUMINCRBY")),
+            RequestType::JsonNumMultBy => Some(RequestMetricCommand::Named("JSON.NUMMULTBY")),
+            RequestType::JsonObjKeys => Some(RequestMetricCommand::Named("JSON.OBJKEYS")),
+            RequestType::JsonObjLen => Some(RequestMetricCommand::Named("JSON.OBJLEN")),
+            RequestType::JsonResp => Some(RequestMetricCommand::Named("JSON.RESP")),
+            RequestType::JsonSet => Some(RequestMetricCommand::Named("JSON.SET")),
+            RequestType::JsonStrAppend => Some(RequestMetricCommand::Named("JSON.STRAPPEND")),
+            RequestType::JsonStrLen => Some(RequestMetricCommand::Named("JSON.STRLEN")),
+            RequestType::JsonToggle => Some(RequestMetricCommand::Named("JSON.TOGGLE")),
+            RequestType::JsonType => Some(RequestMetricCommand::Named("JSON.TYPE")),
+            RequestType::FtList => Some(RequestMetricCommand::Named("FT._LIST")),
+            RequestType::FtAggregate => Some(RequestMetricCommand::Named("FT.AGGREGATE")),
+            RequestType::FtAliasAdd => Some(RequestMetricCommand::Named("FT.ALIASADD")),
+            RequestType::FtAliasDel => Some(RequestMetricCommand::Named("FT.ALIASDEL")),
+            RequestType::FtAliasList => Some(RequestMetricCommand::Named("FT._ALIASLIST")),
+            RequestType::FtAliasUpdate => Some(RequestMetricCommand::Named("FT.ALIASUPDATE")),
+            RequestType::FtCreate => Some(RequestMetricCommand::Named("FT.CREATE")),
+            RequestType::FtDropIndex => Some(RequestMetricCommand::Named("FT.DROPINDEX")),
+            RequestType::FtExplain => Some(RequestMetricCommand::Named("FT.EXPLAIN")),
+            RequestType::FtExplainCli => Some(RequestMetricCommand::Named("FT.EXPLAINCLI")),
+            RequestType::FtInfo => Some(RequestMetricCommand::Named("FT.INFO")),
+            RequestType::FtProfile => Some(RequestMetricCommand::Named("FT.PROFILE")),
+            RequestType::FtSearch => Some(RequestMetricCommand::Named("FT.SEARCH")),
+            RequestType::ModuleList => Some(RequestMetricCommand::Named("MODULE LIST")),
+            RequestType::ModuleLoad => Some(RequestMetricCommand::Named("MODULE LOAD")),
+            RequestType::ModuleLoadEx => Some(RequestMetricCommand::Named("MODULE LOADEX")),
+            RequestType::ModuleUnload => Some(RequestMetricCommand::Named("MODULE UNLOAD")),
+            RequestType::Asking => Some(RequestMetricCommand::Named("ASKING")),
+            RequestType::ClusterAddSlots => Some(RequestMetricCommand::Named("CLUSTER ADDSLOTS")),
+            RequestType::ClusterAddSlotsRange => {
+                Some(RequestMetricCommand::Named("CLUSTER ADDSLOTSRANGE"))
+            }
+            RequestType::ClusterBumpEpoch => Some(RequestMetricCommand::Named("CLUSTER BUMPEPOCH")),
+            RequestType::ClusterCountFailureReports => {
+                Some(RequestMetricCommand::Named("CLUSTER COUNT-FAILURE-REPORTS"))
+            }
+            RequestType::ClusterCountKeysInSlot => {
+                Some(RequestMetricCommand::Named("CLUSTER COUNTKEYSINSLOT"))
+            }
+            RequestType::ClusterDelSlots => Some(RequestMetricCommand::Named("CLUSTER DELSLOTS")),
+            RequestType::ClusterDelSlotsRange => {
+                Some(RequestMetricCommand::Named("CLUSTER DELSLOTSRANGE"))
+            }
+            RequestType::ClusterFailover => Some(RequestMetricCommand::Named("CLUSTER FAILOVER")),
+            RequestType::ClusterFlushSlots => {
+                Some(RequestMetricCommand::Named("CLUSTER FLUSHSLOTS"))
+            }
+            RequestType::ClusterForget => Some(RequestMetricCommand::Named("CLUSTER FORGET")),
+            RequestType::ClusterGetKeysInSlot => {
+                Some(RequestMetricCommand::Named("CLUSTER GETKEYSINSLOT"))
+            }
+            RequestType::ClusterInfo => Some(RequestMetricCommand::Named("CLUSTER INFO")),
+            RequestType::ClusterKeySlot => Some(RequestMetricCommand::Named("CLUSTER KEYSLOT")),
+            RequestType::ClusterLinks => Some(RequestMetricCommand::Named("CLUSTER LINKS")),
+            RequestType::ClusterMeet => Some(RequestMetricCommand::Named("CLUSTER MEET")),
+            RequestType::ClusterMyId => Some(RequestMetricCommand::Named("CLUSTER MYID")),
+            RequestType::ClusterMyShardId => Some(RequestMetricCommand::Named("CLUSTER MYSHARDID")),
+            RequestType::ClusterNodes => Some(RequestMetricCommand::Named("CLUSTER NODES")),
+            RequestType::ClusterReplicas => Some(RequestMetricCommand::Named("CLUSTER REPLICAS")),
+            RequestType::ClusterReplicate => Some(RequestMetricCommand::Named("CLUSTER REPLICATE")),
+            RequestType::ClusterReset => Some(RequestMetricCommand::Named("CLUSTER RESET")),
+            RequestType::ClusterSaveConfig => {
+                Some(RequestMetricCommand::Named("CLUSTER SAVECONFIG"))
+            }
+            RequestType::ClusterSetConfigEpoch => {
+                Some(RequestMetricCommand::Named("CLUSTER SET-CONFIG-EPOCH"))
+            }
+            RequestType::ClusterSetslot => Some(RequestMetricCommand::Named("CLUSTER SETSLOT")),
+            RequestType::ClusterShards => Some(RequestMetricCommand::Named("CLUSTER SHARDS")),
+            RequestType::ClusterSlaves => Some(RequestMetricCommand::Named("CLUSTER SLAVES")),
+            RequestType::ClusterSlots => Some(RequestMetricCommand::Named("CLUSTER SLOTS")),
+            RequestType::ReadOnly => Some(RequestMetricCommand::Named("READONLY")),
+            RequestType::ReadWrite => Some(RequestMetricCommand::Named("READWRITE")),
+            RequestType::AclCat => Some(RequestMetricCommand::Named("ACL CAT")),
+            RequestType::AclDelUser => Some(RequestMetricCommand::Named("ACL DELUSER")),
+            RequestType::AclDryRun => Some(RequestMetricCommand::Named("ACL DRYRUN")),
+            RequestType::AclGenPass => Some(RequestMetricCommand::Named("ACL GENPASS")),
+            RequestType::AclGetUser => Some(RequestMetricCommand::Named("ACL GETUSER")),
+            RequestType::AclList => Some(RequestMetricCommand::Named("ACL LIST")),
+            RequestType::AclLoad => Some(RequestMetricCommand::Named("ACL LOAD")),
+            RequestType::AclLog => Some(RequestMetricCommand::Named("ACL LOG")),
+            RequestType::AclSave => Some(RequestMetricCommand::Named("ACL SAVE")),
+            RequestType::AclSetUser => Some(RequestMetricCommand::Named("ACL SETUSER")),
+            RequestType::AclUsers => Some(RequestMetricCommand::Named("ACL USERS")),
+            RequestType::AclWhoami => Some(RequestMetricCommand::Named("ACL WHOAMI")),
+            RequestType::Command_ => Some(RequestMetricCommand::Named("COMMAND")),
+            RequestType::CommandCount => Some(RequestMetricCommand::Named("COMMAND COUNT")),
+            RequestType::CommandDocs => Some(RequestMetricCommand::Named("COMMAND DOCS")),
+            RequestType::CommandGetKeys => Some(RequestMetricCommand::Named("COMMAND GETKEYS")),
+            RequestType::CommandGetKeysAndFlags => {
+                Some(RequestMetricCommand::Named("COMMAND GETKEYSANDFLAGS"))
+            }
+            RequestType::CommandInfo => Some(RequestMetricCommand::Named("COMMAND INFO")),
+            RequestType::CommandList => Some(RequestMetricCommand::Named("COMMAND LIST")),
+            RequestType::LatencyDoctor => Some(RequestMetricCommand::Named("LATENCY DOCTOR")),
+            RequestType::LatencyGraph => Some(RequestMetricCommand::Named("LATENCY GRAPH")),
+            RequestType::LatencyHistogram => Some(RequestMetricCommand::Named("LATENCY HISTOGRAM")),
+            RequestType::LatencyHistory => Some(RequestMetricCommand::Named("LATENCY HISTORY")),
+            RequestType::LatencyLatest => Some(RequestMetricCommand::Named("LATENCY LATEST")),
+            RequestType::LatencyReset => Some(RequestMetricCommand::Named("LATENCY RESET")),
+            RequestType::MemoryDoctor => Some(RequestMetricCommand::Named("MEMORY DOCTOR")),
+            RequestType::MemoryMallocStats => {
+                Some(RequestMetricCommand::Named("MEMORY MALLOC-STATS"))
+            }
+            RequestType::MemoryPurge => Some(RequestMetricCommand::Named("MEMORY PURGE")),
+            RequestType::MemoryStats => Some(RequestMetricCommand::Named("MEMORY STATS")),
+            RequestType::MemoryUsage => Some(RequestMetricCommand::Named("MEMORY USAGE")),
+            RequestType::PSubscribe => Some(RequestMetricCommand::Named("PSUBSCRIBE")),
+            RequestType::PUnsubscribe => Some(RequestMetricCommand::Named("PUNSUBSCRIBE")),
+            RequestType::SSubscribe => Some(RequestMetricCommand::Named("SSUBSCRIBE")),
+            RequestType::Subscribe => Some(RequestMetricCommand::Named("SUBSCRIBE")),
+            RequestType::SUnsubscribe => Some(RequestMetricCommand::Named("SUNSUBSCRIBE")),
+            RequestType::Unsubscribe => Some(RequestMetricCommand::Named("UNSUBSCRIBE")),
+            RequestType::SubscribeBlocking => {
+                Some(RequestMetricCommand::Named("SUBSCRIBE_BLOCKING"))
+            }
+            RequestType::UnsubscribeBlocking => {
+                Some(RequestMetricCommand::Named("UNSUBSCRIBE_BLOCKING"))
+            }
+            RequestType::PSubscribeBlocking => {
+                Some(RequestMetricCommand::Named("PSUBSCRIBE_BLOCKING"))
+            }
+            RequestType::PUnsubscribeBlocking => {
+                Some(RequestMetricCommand::Named("PUNSUBSCRIBE_BLOCKING"))
+            }
+            RequestType::SSubscribeBlocking => {
+                Some(RequestMetricCommand::Named("SSUBSCRIBE_BLOCKING"))
+            }
+            RequestType::SUnsubscribeBlocking => {
+                Some(RequestMetricCommand::Named("SUNSUBSCRIBE_BLOCKING"))
+            }
+            RequestType::GetSubscriptions => Some(RequestMetricCommand::Named("GET_SUBSCRIPTIONS")),
+            RequestType::BRPopLPush => Some(RequestMetricCommand::Named("BRPOPLPUSH")),
+            RequestType::Eval => Some(RequestMetricCommand::Named("EVAL")),
+            RequestType::EvalSha => Some(RequestMetricCommand::Named("EVALSHA")),
+            RequestType::GeoRadius => Some(RequestMetricCommand::Named("GEORADIUS")),
+            RequestType::GeoRadiusByMember => {
+                Some(RequestMetricCommand::Named("GEORADIUSBYMEMBER"))
+            }
+            RequestType::GeoRadiusByMemberReadOnly => {
+                Some(RequestMetricCommand::Named("GEORADIUSBYMEMBER_RO"))
+            }
+            RequestType::GeoRadiusReadOnly => Some(RequestMetricCommand::Named("GEORADIUS_RO")),
+            RequestType::GetSet => Some(RequestMetricCommand::Named("GETSET")),
+            RequestType::PSetEx => Some(RequestMetricCommand::Named("PSETEX")),
+            RequestType::RPopLPush => Some(RequestMetricCommand::Named("RPOPLPUSH")),
+            RequestType::ScriptLoad => Some(RequestMetricCommand::Named("SCRIPT LOAD")),
+            RequestType::SetEx => Some(RequestMetricCommand::Named("SETEX")),
+            RequestType::SetNX => Some(RequestMetricCommand::Named("SETNX")),
+            RequestType::Substr => Some(RequestMetricCommand::Named("SUBSTR")),
+            RequestType::XSetId => Some(RequestMetricCommand::Named("XSETID")),
+            RequestType::ZRangeByLex => Some(RequestMetricCommand::Named("ZRANGEBYLEX")),
+            RequestType::ZRangeByScore => Some(RequestMetricCommand::Named("ZRANGEBYSCORE")),
+            RequestType::ZRevRange => Some(RequestMetricCommand::Named("ZREVRANGE")),
+            RequestType::ZRevRangeByLex => Some(RequestMetricCommand::Named("ZREVRANGEBYLEX")),
+            RequestType::ZRevRangeByScore => Some(RequestMetricCommand::Named("ZREVRANGEBYSCORE")),
+        }
+    }
+
+    /// Returns the allocation-free, normalized operation for a known request type.
+    pub fn request_metric_name(&self) -> Option<&'static str> {
+        match self.request_metric_command()? {
+            RequestMetricCommand::Custom => None,
+            RequestMetricCommand::Named(name) => Some(name),
+        }
+    }
+}
+
 #[cfg(feature = "proto")]
 impl From<::protobuf::EnumOrUnknown<ProtobufRequestType>> for RequestType {
     fn from(value: ::protobuf::EnumOrUnknown<ProtobufRequestType>) -> Self {

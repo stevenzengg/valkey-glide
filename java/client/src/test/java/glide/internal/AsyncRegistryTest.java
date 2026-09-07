@@ -9,15 +9,51 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import glide.api.models.exceptions.ClosingException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.LongPredicate;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
+@Timeout(5)
 public class AsyncRegistryTest {
+    private static final int COMPLETED = 0;
+    private static final int TIMEOUT = 1;
+    private static final int CANCELLED = 2;
+    private static final int FAILURE = 3;
+    private static final int TIMEOUT_MARK_MISSED = 4;
+    private static final int NATIVE_TIMEOUT = 5;
 
     @BeforeEach
     void setUp() {
         AsyncRegistry.reset();
+    }
+
+    @Test
+    void unselectedRegistrationUsesOnlyLegacyFutureState() {
+        CompletableFuture<Object> future = new CompletableFuture<>();
+
+        long id = AsyncRegistry.register(future, future, 0, 17L, 0, false);
+
+        assertEquals(0, AsyncRegistry.getCompletionStateCount());
+        assertTrue(AsyncRegistry.completeCallback(id, "response"));
+        assertEquals("response", future.join());
+    }
+
+    @Test
+    void selectedRegistrationRetainsDetailedTerminalState() {
+        CompletableFuture<Object> root = new CompletableFuture<>();
+        CompletableFuture<String> terminal = root.thenApply(Object::toString);
+
+        long id = AsyncRegistry.register(root, terminal, 0, 17L, 0, true);
+
+        assertEquals(1, AsyncRegistry.getCompletionStateCount());
+        assertEquals(COMPLETED, AsyncRegistry.completeCallbackForNative(id, "response"));
+        assertEquals(0, AsyncRegistry.getCompletionStateCount());
     }
 
     @Test
@@ -232,6 +268,354 @@ public class AsyncRegistryTest {
         // Clean up: cancel the abandoned future so its 60s timeout task is cancelled and doesn't
         // outlive this test and invoke GlideNativeBridge.markTimedOut in the test JVM.
         f.cancel(true);
+    }
+
+    @Test
+    void nativeSuccessReturnsOnlyAfterSynchronousCompletionActionsFinish() throws Exception {
+        CompletableFuture<Object> future = new CompletableFuture<>();
+        long correlationId = register(future);
+        CountDownLatch actionStarted = new CountDownLatch(1);
+        CountDownLatch releaseAction = new CountDownLatch(1);
+        future.thenRun(
+                () -> {
+                    actionStarted.countDown();
+                    await(releaseAction);
+                });
+        AtomicInteger outcome = new AtomicInteger(-1);
+
+        Thread completion =
+                new Thread(
+                        () -> outcome.set(AsyncRegistry.completeCallbackForNative(correlationId, "response")));
+        completion.start();
+
+        assertTrue(actionStarted.await(1, TimeUnit.SECONDS));
+        assertTrue(completion.isAlive());
+        releaseAction.countDown();
+        completion.join();
+
+        assertEquals(COMPLETED, outcome.get());
+        assertEquals("response", future.join());
+    }
+
+    @Test
+    void nativeErrorDeliveryIsCompletedButExternalExceptionalCompletionIsFailure() {
+        CompletableFuture<Object> deliveredError = new CompletableFuture<>();
+        long deliveredErrorId = register(deliveredError);
+        assertEquals(
+                COMPLETED,
+                AsyncRegistry.completeCallbackWithErrorCodeForNative(deliveredErrorId, 0, "server error"));
+        assertTrue(deliveredError.isCompletedExceptionally());
+
+        CompletableFuture<Object> externallyFailed = new CompletableFuture<>();
+        long externallyFailedId = register(externallyFailed);
+        externallyFailed.completeExceptionally(new IllegalStateException("external failure"));
+        assertEquals(
+                FAILURE, AsyncRegistry.completeCallbackForNative(externallyFailedId, "late response"));
+    }
+
+    @Test
+    void terminalCommandFutureControlsCancellationAndHandlerFailureOutcomes() {
+        CompletableFuture<Object> cancellationRoot = new CompletableFuture<>();
+        CompletableFuture<String> cancelledCommand = cancellationRoot.thenApply(Object::toString);
+        AtomicLong notifiedId = new AtomicLong(-1);
+        long cancelledId =
+                AsyncRegistry.register(
+                        cancellationRoot,
+                        cancelledCommand,
+                        0,
+                        17L,
+                        0,
+                        true,
+                        id -> {
+                            notifiedId.set(id);
+                            return true;
+                        });
+
+        cancelledCommand.cancel(false);
+
+        assertTrue(cancellationRoot.isCancelled());
+        assertEquals(cancelledId, notifiedId.get());
+        assertEquals(0, AsyncRegistry.getCompletionStateCount());
+        assertEquals(FAILURE, AsyncRegistry.completeCallbackForNative(cancelledId, "late response"));
+
+        CompletableFuture<Object> handlerFailureRoot = new CompletableFuture<>();
+        CompletableFuture<String> failedCommand =
+                handlerFailureRoot.thenApply(
+                        ignored -> {
+                            throw new IllegalStateException("handler failed");
+                        });
+        long failedId = AsyncRegistry.register(handlerFailureRoot, failedCommand, 0, 17L, 0, true);
+
+        assertEquals(FAILURE, AsyncRegistry.completeCallbackForNative(failedId, "response"));
+        assertTrue(failedCommand.isCompletedExceptionally());
+    }
+
+    @Test
+    void nativeTimeoutDeliveryHasADistinctTerminalOutcome() {
+        CompletableFuture<Object> root = new CompletableFuture<>();
+        CompletableFuture<String> command = root.thenApply(Object::toString);
+        long correlationId = AsyncRegistry.register(root, command, 0, 17L, 0, true);
+
+        assertEquals(
+                NATIVE_TIMEOUT,
+                AsyncRegistry.completeCallbackWithErrorCodeForNative(
+                        correlationId, 2, "core request timed out"));
+        assertTrue(command.isCompletedExceptionally());
+
+        CompletableFuture<Object> legacyFuture = new CompletableFuture<>();
+        long legacyCorrelationId = AsyncRegistry.register(legacyFuture, 0, 17L, 0);
+        assertTrue(
+                AsyncRegistry.completeCallbackWithErrorCode(
+                        legacyCorrelationId, 2, "core request timed out"));
+    }
+
+    @Test
+    void rootCancellationReleasesCompletionStateAndNotifiesNative() {
+        CompletableFuture<Object> future = new CompletableFuture<>();
+        AtomicLong notifiedId = new AtomicLong(-1);
+        long correlationId =
+                register(
+                        future,
+                        id -> {
+                            notifiedId.set(id);
+                            return true;
+                        });
+
+        assertEquals(1, AsyncRegistry.getCompletionStateCount());
+        assertTrue(future.cancel(false));
+
+        assertEquals(correlationId, notifiedId.get());
+        assertEquals(0, AsyncRegistry.getActiveFutureCount());
+        assertEquals(0, AsyncRegistry.getCompletionStateCount());
+    }
+
+    @Test
+    void cancellationNotifierFailureStillReleasesCompletionState() {
+        CompletableFuture<Object> future = new CompletableFuture<>();
+        register(
+                future,
+                ignored -> {
+                    throw new IllegalStateException("native cancellation failed");
+                });
+
+        assertTrue(future.cancel(false));
+
+        assertEquals(0, AsyncRegistry.getActiveFutureCount());
+        assertEquals(0, AsyncRegistry.getCompletionStateCount());
+    }
+
+    @Test
+    void cancellationOutcomeIsVisibleToAConcurrentNativeCallback() throws Exception {
+        CompletableFuture<Object> future = new CompletableFuture<>();
+        CountDownLatch notifierEntered = new CountDownLatch(1);
+        CountDownLatch releaseNotifier = new CountDownLatch(1);
+        long correlationId =
+                register(
+                        future,
+                        ignored -> {
+                            notifierEntered.countDown();
+                            await(releaseNotifier);
+                            return true;
+                        });
+        AtomicInteger outcome = new AtomicInteger(-1);
+
+        Thread cancellation = new Thread(() -> future.cancel(false));
+        cancellation.start();
+        assertTrue(notifierEntered.await(1, TimeUnit.SECONDS));
+        assertEquals(1, AsyncRegistry.getCompletionStateCount());
+
+        Thread completion =
+                new Thread(
+                        () ->
+                                outcome.set(
+                                        AsyncRegistry.completeCallbackForNative(correlationId, "late response")));
+        completion.start();
+        completion.join();
+        releaseNotifier.countDown();
+        cancellation.join();
+
+        assertEquals(CANCELLED, outcome.get());
+        assertEquals(0, AsyncRegistry.getCompletionStateCount());
+    }
+
+    @Test
+    void nativeCallbackThatWinsTheRaceIsNotReclassifiedOrCancelled() {
+        CompletableFuture<Object> future = new CompletableFuture<>();
+        AtomicInteger notifications = new AtomicInteger();
+        long correlationId =
+                register(
+                        future,
+                        ignored -> {
+                            notifications.incrementAndGet();
+                            return true;
+                        });
+
+        assertEquals(COMPLETED, AsyncRegistry.completeCallbackForNative(correlationId, "response"));
+        assertFalse(future.cancel(false));
+
+        assertEquals(0, notifications.get());
+        assertEquals(0, AsyncRegistry.getCompletionStateCount());
+        assertEquals(FAILURE, AsyncRegistry.completeCallbackForNative(Long.MAX_VALUE, "missing"));
+    }
+
+    @Test
+    void timeoutOutcomeIsPublishedBeforeNativeTimeoutNotification() throws Exception {
+        CompletableFuture<Object> future = new CompletableFuture<>();
+        long correlationId = register(future);
+        CountDownLatch notifierEntered = new CountDownLatch(1);
+        CountDownLatch releaseNotifier = new CountDownLatch(1);
+        AtomicLong notifiedId = new AtomicLong(-1);
+        AtomicInteger outcome = new AtomicInteger(-1);
+
+        Thread timeout =
+                new Thread(
+                        () ->
+                                AsyncRegistry.completeTimeout(
+                                        correlationId,
+                                        25,
+                                        id -> {
+                                            notifiedId.set(id);
+                                            notifierEntered.countDown();
+                                            await(releaseNotifier);
+                                            return true;
+                                        }));
+        timeout.start();
+
+        assertTrue(notifierEntered.await(1, TimeUnit.SECONDS));
+        assertTrue(future.isCompletedExceptionally());
+        Thread completion =
+                new Thread(
+                        () ->
+                                outcome.set(
+                                        AsyncRegistry.completeCallbackForNative(correlationId, "late response")));
+        completion.start();
+        awaitThreadBlocked(completion);
+        releaseNotifier.countDown();
+        timeout.join();
+        completion.join();
+
+        assertEquals(correlationId, notifiedId.get());
+        assertEquals(TIMEOUT, outcome.get());
+    }
+
+    @Test
+    void timeoutThatLosesToCompletionDoesNotNotifyOrReclassify() {
+        CompletableFuture<Object> future = new CompletableFuture<>();
+        long correlationId = register(future);
+        assertEquals(COMPLETED, AsyncRegistry.completeCallbackForNative(correlationId, "response"));
+        AtomicInteger notifications = new AtomicInteger();
+
+        assertFalse(
+                AsyncRegistry.completeTimeout(
+                        correlationId,
+                        25,
+                        ignored -> {
+                            notifications.incrementAndGet();
+                            return true;
+                        }));
+        assertEquals(0, notifications.get());
+    }
+
+    @Test
+    void timeoutBeforeNativeRegistrationIsRetainedUntilTheCallbackQueriesIt() {
+        CompletableFuture<Object> future = new CompletableFuture<>();
+        long correlationId = register(future);
+
+        assertTrue(AsyncRegistry.completeTimeout(correlationId, 25, ignored -> false));
+
+        assertEquals(
+                TIMEOUT_MARK_MISSED,
+                AsyncRegistry.completeCallbackForNative(correlationId, "late response"));
+        assertEquals(
+                FAILURE, AsyncRegistry.completeCallbackForNative(correlationId, "duplicate response"));
+    }
+
+    @Test
+    void missedTimeoutMarkIsPublishedBeforeAConcurrentNativeQuery() throws Exception {
+        CompletableFuture<Object> future = new CompletableFuture<>();
+        long correlationId = register(future);
+        AtomicInteger outcome = new AtomicInteger(-1);
+        Thread[] completion = new Thread[1];
+
+        assertTrue(
+                AsyncRegistry.completeTimeout(
+                        correlationId,
+                        25,
+                        ignored -> {
+                            completion[0] =
+                                    new Thread(
+                                            () ->
+                                                    outcome.set(
+                                                            AsyncRegistry.completeCallbackForNative(
+                                                                    correlationId, "late response")));
+                            completion[0].start();
+                            awaitThreadBlocked(completion[0]);
+                            return false;
+                        }));
+        completion[0].join();
+
+        assertEquals(TIMEOUT_MARK_MISSED, outcome.get());
+    }
+
+    @Test
+    void resetClearsATimeoutTombstoneWhenNoNativeEntryEverArrives() {
+        CompletableFuture<Object> future = new CompletableFuture<>();
+        long correlationId = register(future);
+        assertTrue(AsyncRegistry.completeTimeout(correlationId, 25, ignored -> false));
+
+        AsyncRegistry.reset();
+
+        assertEquals(
+                FAILURE, AsyncRegistry.completeCallbackForNative(correlationId, "missing response"));
+    }
+
+    @Test
+    void shutdownCancellationIsFailureRatherThanUserCancellation() {
+        CompletableFuture<Object> future = new CompletableFuture<>();
+        AtomicInteger notifications = new AtomicInteger();
+        long correlationId =
+                register(
+                        future,
+                        ignored -> {
+                            notifications.incrementAndGet();
+                            return true;
+                        });
+
+        AsyncRegistry.cancelPendingForShutdown();
+
+        assertTrue(future.isCancelled());
+        assertEquals(0, notifications.get());
+        assertEquals(0, AsyncRegistry.getCompletionStateCount());
+        assertEquals(FAILURE, AsyncRegistry.completeCallbackForNative(correlationId, "late response"));
+    }
+
+    private static long register(CompletableFuture<Object> future) {
+        return register(future, ignored -> false);
+    }
+
+    private static long register(
+            CompletableFuture<Object> future, LongPredicate cancellationNotifier) {
+        return AsyncRegistry.register(future, future, 0, 17, 0, true, cancellationNotifier);
+    }
+
+    private static void await(CountDownLatch latch) {
+        try {
+            assertTrue(latch.await(1, TimeUnit.SECONDS));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(e);
+        }
+    }
+
+    private static void awaitThreadBlocked(Thread thread) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+        while (thread.getState() != Thread.State.BLOCKED && thread.isAlive()) {
+            if (System.nanoTime() >= deadline) {
+                throw new AssertionError("completion did not block on the exact entry state");
+            }
+            Thread.yield();
+        }
+        assertEquals(Thread.State.BLOCKED, thread.getState());
     }
 
     private static void assertClosingException(CompletableFuture<?> future, String expectedMessage) {
