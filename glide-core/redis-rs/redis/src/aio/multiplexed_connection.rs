@@ -886,6 +886,20 @@ where
     /// burst headroom.
     const DEFAULT_BUFFER_SIZE: usize = 50;
 
+    /// Returns the request pipeline capacity configured for the process.
+    ///
+    /// This is intentionally an environment override: the capacity is a
+    /// client-runtime tuning knob and must be selected before the pipeline is
+    /// created. Invalid, zero, or excessively large values fall back to the
+    /// safe default.
+    fn configured_buffer_size() -> usize {
+        std::env::var("GLIDE_PIPELINE_BUFFER_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| (1..=10_000).contains(value))
+            .unwrap_or(Self::DEFAULT_BUFFER_SIZE)
+    }
+
     fn new<T>(
         sink_stream: T,
         disconnect_notifier: Option<Box<dyn DisconnectNotifier>>,
@@ -902,7 +916,7 @@ where
             sink_stream,
             disconnect_notifier,
             cache,
-            Self::DEFAULT_BUFFER_SIZE,
+            Self::configured_buffer_size(),
         )
     }
 
